@@ -18,12 +18,18 @@ class Employee(Base):
     designation: Mapped[str] = mapped_column(String(120))
     department: Mapped[str] = mapped_column(String(120))
     manager_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    manager_employee_id: Mapped[int | None] = mapped_column(
+        ForeignKey("employees.id", ondelete="SET NULL"), nullable=True
+    )
     location: Mapped[str] = mapped_column(String(120))
     employment_type: Mapped[str] = mapped_column(String(40))
     joining_date: Mapped[date] = mapped_column(Date)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    __table_args__ = (Index("ix_employees_email", "email"),)
+    __table_args__ = (
+        Index("ix_employees_email", "email"),
+        Index("ix_employees_manager_employee_id", "manager_employee_id"),
+    )
 
 
 class User(Base):
@@ -95,12 +101,20 @@ class LeaveRequest(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"))
+    manager_employee_id: Mapped[int | None] = mapped_column(
+        ForeignKey("employees.id", ondelete="SET NULL"), nullable=True
+    )
     leave_type: Mapped[str] = mapped_column(String(32))
     start_date: Mapped[date] = mapped_column(Date)
     end_date: Mapped[date] = mapped_column(Date)
     working_days: Mapped[Decimal] = mapped_column(Numeric(6, 2))
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="PENDING")
+    decided_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    decision_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
@@ -108,7 +122,26 @@ class LeaveRequest(Base):
         CheckConstraint("end_date >= start_date", name="ck_leave_requests_date_order"),
         CheckConstraint("working_days > 0", name="ck_leave_requests_positive_days"),
         Index("ix_leave_requests_employee_status", "employee_id", "status"),
+        Index("ix_leave_requests_manager_status", "manager_employee_id", "status"),
         Index("ix_leave_requests_employee_dates", "employee_id", "start_date", "end_date"),
+    )
+
+
+class LeaveRequestEvent(Base):
+    __tablename__ = "leave_request_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    leave_request_id: Mapped[int] = mapped_column(
+        ForeignKey("leave_requests.id", ondelete="CASCADE")
+    )
+    actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    from_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(24))
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_leave_request_events_request_created", "leave_request_id", "created_at"),
     )
 
 

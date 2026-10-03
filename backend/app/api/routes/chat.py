@@ -8,7 +8,12 @@ from app.agent.orchestrator import HRAssistantOrchestrator
 from app.api.dependencies import AppSettings, CurrentUser, Database
 from app.api.schemas.chat import ChatRequest, ChatResponse
 from app.application.leave.service import LeaveService
-from app.application.pending.handlers import ApplyLeaveHandler
+from app.application.pending.handlers import (
+    ApplyLeaveHandler,
+    ApproveLeaveRequestHandler,
+    CancelLeaveRequestHandler,
+    RejectLeaveRequestHandler,
+)
 from app.application.pending.service import PendingActionCoordinator
 from app.core.config import get_settings
 from app.infrastructure.embeddings.bge import BGEEmbeddingProvider
@@ -59,7 +64,12 @@ def chat(
     leave = LeaveService(SQLAlchemyLeaveRepository(db))
     pending = PendingActionCoordinator(
         SQLAlchemyPendingActionRepository(db),
-        {"apply_leave": ApplyLeaveHandler(leave)},
+        {
+            "apply_leave": ApplyLeaveHandler(leave),
+            "approve_leave_request": ApproveLeaveRequestHandler(leave),
+            "reject_leave_request": RejectLeaveRequestHandler(leave),
+            "cancel_leave_request": CancelLeaveRequestHandler(leave),
+        },
     )
     service = HRAssistantOrchestrator(
         settings=settings,

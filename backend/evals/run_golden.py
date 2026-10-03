@@ -41,6 +41,8 @@ class GoldenCase(BaseModel):
     category: str
     tags: list[str] = Field(default_factory=list)
     auth: Literal["valid", "missing", "invalid"] = "valid"
+    username: str | None = None
+    password: str | None = None
     mutating: bool = False
     turns: list[Turn] = Field(min_length=1)
 
@@ -138,7 +140,7 @@ def run_cases(
     results: list[dict] = []
     signatures: dict[tuple[str, int], list[tuple]] = defaultdict(list)
     with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout) as client:
-        valid_token = login(client, username, password)
+        token_cache: dict[tuple[str, str], str] = {}
         for case in cases:
             if case.mutating and not include_mutating:
                 results.append({"case_id": case.id, "category": case.category, "skipped": True,
@@ -148,7 +150,10 @@ def run_cases(
                 session_id = f"eval-{case.id[:42]}-{repetition}-{uuid4().hex[:8]}"
                 headers = {}
                 if case.auth == "valid":
-                    headers["Authorization"] = f"Bearer {valid_token}"
+                    credentials = (case.username or username, case.password or password)
+                    if credentials not in token_cache:
+                        token_cache[credentials] = login(client, *credentials)
+                    headers["Authorization"] = f"Bearer {token_cache[credentials]}"
                 elif case.auth == "invalid":
                     headers["Authorization"] = "Bearer invalid-evaluation-token"
                 for turn_index, turn in enumerate(case.turns):

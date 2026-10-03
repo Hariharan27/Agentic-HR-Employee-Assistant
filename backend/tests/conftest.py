@@ -26,10 +26,15 @@ def db_session():
         manager = Employee(employee_code="M1", name="Test Manager", email="manager@test.local",
                            designation="Manager", department="Engineering", manager_name=None,
                            location="Chennai", employment_type="Permanent", joining_date=date(2022, 1, 1))
-        db.add_all([employee, manager]); db.flush()
+        hr = Employee(employee_code="H1", name="Test HR", email="hr@test.local",
+                      designation="HR Partner", department="People", manager_name=None,
+                      location="Bengaluru", employment_type="Permanent", joining_date=date(2021, 1, 1))
+        db.add_all([employee, manager, hr]); db.flush()
+        employee.manager_employee_id = manager.id
         db.add_all([
             User(username="employee", password_hash=hash_password("correct-password"), role="EMPLOYEE", employee_id=employee.id),
             User(username="manager", password_hash=hash_password("manager-password"), role="MANAGER", employee_id=manager.id),
+            User(username="hr", password_hash=hash_password("hr-password"), role="HR", employee_id=hr.id),
         ])
         db.add_all([
             LeaveBalance(employee_id=employee.id, leave_type="CASUAL", total_days=12, used_days=8),

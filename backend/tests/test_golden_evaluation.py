@@ -11,7 +11,8 @@ def test_golden_dataset_is_valid_and_covers_required_categories():
     assert len(cases) >= 75
     assert len({case.id for case in cases}) == len(cases)
     assert {case.category for case in cases} >= {
-        "api_safety", "leave_action", "leave_balance", "leave_rules", "policy", "safety", "scope"
+        "api_safety", "leave_action", "leave_balance", "leave_rules", "manager_workflow",
+        "policy", "safety", "scope"
     }
     assert any(case.mutating for case in cases)
 

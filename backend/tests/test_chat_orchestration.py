@@ -1,4 +1,5 @@
 import json
+from datetime import date
 
 import httpx
 import pytest
@@ -7,7 +8,12 @@ from sqlalchemy import select
 from app.agent.orchestrator import HRAssistantOrchestrator
 from app.api.routes.chat import get_llm_gateway, get_policy_service
 from app.application.leave.service import LeaveService
-from app.application.pending.handlers import ApplyLeaveHandler
+from app.application.pending.handlers import (
+    ApplyLeaveHandler,
+    ApproveLeaveRequestHandler,
+    CancelLeaveRequestHandler,
+    RejectLeaveRequestHandler,
+)
 from app.application.pending.service import PendingActionCoordinator
 from app.core.config import Settings
 from app.core.exceptions import AuthorizationError, LLMServiceError
@@ -61,6 +67,7 @@ def route(**overrides) -> str:
         "start_date": None,
         "end_date": None,
         "reason": None,
+        "request_id": None,
         **overrides,
     }
     return json.dumps(payload)
@@ -79,7 +86,12 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
     leave = LeaveService(SQLAlchemyLeaveRepository(db_session))
     pending = PendingActionCoordinator(
         SQLAlchemyPendingActionRepository(db_session),
-        {"apply_leave": ApplyLeaveHandler(leave)},
+        {
+            "apply_leave": ApplyLeaveHandler(leave),
+            "approve_leave_request": ApproveLeaveRequestHandler(leave),
+            "reject_leave_request": RejectLeaveRequestHandler(leave),
+            "cancel_leave_request": CancelLeaveRequestHandler(leave),
+        },
     )
     return HRAssistantOrchestrator(
         settings=settings or Settings(),
@@ -141,6 +153,131 @@ def test_pending_leave_can_be_cancelled_without_execution(db_session):
     assert "cancelled" in cancelled.message
     assert db_session.scalars(select(LeaveRequest)).all() == []
     assert db_session.scalar(select(PendingAction).where(PendingAction.session_id == "cancel-session")) is None
+
+
+def test_manager_can_list_direct_report_approval_queue_in_chat(db_session):
+    LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12), "Appointment"
+    )
+    llm = FakeLLM([route(domain="general", intent="general")])
+
+    result = orchestrator(
+        db_session, llm, current_actor=actor(db_session, "manager")
+    ).chat("manager-queue", "Show my pending approvals")
+
+    assert result.intent == "manager_leave_requests"
+    assert "Pending leave approvals" in result.message
+    assert "Test Employee" in result.message
+
+
+def test_manager_chat_approval_requires_confirmation_and_is_atomic(db_session):
+    created = LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12), "Appointment"
+    )
+    llm = FakeLLM([route(domain="general", intent="general")])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "manager"))
+
+    proposal = service.chat("manager-approve", f"Approve leave request #{created.id}")
+    assert "Reply yes to confirm" in proposal.message
+    assert db_session.get(LeaveRequest, created.id).status == "PENDING"
+
+    confirmed = service.chat("manager-approve", "yes")
+    assert f"request #{created.id} was approved" in confirmed.message
+    assert db_session.get(LeaveRequest, created.id).status == "APPROVED"
+    assert db_session.scalar(select(PendingAction).where(
+        PendingAction.session_id == "manager-approve"
+    )) is None
+
+
+def test_manager_chat_rejection_requires_reason_before_confirmation(db_session):
+    created = LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
+    )
+    llm = FakeLLM([
+        route(intent="reject_leave_request", request_id=created.id),
+        route(intent="reject_leave_request", request_id=created.id, reason="Release deadline"),
+    ])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "manager"))
+
+    missing = service.chat("manager-reject", f"Reject request #{created.id}")
+    assert "provide a reason" in missing.message
+    proposal = service.chat(
+        "manager-reject", f"Reject request #{created.id} because Release deadline"
+    )
+    assert "Reply yes to confirm" in proposal.message
+
+    confirmed = service.chat("manager-reject", "yes")
+    assert "was rejected" in confirmed.message
+    assert db_session.get(LeaveRequest, created.id).status == "REJECTED"
+
+
+def test_employee_chat_cancellation_requires_confirmation(db_session):
+    created = LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
+    )
+    service = orchestrator(db_session, FakeLLM([route(intent="leave_requests")]))
+
+    proposal = service.chat("employee-cancel-request", f"Cancel my leave request #{created.id}")
+    assert "Reply yes to confirm" in proposal.message
+    assert db_session.get(LeaveRequest, created.id).status == "PENDING"
+
+    confirmed = service.chat("employee-cancel-request", "yes")
+    assert "was cancelled" in confirmed.message
+    assert db_session.get(LeaveRequest, created.id).status == "CANCELLED"
+
+
+def test_employee_cannot_approve_a_leave_request_through_chat(db_session):
+    created = LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
+    )
+
+    with pytest.raises(AuthorizationError):
+        orchestrator(db_session, FakeLLM([route(intent="leave_requests")])).chat(
+            "employee-approve", f"Approve leave request #{created.id}"
+        )
+
+
+def test_authorized_request_history_is_available_in_chat(db_session):
+    created = LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
+    )
+
+    result = orchestrator(db_session, FakeLLM([route(intent="leave_requests")])).chat(
+        "employee-request-history", f"Show history for request #{created.id}"
+    )
+
+    assert result.intent == "leave_request_history"
+    assert "Pending by user" in result.message
+
+
+def test_recent_leave_requests_is_distinct_from_single_request_audit_history(db_session):
+    LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
+    )
+
+    result = orchestrator(
+        db_session, FakeLLM([route(intent="leave_request_history")])
+    ).chat("employee-recent-requests", "Show my recent leave requests")
+
+    assert result.intent == "leave_requests"
+    assert "Your recent leave requests" in result.message
+
+
+def test_manager_can_switch_from_approval_queue_to_policy_question(db_session):
+    llm = FakeLLM([
+        route(intent="general", domain="general"),
+        route(intent="policy_question", domain="policy"),
+        "The policy provides six casual leave days [Revised Leave Policy - I2I.pdf, page 2].",
+    ])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "manager"))
+
+    queue = service.chat("manager-domain-switch", "Show my pending approvals")
+    policy = service.chat("manager-domain-switch", "What is the casual leave policy?")
+
+    assert queue.intent == "manager_leave_requests"
+    assert policy.domain == "policy"
+    assert policy.intent == "policy_question"
+    assert policy.sources[0]["document"] == "Revised Leave Policy - I2I.pdf"
 
 
 def test_router_cannot_invent_an_unstated_leave_type(db_session):

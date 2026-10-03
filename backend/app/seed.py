@@ -54,6 +54,13 @@ def seed() -> None:
                     db.add(LeaveBalance(employee_id=employee.id, leave_type=leave_type,
                                         total_days=total, used_days=used))
 
+        # Keep the display name for compatibility, but use a trusted employee FK
+        # for approval authorization.
+        employee = db.scalar(select(Employee).where(Employee.employee_code == "E1001"))
+        manager = db.scalar(select(Employee).where(Employee.employee_code == "M1001"))
+        if employee is not None and manager is not None:
+            employee.manager_employee_id = manager.id
+
         year = date.today().year
         for holiday_date, name in (
             (date(year, 1, 26), "Republic Day"),

@@ -25,15 +25,22 @@ ROUTER_SYSTEM_PROMPT = """You route requests for an HR employee assistant.
 Return exactly one JSON object with these fields:
 - domain: leave, policy, onboarding, parking, or general
 - intent: policy_question, leave_balance, leave_eligibility, apply_leave, leave_requests,
-  calculate_leave_days, holidays, onboarding, parking, or general
+  manager_leave_requests, approve_leave_request, reject_leave_request, cancel_leave_request,
+  leave_request_history, calculate_leave_days, holidays, onboarding, parking, or general
 - confidence: number from 0 to 1
 - leave_type: CASUAL, SICK, PRIVILEGE, or null
 - start_date: YYYY-MM-DD or null
 - end_date: YYYY-MM-DD or null
 - reason: string or null
+- request_id: positive integer or null
 
 Policy or rules questions use policy/policy_question. Personal balance, eligibility, calculation,
 application, holidays, and request history use leave. Never invent missing dates or fields.
+Manager approval queues and approval/rejection actions use their dedicated intents. An employee
+cancelling their own submitted request uses cancel_leave_request. Extract a request ID only when
+the user explicitly provides it. Rejection reasons belong in reason. Use leave_requests for a list
+of the employee's recent requests. Use leave_request_history only for the audit trail of one
+specific request ID.
 When the user clearly asks about one specific date, set both start_date and end_date to that date.
 Questions about general entitlements or rules use policy_question. Questions asking whether the
 current employee can use a named leave type on a date use leave_eligibility, even on weekends or
@@ -161,12 +168,21 @@ class HRAssistantOrchestrator:
                 "pending_summary": None,
             }
         created = self.pending.confirm(self.actor, state["session_id"])
-        return {
-            "response": (
+        action_type = action.action_type
+        if action_type == "approve_leave_request":
+            response = f"Leave request #{created.id} was approved successfully."
+        elif action_type == "reject_leave_request":
+            response = f"Leave request #{created.id} was rejected successfully."
+        elif action_type == "cancel_leave_request":
+            response = f"Your leave request #{created.id} was cancelled successfully."
+        else:
+            response = (
                 f"Your {created.leave_type.value.title()} leave request for "
                 f"{self._number(created.working_days)} working day(s) was submitted successfully "
                 f"with request ID {created.id}."
-            ),
+            )
+        return {
+            "response": response,
             "active_domain": "leave",
             "pending_summary": None,
         }
@@ -238,6 +254,59 @@ class HRAssistantOrchestrator:
                 for item in requests[:10]
             ]
             return {"response": "Your recent leave requests:\n" + "\n".join(lines), "active_domain": "leave"}
+        if route.intent == "manager_leave_requests":
+            requests = self.leave.get_managed_leave_requests(self.actor)
+            if not requests:
+                return {"response": "There are no pending leave requests in your approval queue.",
+                        "active_domain": "leave"}
+            lines = [
+                f"#{item.id}: {item.employee_name or item.employee_code or item.employee_id} — "
+                f"{item.leave_type.value.title()} {item.start_date} to {item.end_date}, "
+                f"{self._number(item.working_days)} day(s)"
+                for item in requests[:20]
+            ]
+            return {"response": "Pending leave approvals:\n" + "\n".join(lines),
+                    "active_domain": "leave"}
+        if route.intent == "leave_request_history":
+            if route.request_id is None:
+                return {"response": "Please provide the leave request ID.", "active_domain": "leave"}
+            events = self.leave.get_leave_request_history(self.actor, route.request_id)
+            lines = [
+                f"{item.to_status.value.title()} by user #{item.actor_user_id}"
+                + (f" — {item.comment}" if item.comment else "")
+                for item in events
+            ]
+            return {"response": f"History for leave request #{route.request_id}:\n" + "\n".join(lines),
+                    "active_domain": "leave"}
+        if route.intent in {"approve_leave_request", "reject_leave_request", "cancel_leave_request"}:
+            if route.request_id is None:
+                return {"response": "Please provide the leave request ID.", "active_domain": "leave"}
+            if route.intent == "reject_leave_request" and not route.reason:
+                return {"response": "Please provide a reason for rejecting the leave request.",
+                        "active_domain": "leave"}
+            if route.intent == "cancel_leave_request":
+                request = self.leave.prepare_leave_cancellation(self.actor, route.request_id)
+                action_type = "cancel_leave_request"
+                arguments = {"request_id": route.request_id, "reason": route.reason}
+                summary = f"Cancel your pending leave request #{request.id}"
+            else:
+                request = self.leave.prepare_leave_decision(self.actor, route.request_id)
+                if route.intent == "approve_leave_request":
+                    action_type = "approve_leave_request"
+                    arguments = {"request_id": route.request_id, "comment": route.reason}
+                    summary = f"Approve leave request #{request.id} for {request.employee_name or request.employee_code}"
+                else:
+                    action_type = "reject_leave_request"
+                    arguments = {"request_id": route.request_id, "reason": route.reason}
+                    summary = f"Reject leave request #{request.id}: {route.reason}"
+            action = self.pending.propose(
+                self.actor, state["session_id"], action_type, arguments, summary
+            )
+            return {
+                "response": f"{action.summary}. Reply yes to confirm or cancel.",
+                "active_domain": "leave",
+                "pending_summary": action.summary,
+            }
         if route.intent in {"leave_eligibility", "apply_leave", "calculate_leave_days", "holidays"}:
             missing = self._missing_leave_fields(route)
             if missing:
@@ -387,12 +456,70 @@ class HRAssistantOrchestrator:
             phrase in normalized
             for phrase in ("expense", "payroll", "bank account", "laptop", "performance review", "insurance")
         )
+        request_id_match = re.search(
+            r"(?:request(?:\s+id)?\s*#?|#)\s*(\d+)", normalized
+        ) or re.search(r"\b(?:approve|reject|decline|cancel|history)\D{0,12}(\d+)\b", normalized)
+        request_id = int(request_id_match.group(1)) if request_id_match else None
+        reason_match = re.search(r"\b(?:because|reason\s*:|due\s+to)\s+(.+)$", message, re.I)
+        explicit_reason = reason_match.group(1).strip() if reason_match else None
+        approval_queue_signal = any(
+            phrase in normalized
+            for phrase in ("pending approvals", "approval queue", "requests to approve", "team leave requests")
+        )
+        history_signal = bool(re.search(r"\b(history|audit(?:\s+trail)?)\b", normalized)) and "request" in normalized
+        own_request_list_signal = (
+            personal
+            and bool(re.search(r"\b(recent|list|show|view|my)\b", normalized))
+            and bool(re.search(r"\bleave\s+requests?\b", normalized))
+            and not history_signal
+            and not re.search(r"\b(approve|reject|decline|cancel|withdraw)\b", normalized)
+        )
+        approve_signal = bool(re.search(r"\bapprove\b", normalized)) and "request" in normalized
+        reject_signal = bool(re.search(r"\b(reject|decline)\b", normalized)) and "request" in normalized
+        cancel_request_signal = (
+            bool(re.search(r"\b(cancel|withdraw)\b", normalized))
+            and "request" in normalized
+            and (personal or "my" in normalized)
+        )
 
         updates: dict[str, object] = {}
         if unsupported_action_signal:
             updates.update(
                 domain="general", intent="general", confidence=max(decision.confidence, 0.95),
                 leave_type=None, start_date=None, end_date=None,
+            )
+        elif own_request_list_signal:
+            updates.update(
+                domain="leave", intent="leave_requests", confidence=max(decision.confidence, 0.98),
+                request_id=None, leave_type=None, start_date=None, end_date=None,
+            )
+        elif history_signal:
+            updates.update(
+                domain="leave", intent="leave_request_history", confidence=max(decision.confidence, 0.98),
+                request_id=request_id, leave_type=None, start_date=None, end_date=None,
+            )
+        elif approve_signal:
+            updates.update(
+                domain="leave", intent="approve_leave_request", confidence=max(decision.confidence, 0.98),
+                request_id=request_id, reason=explicit_reason or decision.reason,
+                leave_type=None, start_date=None, end_date=None,
+            )
+        elif reject_signal:
+            updates.update(
+                domain="leave", intent="reject_leave_request", confidence=max(decision.confidence, 0.98),
+                request_id=request_id, reason=explicit_reason or decision.reason,
+                leave_type=None, start_date=None, end_date=None,
+            )
+        elif cancel_request_signal:
+            updates.update(
+                domain="leave", intent="cancel_leave_request", confidence=max(decision.confidence, 0.98),
+                request_id=request_id, reason=explicit_reason or decision.reason,
+                leave_type=None, start_date=None, end_date=None,
+            )
+        elif approval_queue_signal:
+            updates.update(
+                domain="leave", intent="manager_leave_requests", confidence=max(decision.confidence, 0.98),
+                request_id=None, leave_type=None, start_date=None, end_date=None,
             )
         elif apply_signal:
             updates.update(domain="leave", intent="apply_leave", confidence=max(decision.confidence, 0.95))

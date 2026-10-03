@@ -4,7 +4,7 @@ Phased implementation of one authenticated conversational service for Leave/HR, 
 
 ## Current status
 
-Phase 0, Phase 1A deterministic Leave, Phase 1B reusable confirmation, Phase 1C policy retrieval, and Phase 1D conversational Leave are complete. Onboarding, Parking, and the frontend remain gated behind later phases.
+Phase 0, Phase 1A deterministic Leave, Phase 1B reusable confirmation, Phase 1C policy retrieval, Phase 1D conversational Leave, and Phase 1E leave approval lifecycle are complete. Onboarding, Parking, and the frontend remain gated behind later phases.
 
 Included now:
 
@@ -20,6 +20,8 @@ Included now:
 - Phase 1B reusable pending actions with ownership, expiry, cancellation, replay protection, and atomic execution
 - Phase 1C policy PDF ingestion with direct extraction, 300-DPI OCR fallback, BGE embeddings, Qdrant retrieval, source metadata, and insufficient-evidence handling
 - Phase 1D authenticated chat endpoint, LangGraph orchestration, cost-aware Bedrock Mantle routing, grounded policy answers, deterministic leave tools, conversation state, and confirmed leave execution
+- Phase 1E reporting-manager authorization, manager/HR approval queues, approve/reject/cancel transitions, atomic balance consumption, replay protection, and request audit history
+- Phase 1E conversational manager queue, approval/rejection, employee cancellation, and audit-history intents with confirmation before every mutation
 
 Not implemented yet: Onboarding, Parking, and React UI.
 
@@ -48,6 +50,12 @@ These are intentionally non-sensitive local demonstration values.
 - `POST /api/v1/auth/login`
 - `GET /api/v1/auth/me` (Bearer token required)
 - `POST /api/v1/chat` (Bearer token required)
+- `GET /api/v1/leave/requests` (employee request history)
+- `POST /api/v1/leave/requests/{id}/cancel` (cancel a pending own request)
+- `GET /api/v1/leave/requests/{id}/history` (authorized audit history)
+- `GET /api/v1/manager/leave-requests` (direct-report queue; HR sees all)
+- `POST /api/v1/manager/leave-requests/{id}/approve`
+- `POST /api/v1/manager/leave-requests/{id}/reject`
 - Interactive documentation: `http://localhost:8000/docs`
 
 Example chat request:
@@ -60,6 +68,11 @@ Example chat request:
 ```
 
 Reuse the returned `session_id` for follow-up messages and confirmation. A leave application is never executed from model output: the API stores a validated pending action and requires a separate `yes` message in the same session.
+
+The same confirmation rule applies to conversational lifecycle actions. Managers can ask to show
+pending approvals and propose approval or rejection by request ID; employees can propose cancelling
+their own pending request. Approval, rejection, or cancellation executes only after `yes` in the same
+authenticated session.
 
 ## Bedrock Mantle model cascade
 

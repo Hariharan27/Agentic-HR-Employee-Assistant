@@ -12,6 +12,11 @@ Intent = Literal[
     "leave_eligibility",
     "apply_leave",
     "leave_requests",
+    "manager_leave_requests",
+    "approve_leave_request",
+    "reject_leave_request",
+    "cancel_leave_request",
+    "leave_request_history",
     "calculate_leave_days",
     "holidays",
     "onboarding",
@@ -28,6 +33,7 @@ class RouteDecision(BaseModel):
     start_date: date | None = None
     end_date: date | None = None
     reason: str | None = Field(default=None, max_length=1000)
+    request_id: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def align_domain_with_intent(self):
@@ -37,6 +43,11 @@ class RouteDecision(BaseModel):
             "leave_eligibility": "leave",
             "apply_leave": "leave",
             "leave_requests": "leave",
+            "manager_leave_requests": "leave",
+            "approve_leave_request": "leave",
+            "reject_leave_request": "leave",
+            "cancel_leave_request": "leave",
+            "leave_request_history": "leave",
             "calculate_leave_days": "leave",
             "holidays": "leave",
             "onboarding": "onboarding",

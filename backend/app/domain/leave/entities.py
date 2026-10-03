@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -53,4 +53,20 @@ class LeaveRequestData:
     working_days: Decimal
     reason: str | None
     status: LeaveStatus = LeaveStatus.PENDING
+    manager_employee_id: int | None = None
+    decided_by_user_id: int | None = None
+    decision_comment: str | None = None
+    decided_at: datetime | None = None
+    employee_code: str | None = None
+    employee_name: str | None = None
 
+
+@dataclass(frozen=True, slots=True)
+class LeaveRequestEventData:
+    id: int | None
+    leave_request_id: int
+    actor_user_id: int
+    from_status: LeaveStatus | None
+    to_status: LeaveStatus
+    comment: str | None
+    created_at: datetime | None = None
