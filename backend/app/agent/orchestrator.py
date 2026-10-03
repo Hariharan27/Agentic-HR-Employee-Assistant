@@ -188,6 +188,10 @@ class HRAssistantOrchestrator:
         }
 
     def _route(self, state: AgentState) -> AgentState:
+        security_route = self._security_route(state["user_message"])
+        if security_route is not None:
+            return {"route": security_route, "active_domain": security_route.domain, "llm_calls": 0}
+
         today = datetime.now(ZoneInfo(self.settings.app_timezone)).date().isoformat()
         prompt = self._routing_input(state, today)
         raw, calls = self._complete(state, "router", ROUTER_SYSTEM_PROMPT, prompt, json_mode=True)
@@ -206,6 +210,27 @@ class HRAssistantOrchestrator:
             decision = self._parse_route(raw)
         decision = self._apply_routing_guards(decision, state["user_message"])
         return {"route": decision, "active_domain": decision.domain, "llm_calls": calls}
+
+    @staticmethod
+    def _security_route(message: str) -> RouteDecision | None:
+        """Route explicit policy-manipulation attacks without asking a model to obey them."""
+        normalized = message.casefold()
+        attempts_to_override = bool(
+            re.search(r"\b(ignore|disregard|override|bypass)\b", normalized)
+        )
+        attempts_to_invent = bool(
+            re.search(r"\b(invent|fabricate|make\s+up|change)\b", normalized)
+        )
+        targets_policy = "policy" in normalized and bool(
+            re.search(r"\b(document|rule|policy|policies)\b", normalized)
+        )
+        if attempts_to_override and attempts_to_invent and targets_policy:
+            return RouteDecision(
+                domain="policy",
+                intent="policy_question",
+                confidence=1.0,
+            )
+        return None
 
     @staticmethod
     def _route_destination(state: AgentState) -> str:
@@ -390,15 +415,15 @@ class HRAssistantOrchestrator:
             "active_domain": domain,
         }
 
-    def _handle_general(self, state: AgentState) -> AgentState:
-        raw, calls = self._complete(
-            state,
-            "standard",
-            "You are a concise HR assistant. Explain that you currently support leave and policy questions. "
-            "Do not claim to execute onboarding, parking, payroll, or other unavailable workflows.",
-            self._history_text(state),
-        )
-        return {"response": raw, "active_domain": "general", "llm_calls": calls}
+    @staticmethod
+    def _handle_general(state: AgentState) -> AgentState:
+        return {
+            "response": (
+                "Hello! I can help with HR policy questions and leave workflows, including balances, "
+                "eligibility, applications, request history, and manager approvals."
+            ),
+            "active_domain": "general",
+        }
 
     def _complete(
         self,
@@ -566,8 +591,28 @@ class HRAssistantOrchestrator:
                 updates.update(start_date=iso_dates[0], end_date=iso_dates[0])
             elif len(iso_dates) >= 2:
                 updates.update(start_date=iso_dates[0], end_date=iso_dates[1])
+            elif not HRAssistantOrchestrator._contains_date_reference(message):
+                updates.update(start_date=None, end_date=None)
 
         return decision.model_copy(update=updates) if updates else decision
+
+    @staticmethod
+    def _contains_date_reference(message: str) -> bool:
+        month_or_weekday = (
+            r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+            r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|"
+            r"mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|"
+            r"sat(?:urday)?|sun(?:day)?)\b"
+        )
+        relative_date = (
+            r"\b(?:today|tomorrow|yesterday|day after tomorrow|next week|this week|"
+            r"next month|this month)\b"
+        )
+        numeric_date = (
+            r"\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}(?:[-/]\d{2,4})?|"
+            r"\d{1,2}(?:st|nd|rd|th))\b"
+        )
+        return bool(re.search(f"(?:{month_or_weekday}|{relative_date}|{numeric_date})", message, re.I))
 
     @staticmethod
     def _missing_leave_fields(route: RouteDecision) -> list[str]:

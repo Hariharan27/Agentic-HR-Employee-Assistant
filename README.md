@@ -4,7 +4,7 @@ Phased implementation of one authenticated conversational service for Leave/HR, 
 
 ## Current status
 
-Phase 0, Phase 1A deterministic Leave, Phase 1B reusable confirmation, Phase 1C policy retrieval, Phase 1D conversational Leave, and Phase 1E leave approval lifecycle are complete. Onboarding, Parking, and the frontend remain gated behind later phases.
+Phase 0, Phase 1A deterministic Leave, Phase 1B reusable confirmation, Phase 1C policy retrieval, Phase 1D conversational Leave, Phase 1E leave approval lifecycle, and the assessment frontend are complete. Onboarding and Parking remain gated behind later phases.
 
 Included now:
 
@@ -22,8 +22,9 @@ Included now:
 - Phase 1D authenticated chat endpoint, LangGraph orchestration, cost-aware Bedrock Mantle routing, grounded policy answers, deterministic leave tools, conversation state, and confirmed leave execution
 - Phase 1E reporting-manager authorization, manager/HR approval queues, approve/reject/cancel transitions, atomic balance consumption, replay protection, and request audit history
 - Phase 1E conversational manager queue, approval/rejection, employee cancellation, and audit-history intents with confirmation before every mutation
+- Responsive Ideator PeopleDesk React interface with role-aware login, grounded chat sources, confirmation controls, and live leave/approval data
 
-Not implemented yet: Onboarding, Parking, and React UI.
+Not implemented yet: Onboarding and Parking workflows.
 
 ## Docker startup
 
