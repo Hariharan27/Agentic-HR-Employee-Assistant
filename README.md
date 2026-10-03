@@ -4,7 +4,7 @@ Phased implementation of one authenticated conversational service for Leave/HR, 
 
 ## Current status
 
-Phase 0, Phase 1A deterministic Leave, Phase 1B reusable confirmation, and Phase 1C policy retrieval are complete. Agent orchestration and the frontend remain gated behind later phases.
+Phase 0, Phase 1A deterministic Leave, Phase 1B reusable confirmation, Phase 1C policy retrieval, and Phase 1D conversational Leave are complete. Onboarding, Parking, and the frontend remain gated behind later phases.
 
 Included now:
 
@@ -19,8 +19,9 @@ Included now:
 - Phase 1A leave balances, holidays, working-day calculation, eligibility, and leave requests
 - Phase 1B reusable pending actions with ownership, expiry, cancellation, replay protection, and atomic execution
 - Phase 1C policy PDF ingestion with direct extraction, 300-DPI OCR fallback, BGE embeddings, Qdrant retrieval, source metadata, and insufficient-evidence handling
+- Phase 1D authenticated chat endpoint, LangGraph orchestration, cost-aware Bedrock Mantle routing, grounded policy answers, deterministic leave tools, conversation state, and confirmed leave execution
 
-Not implemented yet: chat endpoint, LangGraph orchestration, Onboarding, Parking, and React UI.
+Not implemented yet: Onboarding, Parking, and React UI.
 
 ## Docker startup
 
@@ -46,7 +47,29 @@ These are intentionally non-sensitive local demonstration values.
 - `GET /api/v1/health`
 - `POST /api/v1/auth/login`
 - `GET /api/v1/auth/me` (Bearer token required)
+- `POST /api/v1/chat` (Bearer token required)
 - Interactive documentation: `http://localhost:8000/docs`
+
+Example chat request:
+
+```json
+{
+  "message": "How many casual leave days do I have?",
+  "session_id": "optional-client-session-id"
+}
+```
+
+Reuse the returned `session_id` for follow-up messages and confirmation. A leave application is never executed from model output: the API stores a validated pending action and requires a separate `yes` message in the same session.
+
+## Bedrock Mantle model cascade
+
+Set `BEDROCK_API_KEY` in the untracked `.env` file. The configured cascade is:
+
+- `openai.gpt-oss-20b` at low reasoning effort for structured routing and field extraction
+- `openai.gpt-oss-120b` for grounded policy and general responses
+- `openai.gpt-oss-120b` with medium reasoning effort only when router confidence is below `COMPLEX_ESCALATION_THRESHOLD`
+
+Each request is capped by `LLM_MAX_CALLS_PER_REQUEST` (default: 3). Deterministic leave operations do not use the reasoning models after routing, and automated tests use fake providers so they incur no model cost.
 
 ## Local backend development
 
@@ -69,6 +92,22 @@ Run tests with:
 cd backend
 pytest
 ```
+
+## Golden behavior evaluation
+
+The versioned live-model dataset is in `backend/evals/golden_v1.jsonl`. It evaluates routing,
+field extraction, deterministic leave behavior, policy grounding, confirmation safety, scope
+boundaries, adversarial prompts, and API security without relying on exact response wording.
+
+```bash
+cd backend
+.venv/bin/python evals/run_golden.py --dry-run
+.venv/bin/python evals/run_golden.py --repeat 3 --fail-under 0.95
+```
+
+HTML and JSON reports are written under the ignored `backend/evals/reports/` directory. Confirmed
+write cases are skipped unless `--include-mutating` is supplied and should only be run against a
+disposable database.
 
 ## Policy ingestion
 

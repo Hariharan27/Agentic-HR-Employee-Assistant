@@ -11,7 +11,11 @@ from app.rag.service import PolicyKnowledgeService
 
 
 class FakeEmbeddings:
+    def __init__(self):
+        self.query = None
+
     def embed_query(self, text: str) -> list[float]:
+        self.query = text
         return [1.0, 0.0, 0.0]
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -137,3 +141,17 @@ def test_policy_service_refuses_to_answer_without_evidence():
 
     with pytest.raises(MissingPolicyEvidenceError, match="enough evidence"):
         service.search("What is the moon leave allowance?")
+
+
+def test_policy_service_expands_resignation_notice_question_for_retrieval():
+    embeddings = FakeEmbeddings()
+    match = PolicySearchResult(
+        text="Employees serving notice are not eligible for leave.", score=0.91,
+        document="Leave Policy.pdf", page=3, section="Leave", category="leave",
+    )
+    service = PolicyKnowledgeService(embeddings, FakeVectorStore([match]))
+
+    service.search("Can an employee serving resignation notice use CL or WFH?")
+
+    assert "not eligible to avail Casual Leave" in embeddings.query
+    assert "Work from Home (WFH)" in embeddings.query

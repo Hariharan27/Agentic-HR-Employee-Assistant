@@ -39,3 +39,8 @@ class PendingActionExpiredError(ApplicationError):
 class MissingPolicyEvidenceError(ApplicationError):
     status_code = 404
     code = "missing_policy_evidence"
+
+
+class LLMServiceError(ApplicationError):
+    status_code = 503
+    code = "llm_service_unavailable"

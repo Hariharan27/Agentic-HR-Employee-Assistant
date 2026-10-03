@@ -11,7 +11,20 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
         }
-        for key in ("request_id", "session_id", "user_id", "domain", "node", "tool", "duration_ms", "status"):
+        for key in (
+            "request_id",
+            "session_id",
+            "user_id",
+            "domain",
+            "node",
+            "tool",
+            "model",
+            "tier",
+            "input_tokens",
+            "output_tokens",
+            "duration_ms",
+            "status",
+        ):
             value = getattr(record, key, None)
             if value is not None:
                 payload[key] = value
@@ -26,4 +39,3 @@ def configure_logging(level: str = "INFO") -> None:
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level.upper())
-

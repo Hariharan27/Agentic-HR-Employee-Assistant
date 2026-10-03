@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "Agentic HR & Employee Assistant"
     environment: str = "development"
+    app_timezone: str = "Asia/Kolkata"
     database_url: str = "postgresql+psycopg://hr_app:hr_app@postgres:5432/hr_assistant"
     jwt_secret: str = Field(default="local-development-secret-change-me-32", min_length=32)
     jwt_algorithm: str = "HS256"
@@ -24,13 +25,14 @@ class Settings(BaseSettings):
     bedrock_region: str = "us-east-1"
     bedrock_api_key: str = ""
     bedrock_openai_base_url: str = "https://bedrock-mantle.us-east-1.api.aws/v1"
-    bedrock_anthropic_base_url: str = "https://bedrock-mantle.us-east-1.api.aws/anthropic"
     router_model_id: str = "openai.gpt-oss-20b"
     standard_model_id: str = "openai.gpt-oss-120b"
-    complex_model_id: str = "anthropic.claude-haiku-4-5"
+    complex_model_id: str = "openai.gpt-oss-120b"
+    router_reasoning_effort: str = "low"
+    complex_reasoning_effort: str = "medium"
     router_max_output_tokens: int = 250
     standard_max_output_tokens: int = 700
-    complex_max_output_tokens: int = 900
+    complex_max_output_tokens: int = 1200
     complex_escalation_threshold: float = 0.70
     llm_max_retries: int = 1
     llm_max_calls_per_request: int = 3
