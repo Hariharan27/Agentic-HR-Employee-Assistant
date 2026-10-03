@@ -33,6 +33,7 @@ docker compose up --build
 ```
 
 The backend applies migrations and idempotently seeds demo identities before starting at `http://localhost:8000`.
+The React assessment UI is available at `http://localhost:5173`.
 
 ## Demo credentials
 
@@ -57,6 +58,7 @@ These are intentionally non-sensitive local demonstration values.
 - `POST /api/v1/manager/leave-requests/{id}/approve`
 - `POST /api/v1/manager/leave-requests/{id}/reject`
 - Interactive documentation: `http://localhost:8000/docs`
+- React chat interface: `http://localhost:5173`
 
 Example chat request:
 
@@ -105,6 +107,17 @@ Run tests with:
 cd backend
 pytest
 ```
+
+Run the frontend locally with:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Create a production frontend bundle with `npm run build`. Set `VITE_API_BASE_URL` when the API is
+not available at `http://localhost:8000`.
 
 ## Golden behavior evaluation
 

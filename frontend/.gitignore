@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Production build
+dist/
+
+# Vite and TypeScript caches
+.vite/
+*.tsbuildinfo
+
+# Local environment overrides
+.env
+.env.local
+.env.*.local
+
+# Logs and editor metadata
+*.log
+.DS_Store

@@ -370,12 +370,13 @@ def test_non_leave_submission_is_not_treated_as_leave_application():
 def test_policy_answer_returns_grounding_sources(db_session):
     llm = FakeLLM([
         route(domain="policy", intent="policy_question"),
-        "Employees receive six casual leave days [Revised Leave Policy - I2I.pdf, page 2].",
+        "Employees receive **6days** of casual leave [Revised Leave Policy - I2I.pdf, page 2].",
     ])
 
     result = orchestrator(db_session, llm).chat("policy-session", "What is the casual leave policy?")
 
     assert result.domain == "policy"
+    assert result.message == "Employees receive 6 days of casual leave."
     assert result.sources[0]["page"] == 2
     assert llm.calls == [("router", True), ("standard", False)]
 

@@ -218,8 +218,11 @@ class HRAssistantOrchestrator:
         context = self.policies.search(state["user_message"])
         system = (
             "Answer the employee's HR policy question using only the supplied policy context. "
-            "Do not add rules that are absent. If passages conflict, say so. Be concise and cite "
-            "the document and page in the answer."
+            "Do not add rules that are absent, and explicitly mention any conflict in the passages. "
+            "Lead with the direct answer and use at most three short sentences unless the employee "
+            "asks for steps or a detailed explanation. Use plain text only: no Markdown, headings, "
+            "bullets, quotations, document names, page numbers, or inline citations. The interface "
+            "shows source documents separately. Use natural grammar and spacing, such as '12 days'."
         )
         raw, calls = self._complete(
             state,
@@ -228,11 +231,28 @@ class HRAssistantOrchestrator:
             f"Question:\n{state['user_message']}\n\nPolicy context:\n{context.text}",
         )
         return {
-            "response": raw,
+            "response": self._clean_policy_response(raw),
             "sources": context.sources,
             "active_domain": "policy",
             "llm_calls": calls,
         }
+
+    @staticmethod
+    def _clean_policy_response(response: str) -> str:
+        """Keep policy answers readable when a model ignores presentation instructions."""
+        cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", response, flags=re.DOTALL)
+        cleaned = re.sub(r"__(.*?)__", r"\1", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r"\s*\[[^\]\n]*\.pdf[^\]\n]*\]", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"(?<=\d)(?=(?:days?|weeks?|months?|years?|hours?)\b)",
+            " ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"[ \t]+([.,;:])", r"\1", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
 
     def _handle_leave(self, state: AgentState) -> AgentState:
         route: RouteDecision = state["route"]
