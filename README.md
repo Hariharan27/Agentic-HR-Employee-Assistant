@@ -58,7 +58,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
 | Safe actions | Expiring pending actions and explicit Confirm/Cancel step |
 | Manager workflow | Direct-report queue, approve/reject, balance update, audit history |
 | Onboarding workflow | Four provisioning tasks, HR Admin approval, account activation, employee login |
-| Quality evidence | 110 automated tests and 85 live golden scenarios |
+| Parking foundation | PostgreSQL-backed vehicles, slots, lifecycle audit, waitlist, and allocation constraints |
+| Quality evidence | 119 automated tests and 93 live golden scenarios |
 
 ## Quick start with Docker
 
@@ -98,19 +99,21 @@ migrations and performs non-destructive, idempotent seeding.
 | Manager | `manager` | `manager123` |
 | HR | `hr` | `hr12345` |
 | HR Administrator | `hradmin` | `hradmin123` |
+| Parking Administrator | `parkingadmin` | `parkingadmin123` |
 
 These credentials are intentionally non-sensitive and exist only for local demonstration.
 
-Reset the four demo identities to a predictable state before recording:
+Reset the five demo identities to a predictable state before recording:
 
 ```bash
 docker compose exec -T backend python -m app.seed --reset-demo
 ```
 
-The reset clears demo conversations, pending actions, leave activity, and onboarding requests
+The reset clears demo conversations, pending actions, leave and parking activity, and onboarding requests
 created by demo identities—including any accounts activated from them. It restores the documented
-passwords and balances and creates one pending Casual Leave request for the manager flow. Policy
-vectors, schema, and unrelated employees are not changed.
+passwords, balances, registered vehicles, five parking slots, one occupied-slot scenario, and one
+pending Casual Leave request for the manager flow. Policy vectors, schema, and unrelated employees
+are not changed.
 
 Follow [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the exact 6–8 minute assessment walkthrough.
 
@@ -273,11 +276,14 @@ Completed:
 - Ideator PeopleDesk assessment frontend
 - Golden behavior evaluation and demo reset
 - New-employee onboarding, HR Admin approval, and employee account activation
+- Workplace parking persistence foundation: vehicles, slots, reservations, waitlist, lifecycle audit,
+  concurrency constraints, configuration, and repeatable demo data
 
 Future phases:
 
-- Workplace parking workflow
+- Workplace parking chat workflow and Parking Admin operations
 - Production identity provider and managed secret storage
 - Production observability and deployment hardening
 
-The future parking domain label is recognized only to return a transparent unavailable response.
+The parking schema is ready, but the parking domain label still returns a transparent unavailable
+response until the Phase 3B chat workflow is connected.

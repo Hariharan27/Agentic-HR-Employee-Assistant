@@ -15,8 +15,13 @@ from app.infrastructure.database.models import (
     LeaveRequestEvent,
     OnboardingRequest,
     OnboardingTask,
+    ParkingReservation,
+    ParkingReservationEvent,
+    ParkingSlot,
+    ParkingWaitlistEntry,
     PendingAction,
     User,
+    Vehicle,
 )
 from app.infrastructure.database.session import SessionLocal
 
@@ -86,6 +91,22 @@ DEMO_USERS = (
         "password": "hradmin123",
         "role": "HR_ADMIN",
     },
+    {
+        "employee": {
+            "employee_code": "P1001",
+            "name": "Arun Prakash",
+            "email": "arun.parking@example.test",
+            "designation": "Workplace Operations Administrator",
+            "department": "Workplace Operations",
+            "manager_name": None,
+            "location": "Chennai",
+            "employment_type": "Permanent",
+            "joining_date": date(2021, 8, 16),
+        },
+        "username": "parkingadmin",
+        "password": "parkingadmin123",
+        "role": "PARKING_ADMIN",
+    },
 )
 
 DEMO_BALANCES = {
@@ -93,11 +114,34 @@ DEMO_BALANCES = {
     "MANAGER": (("CASUAL", 12, 2), ("PRIVILEGE", 18, 4), ("SICK", 10, 0)),
     "HR": (("CASUAL", 12, 1), ("PRIVILEGE", 18, 2), ("SICK", 10, 0)),
     "HR_ADMIN": (("CASUAL", 12, 1), ("PRIVILEGE", 18, 2), ("SICK", 10, 0)),
+    "PARKING_ADMIN": (("CASUAL", 12, 1), ("PRIVILEGE", 18, 2), ("SICK", 10, 0)),
 }
+
+DEMO_VEHICLES = {
+    "EMPLOYEE": ("TN01AR1001", "CAR", "Hyundai i20"),
+    "MANAGER": ("TN01KI1001", "CAR", "Honda City"),
+    "HR": ("KA01MN1001", "CAR", "Tata Nexon"),
+    "HR_ADMIN": ("TN01NK1001", "MOTORCYCLE", "TVS Ntorq"),
+}
+
+DEMO_PARKING_SLOTS = (
+    ("B-21", "Chennai HQ - Basement B", "REGULAR"),
+    ("B-22", "Chennai HQ - Basement B", "REGULAR"),
+    ("B-23", "Chennai HQ - Basement B", "REGULAR"),
+    ("B-24", "Chennai HQ - Basement B", "REGULAR"),
+    ("B-25", "Chennai HQ - Basement B", "ACCESSIBLE"),
+)
 
 
 def _next_demo_workday() -> date:
     candidate = date.today() + timedelta(days=14)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def _next_parking_workday() -> date:
+    candidate = date.today() + timedelta(days=1)
     while candidate.weekday() >= 5:
         candidate += timedelta(days=1)
     return candidate
@@ -116,6 +160,25 @@ def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[in
     activated_employee_ids = [
         row.activated_employee_id for row in onboarding_rows if row.activated_employee_id
     ]
+    parking_employee_ids = [*employee_ids, *activated_employee_ids]
+    parking_reservation_ids = select(ParkingReservation.id).where(
+        ParkingReservation.employee_id.in_(parking_employee_ids)
+    )
+    db.execute(
+        delete(ParkingReservationEvent).where(
+            ParkingReservationEvent.reservation_id.in_(parking_reservation_ids)
+        )
+    )
+    db.execute(
+        delete(ParkingWaitlistEntry).where(
+            ParkingWaitlistEntry.employee_id.in_(parking_employee_ids)
+        )
+    )
+    db.execute(
+        delete(ParkingReservation).where(
+            ParkingReservation.employee_id.in_(parking_employee_ids)
+        )
+    )
     if onboarding_ids:
         db.execute(
             delete(OnboardingTask).where(
@@ -147,6 +210,7 @@ def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[in
         )
         db.execute(delete(User).where(User.id.in_(activated_user_ids)))
     if activated_employee_ids:
+        db.execute(delete(Vehicle).where(Vehicle.employee_id.in_(activated_employee_ids)))
         db.execute(delete(Employee).where(Employee.id.in_(activated_employee_ids)))
     request_ids = select(LeaveRequest.id).where(LeaveRequest.employee_id.in_(employee_ids))
     db.execute(delete(LeaveRequestEvent).where(LeaveRequestEvent.leave_request_id.in_(request_ids)))
@@ -219,6 +283,45 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
                 balance.total_days = Decimal(total)
                 balance.used_days = Decimal(used)
 
+    vehicles: dict[str, Vehicle] = {}
+    for role, (registration_number, vehicle_type, make_model) in DEMO_VEHICLES.items():
+        employee = employees[role]
+        vehicle = db.scalar(select(Vehicle).where(Vehicle.employee_id == employee.id))
+        if vehicle is None:
+            vehicle = Vehicle(
+                employee_id=employee.id,
+                registration_number=registration_number,
+                vehicle_type=vehicle_type,
+                make_model=make_model,
+                active=True,
+            )
+            db.add(vehicle)
+            db.flush()
+        elif reset_demo:
+            vehicle.registration_number = registration_number
+            vehicle.vehicle_type = vehicle_type
+            vehicle.make_model = make_model
+            vehicle.active = True
+        vehicles[role] = vehicle
+
+    parking_slots: dict[str, ParkingSlot] = {}
+    for code, location, slot_type in DEMO_PARKING_SLOTS:
+        slot = db.scalar(select(ParkingSlot).where(ParkingSlot.code == code))
+        if slot is None:
+            slot = ParkingSlot(
+                code=code,
+                location=location,
+                slot_type=slot_type,
+                active=True,
+            )
+            db.add(slot)
+            db.flush()
+        elif reset_demo:
+            slot.location = location
+            slot.slot_type = slot_type
+            slot.active = True
+        parking_slots[code] = slot
+
     year = date.today().year
     for holiday_date, name in (
         (date(year, 1, 26), "Republic Day"),
@@ -257,6 +360,34 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
             )
         )
 
+    parking_date = _next_parking_workday()
+    occupied = db.scalar(
+        select(ParkingReservation).where(
+            ParkingReservation.employee_id == employees["MANAGER"].id,
+            ParkingReservation.reservation_date == parking_date,
+            ParkingReservation.status.in_(("RESERVED", "CHECKED_IN")),
+        )
+    )
+    if occupied is None:
+        occupied = ParkingReservation(
+            employee_id=employees["MANAGER"].id,
+            vehicle_id=vehicles["MANAGER"].id,
+            slot_id=parking_slots["B-21"].id,
+            reservation_date=parking_date,
+            status="RESERVED",
+        )
+        db.add(occupied)
+        db.flush()
+        db.add(
+            ParkingReservationEvent(
+                reservation_id=occupied.id,
+                actor_user_id=users["MANAGER"].id,
+                from_status=None,
+                to_status="RESERVED",
+                reason="Seeded occupied slot for the parking demo",
+            )
+        )
+
 
 def seed(*, reset_demo: bool = False) -> None:
     with SessionLocal.begin() as db:
@@ -268,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--reset-demo",
         action="store_true",
-        help="Clear demo conversations and leave activity, then restore the baseline demo scenario",
+        help="Clear demo activity and restore the leave, onboarding, and parking baseline",
     )
     args = parser.parse_args()
     seed(reset_demo=args.reset_demo)

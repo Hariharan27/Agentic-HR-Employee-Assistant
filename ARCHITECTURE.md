@@ -1,8 +1,9 @@
 # Ideator PeopleDesk — As-Built Technical Architecture
 
 This document describes the implementation currently present in the repository. The assessment
-release implements authenticated HR policy, leave, and employee-onboarding lifecycles end to end;
-parking remains a future extension.
+release implements authenticated HR policy, leave, and employee-onboarding lifecycles end to end.
+Parking persistence is implemented as a foundation; its chat and administrator workflows remain
+the next phased extensions.
 
 ## 1. Architecture goals
 
@@ -273,6 +274,11 @@ Cost and stability controls include:
 | `leave_requests` | Dates, working days, status, manager, decision metadata |
 | `leave_request_events` | Immutable lifecycle/audit entries |
 | `holidays` | Dates excluded from working-day calculations |
+| `vehicles` | One registered active vehicle per employee for the parking MVP |
+| `parking_slots` | Database-backed workplace parking inventory |
+| `parking_reservations` | Reservation and attendance lifecycle state |
+| `parking_reservation_events` | Auditable reservation status transitions and reasons |
+| `parking_waitlist` | One active waitlist entry per employee and date |
 
 Alembic owns schema evolution. PostgreSQL constraints, foreign keys, indexes, row locking, and
 application transactions support integrity and concurrency safety.
@@ -305,10 +311,10 @@ The frontend renders server decisions; it is not an authorization boundary.
 
 ## 14. Quality strategy
 
-- **114 deterministic tests** cover authentication, security, leave rules, onboarding approval and
-  account activation, pending actions, manager lifecycle, RAG, orchestration, evaluation contracts,
-  and repeatable demo seed.
-- **85 versioned golden scenarios** exercise the live API and configured models across policy,
+- **119 deterministic tests** cover authentication, security, leave rules, onboarding approval and
+  account activation, parking persistence and allocation constraints, pending actions, manager
+  lifecycle, RAG, orchestration, evaluation contracts, and repeatable demo seed.
+- **93 versioned golden scenarios** exercise the live API and configured models across policy,
   leave, safety, scope, manager workflow, and API safety categories.
 - The latest complete live release gate scored **98.7%** with **99.0% consistency**, above both
   configured 95% thresholds; safety, API-safety, and onboarding categories passed at **100%**.
@@ -338,7 +344,11 @@ docker compose exec -T backend python -m app.seed --reset-demo
 ## 16. Future extensions
 
 Employee onboarding now uses the same validated, confirmed, atomic workflow pattern as leave.
-Parking remains a future phase and is reported transparently as unavailable. New domains can reuse
+Parking Phase 3A now provides schema, read repository, demo data, lifecycle-ready statuses, and
+database constraints preventing duplicate employee/date and slot/date allocations. Phase 3B will
+connect the employee chat workflow; Phase 3C will add Parking Admin check-in, no-show enforcement,
+and overrides. Until Phase 3B is complete, chat reports parking transparently as unavailable. New
+domains can reuse
 the existing pattern:
 
 ```text
