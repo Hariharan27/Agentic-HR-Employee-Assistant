@@ -1,42 +1,93 @@
-# Agentic HR & Employee Assistant
+# Ideator PeopleDesk
 
-Phased implementation of one authenticated conversational service for Leave/HR, Onboarding, and Parking. The source-of-truth requirements are in `PROJECT_SPEC.md` and `ARCHITECTURE.md`.
+Ideator PeopleDesk is an authenticated Agentic HR help desk for ideas2it employees. It answers HR
+questions from company policy documents and executes leave workflows against trusted employee data
+with deterministic rules, role-based authorization, human confirmation, and an auditable lifecycle.
 
-## Current status
+The assessment release completes the HR policy and leave domain end to end. Onboarding and parking
+are intentionally reserved for later phases.
 
-Phase 0, Phase 1A deterministic Leave, Phase 1B reusable confirmation, Phase 1C policy retrieval, Phase 1D conversational Leave, Phase 1E leave approval lifecycle, and the assessment frontend are complete. Onboarding and Parking remain gated behind later phases.
+## What it demonstrates
 
-Included now:
+- Authenticated employee, manager, and HR experiences
+- LangGraph intent routing and multi-turn conversation state
+- Grounded policy RAG over 32 PDFs with document/page attribution
+- Dynamic leave balances, eligibility, working-day calculation, and request history
+- Leave application, cancellation, manager approval, and rejection workflows
+- Explicit confirmation before every database mutation
+- Deterministic business rules and service-layer authorization outside the LLM
+- Cost-aware Amazon Bedrock Mantle model routing
+- Prompt-injection, replay, ownership, and invented-field protections
+- Versioned golden evaluation and repeatable demo data
 
-- FastAPI application and health endpoint
-- PostgreSQL/SQLAlchemy foundation models and Alembic migration
-- JWT authentication with trusted `user_id`, `employee_id`, and `role`
-- Employee, manager, and HR demo identities
-- Generic conversation-session and pending-action persistence foundation
-- Structured JSON logging with request IDs
-- Backend/PostgreSQL/Qdrant Docker Compose services
-- Deterministic authentication and authorization tests
-- Phase 1A leave balances, holidays, working-day calculation, eligibility, and leave requests
-- Phase 1B reusable pending actions with ownership, expiry, cancellation, replay protection, and atomic execution
-- Phase 1C policy PDF ingestion with direct extraction, 300-DPI OCR fallback, BGE embeddings, Qdrant retrieval, source metadata, and insufficient-evidence handling
-- Phase 1D authenticated chat endpoint, LangGraph orchestration, cost-aware Bedrock Mantle routing, grounded policy answers, deterministic leave tools, conversation state, and confirmed leave execution
-- Phase 1E reporting-manager authorization, manager/HR approval queues, approve/reject/cancel transitions, atomic balance consumption, replay protection, and request audit history
-- Phase 1E conversational manager queue, approval/rejection, employee cancellation, and audit-history intents with confirmation before every mutation
-- Responsive Ideator PeopleDesk React interface with role-aware login, grounded chat sources, confirmation controls, and live leave/approval data
+## Architecture
 
-Not implemented yet: Onboarding and Parking workflows.
+```mermaid
+flowchart LR
+    UI[Ideator PeopleDesk\nReact + TypeScript] -->|JWT| API[FastAPI]
+    API --> GRAPH[LangGraph]
+    GRAPH --> ROUTER[GPT OSS 20B\nRouter]
+    GRAPH --> CONFIRM[Confirmation\nLifecycle]
+    ROUTER --> POLICY[Policy RAG]
+    ROUTER --> LEAVE[Deterministic\nLeave Services]
+    POLICY --> QDRANT[(Qdrant)]
+    POLICY --> MODEL[GPT OSS 120B\nGrounded Answer]
+    LEAVE --> POSTGRES[(PostgreSQL)]
+    CONFIRM --> POSTGRES
+    GRAPH --> POSTGRES
+```
 
-## Docker startup
+The LLM proposes an intent and structured fields. Authenticated identity, authorization,
+calculations, confirmation, transactions, and audit events remain controlled by application code.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
+[PROJECT_SPEC.md](PROJECT_SPEC.md) for the phased source requirements.
+
+## Assessment coverage
+
+| Requirement | Implementation |
+|---|---|
+| Authenticated employees | JWT login and trusted `AuthenticatedUser` context |
+| Policy questions | Qdrant retrieval and grounded GPT OSS 120B response with sources |
+| Dynamic employee information | PostgreSQL-backed balances and request lifecycle |
+| Calculations | Python working-day, holiday, overlap, and balance rules |
+| Tool usage | LangGraph invokes validated policy and leave application services |
+| Agent workflow | Structured routing, conditional graph nodes, context, and escalation |
+| Safe actions | Expiring pending actions and explicit Confirm/Cancel step |
+| Manager workflow | Direct-report queue, approve/reject, balance update, audit history |
+| Quality evidence | 84 automated tests and 85 live golden scenarios |
+
+## Quick start with Docker
+
+Prerequisites: Docker Desktop and an Amazon Bedrock Mantle API key with access to the configured
+models.
 
 ```bash
 cp .env.example .env
+```
+
+Set `BEDROCK_API_KEY` in `.env`, then start the stack:
+
+```bash
 docker compose up --build
 ```
 
-The backend applies migrations and idempotently seeds demo identities before starting at `http://localhost:8000`.
-The React assessment UI is available at `http://localhost:5173`.
+On the first run, index the policy library:
 
-## Demo credentials
+```bash
+docker compose exec -T backend python -m app.rag.ingestion
+```
+
+Open:
+
+- PeopleDesk UI: [http://localhost:5173](http://localhost:5173)
+- FastAPI documentation: [http://localhost:8000/docs](http://localhost:8000/docs)
+- Health check: [http://localhost:8000/api/v1/health](http://localhost:8000/api/v1/health)
+
+Docker Compose starts React/Nginx, FastAPI, PostgreSQL, and Qdrant. Backend startup applies Alembic
+migrations and performs non-destructive, idempotent seeding.
+
+## Demo accounts
 
 | Role | Username | Password |
 |---|---|---|
@@ -44,24 +95,102 @@ The React assessment UI is available at `http://localhost:5173`.
 | Manager | `manager` | `manager123` |
 | HR | `hr` | `hr12345` |
 
-These are intentionally non-sensitive local demonstration values.
+These credentials are intentionally non-sensitive and exist only for local demonstration.
 
-## API
+Reset the three demo identities to a predictable state before recording:
+
+```bash
+docker compose exec -T backend python -m app.seed --reset-demo
+```
+
+The reset clears only demo conversations, pending actions, and leave activity. It restores the
+documented passwords and balances and creates one pending Casual Leave request for the manager
+flow. Policy vectors, schema, and non-demo employees are not changed.
+
+Follow [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the exact 6–8 minute assessment walkthrough.
+
+## Implemented agent flow
+
+```text
+POST /api/v1/chat
+  → validate JWT and load trusted actor
+  → load conversation and pending action
+  → resolve confirmation first, when present
+  → otherwise route the request
+       ├─ policy  → retrieve Qdrant evidence → grounded response + sources
+       ├─ leave   → deterministic application service
+       ├─ general → deterministic capability response
+       └─ future  → explicit not-yet-available response
+  → persist conversation state
+  → return message, intent, sources, and pending-action summary
+```
+
+Application and manager decisions follow a two-turn lifecycle:
+
+```text
+request → validate → propose pending action → explicit confirmation → revalidate → atomic write
+```
+
+No leave request or manager decision is executed directly from model output.
+
+## Application tools
+
+LangGraph invokes tool-like application services directly rather than allowing the model to run SQL
+or native provider function calls.
+
+| Area | Operations |
+|---|---|
+| Policy | Search policy evidence and return source metadata |
+| Employee leave | Balance, holidays, calculation, eligibility, apply, list, cancel |
+| Manager/HR | Approval queue, approve, reject, request audit history |
+| Confirmation | Propose, inspect, cancel, expire, and atomically execute pending actions |
+
+Every self-service operation derives employee identity from the JWT. Manager scope is derived from
+the reporting relationship stored in PostgreSQL.
+
+## Bedrock Mantle model cascade
+
+| Tier | Model | Purpose |
+|---|---|---|
+| Router | `openai.gpt-oss-20b` | Low-cost structured routing and field extraction |
+| Standard | `openai.gpt-oss-120b` | Grounded policy response generation |
+| Complex | `openai.gpt-oss-120b` | Medium-effort fallback for uncertain/invalid routing |
+
+Cost controls include small routing outputs, per-tier token limits, a maximum call budget, top-k
+retrieval, deterministic greetings and guards, and no reasoning-model call during confirmed action
+execution.
+
+Configuration is available in `.env.example`. Keep the real `.env` untracked.
+
+## Policy ingestion
+
+Place PDFs in `backend/policy_docs`, then run:
+
+```bash
+docker compose exec -T backend python -m app.rag.ingestion
+```
+
+The pipeline prefers native PDF text and uses 300-DPI OCR fallback for image-only pages. It performs
+confidence checks, creates overlapping section-aware chunks, embeds them with
+`BAAI/bge-small-en-v1.5`, and idempotently replaces each document in Qdrant. Metadata preserves the
+document, page, section, and category.
+
+## API surface
 
 - `GET /api/v1/health`
 - `POST /api/v1/auth/login`
-- `GET /api/v1/auth/me` (Bearer token required)
-- `POST /api/v1/chat` (Bearer token required)
-- `GET /api/v1/leave/requests` (employee request history)
-- `POST /api/v1/leave/requests/{id}/cancel` (cancel a pending own request)
-- `GET /api/v1/leave/requests/{id}/history` (authorized audit history)
-- `GET /api/v1/manager/leave-requests` (direct-report queue; HR sees all)
+- `GET /api/v1/auth/me`
+- `POST /api/v1/chat`
+- `GET /api/v1/leave/requests`
+- `POST /api/v1/leave/requests/{id}/cancel`
+- `GET /api/v1/leave/requests/{id}/history`
+- `GET /api/v1/manager/leave-requests`
 - `POST /api/v1/manager/leave-requests/{id}/approve`
 - `POST /api/v1/manager/leave-requests/{id}/reject`
-- Interactive documentation: `http://localhost:8000/docs`
-- React chat interface: `http://localhost:5173`
 
-Example chat request:
+All endpoints other than health and login require a bearer token.
+
+Example chat payload:
 
 ```json
 {
@@ -70,78 +199,78 @@ Example chat request:
 }
 ```
 
-Reuse the returned `session_id` for follow-up messages and confirmation. A leave application is never executed from model output: the API stores a validated pending action and requires a separate `yes` message in the same session.
+Reuse the returned `session_id` for follow-up messages and confirmation.
 
-The same confirmation rule applies to conversational lifecycle actions. Managers can ask to show
-pending approvals and propose approval or rejection by request ID; employees can propose cancelling
-their own pending request. Approval, rejection, or cancellation executes only after `yes` in the same
-authenticated session.
+## Testing and evaluation
 
-## Bedrock Mantle model cascade
-
-Set `BEDROCK_API_KEY` in the untracked `.env` file. The configured cascade is:
-
-- `openai.gpt-oss-20b` at low reasoning effort for structured routing and field extraction
-- `openai.gpt-oss-120b` for grounded policy and general responses
-- `openai.gpt-oss-120b` with medium reasoning effort only when router confidence is below `COMPLEX_ESCALATION_THRESHOLD`
-
-Each request is capped by `LLM_MAX_CALLS_PER_REQUEST` (default: 3). Deterministic leave operations do not use the reasoning models after routing, and automated tests use fake providers so they incur no model cost.
-
-## Local backend development
-
-Python 3.12 or newer is required.
+Python 3.12 or newer is required for local backend development.
 
 ```bash
 cd backend
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-export DATABASE_URL=postgresql+psycopg://hr_app:hr_app@localhost:5432/hr_assistant
-alembic upgrade head
-python -m app.seed
-uvicorn app.main:app --reload
-```
-
-Run tests with:
-
-```bash
-cd backend
 pytest
 ```
 
-Run the frontend locally with:
+Current deterministic result: **84 passed**.
 
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Create a production frontend bundle with `npm run build`. Set `VITE_API_BASE_URL` when the API is
-not available at `http://localhost:8000`.
-
-## Golden behavior evaluation
-
-The versioned live-model dataset is in `backend/evals/golden_v1.jsonl`. It evaluates routing,
-field extraction, deterministic leave behavior, policy grounding, confirmation safety, scope
-boundaries, adversarial prompts, and API security without relying on exact response wording.
+Validate or run the live golden dataset:
 
 ```bash
 cd backend
 .venv/bin/python evals/run_golden.py --dry-run
-.venv/bin/python evals/run_golden.py --repeat 3 --fail-under 0.95
+.venv/bin/python evals/run_golden.py --fail-under 0.95
 ```
 
-HTML and JSON reports are written under the ignored `backend/evals/reports/` directory. Confirmed
-write cases are skipped unless `--include-mutating` is supplied and should only be run against a
-disposable database.
+The dataset contains **85 scenarios** covering policy grounding, routing, leave rules,
+confirmations, manager workflows, authorization, prompt injection, scope, and API safety. The latest
+complete live release gate scored **98.9%**, above the configured 95% threshold. Mutating cases are
+skipped unless `--include-mutating` is supplied and should run only against a reset demo database.
 
-## Policy ingestion
+Reports are generated as ignored JSON and HTML files under `backend/evals/reports/`.
 
-Place policy PDFs in `backend/policy_docs`, then index them into Qdrant:
+Build the frontend independently with:
 
 ```bash
-docker compose exec -T backend python -m app.rag.ingestion
+cd frontend
+npm install
+npm run build
 ```
 
-Ingestion is idempotent per document. Each run replaces that document's existing vectors while preserving `document`, `page`, `section`, and `category` source metadata. Native PDF text is preferred; image-only pages use 300-DPI OCR with preprocessing and confidence checks. Visually blank pages are skipped, while unreadable non-blank pages fail ingestion instead of silently adding poor text.
+## Repository structure
+
+```text
+frontend/                   Ideator PeopleDesk React application
+backend/app/agent/          LangGraph orchestration and state
+backend/app/application/    Leave and pending-action use cases
+backend/app/domain/         Deterministic entities and business rules
+backend/app/infrastructure/ Provider and persistence adapters
+backend/app/rag/            PDF ingestion and policy retrieval
+backend/tests/              Deterministic test suite
+backend/evals/              Golden behavior dataset and runner
+backend/policy_docs/        Assessment policy PDFs
+```
+
+## Implemented scope and future phases
+
+Completed:
+
+- Authentication and conversation foundation
+- Deterministic leave domain
+- Reusable confirmation lifecycle
+- Policy RAG
+- LangGraph conversational orchestration
+- Manager approval lifecycle and audit events
+- Ideator PeopleDesk assessment frontend
+- Golden behavior evaluation and demo reset
+
+Future phases:
+
+- New-employee onboarding workflow
+- Workplace parking workflow
+- Production identity provider and managed secret storage
+- Production observability and deployment hardening
+
+The future domain labels are recognized only to return a transparent unavailable response; no
+incomplete onboarding or parking operation is represented as working.

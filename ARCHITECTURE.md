@@ -1,1116 +1,352 @@
-# Agentic HR & Employee Assistant — Technical Architecture
+# Ideator PeopleDesk — As-Built Technical Architecture
 
-## 1. Architecture Goals
+This document describes the implementation currently present in the repository. Onboarding and
+parking are intentionally listed only as future extensions; the assessment release implements the
+authenticated HR policy and leave lifecycle end to end.
 
-The architecture should:
+## 1. Architecture goals
 
-- Support a single conversational interface.
-- Support multiple enterprise workflows.
-- Separate AI orchestration from business logic.
-- Use deterministic services for business-critical operations.
-- Support RAG for organizational knowledge.
-- Support transactional operations safely.
-- Maintain multi-turn conversation state.
-- Require confirmation before side effects.
-- Enforce authentication and authorization outside the LLM.
-- Remain simple enough for an assessment/MVP.
-- Be extensible for future enterprise workflows.
+- Provide one authenticated conversational HR interface.
+- Ground policy answers in company documents with visible sources.
+- Keep identity, authorization, calculations, and writes outside the LLM.
+- Use deterministic application services for business-critical operations.
+- Require explicit human confirmation before every mutation.
+- Preserve conversation context and an auditable request lifecycle.
+- Control inference cost with tiered models, deterministic guards, and call budgets.
+- Remain extensible without presenting incomplete workflows as finished features.
 
----
+## 2. Implemented stack
 
-# 2. Technology Stack
+| Area | Technology |
+|---|---|
+| Frontend | React, TypeScript, Vite, Nginx |
+| API | Python 3.12, FastAPI, Pydantic |
+| Agent orchestration | LangGraph |
+| LLM provider | Amazon Bedrock Mantle, OpenAI-compatible chat completions |
+| Operational storage | PostgreSQL, SQLAlchemy, Alembic |
+| Policy retrieval | Qdrant, BAAI/bge-small-en-v1.5 |
+| PDF extraction | Native PDF text with 300-DPI OCR fallback |
+| Authentication | JWT bearer tokens |
+| Testing | Pytest and a versioned live-model golden dataset |
+| Packaging | Docker and Docker Compose |
 
-Frontend:
-- React
-- TypeScript
+## 3. System overview
 
-Backend:
-- Python 3.12+
-- FastAPI
-- Pydantic
+```mermaid
+flowchart TB
+    UI[Ideator PeopleDesk\nReact UI] -->|JWT + HTTPS/JSON| API[FastAPI API]
+    API --> AUTH[JWT authentication\nand role checks]
+    AUTH --> GRAPH[LangGraph orchestrator]
 
-Agent orchestration:
-- LangGraph
+    GRAPH --> ROUTER[Intent router\nGPT OSS 20B]
+    GRAPH --> CONFIRM[Pending-action\nconfirmation]
+    ROUTER --> POLICY[Policy node]
+    ROUTER --> LEAVE[Leave node]
+    ROUTER --> GENERAL[Deterministic general response]
+    ROUTER --> UNSUPPORTED[Future-domain response]
 
-LLM/tool abstraction:
-- LangChain where useful
+    POLICY --> RAG[Policy knowledge service]
+    RAG --> EMBED[BGE embeddings]
+    EMBED --> QDRANT[(Qdrant)]
+    POLICY --> ANSWER[Grounded response\nGPT OSS 120B]
 
-Operational database:
-- PostgreSQL
+    LEAVE --> SERVICE[Deterministic LeaveService]
+    CONFIRM --> PENDING[PendingActionCoordinator]
+    PENDING --> SERVICE
+    SERVICE --> REPO[SQLAlchemy repositories]
+    REPO --> POSTGRES[(PostgreSQL)]
 
-ORM:
-- SQLAlchemy
+    GRAPH --> CONVERSATION[Conversation repository]
+    CONVERSATION --> POSTGRES
+```
 
-Vector database:
-- Qdrant
+The model proposes routing and structured fields. It does not receive authority to identify a
+different employee, bypass role checks, calculate final business values, or commit a transaction.
 
-Embeddings:
-- BAAI/bge-small-en-v1.5
-
-Authentication:
-- JWT
-
-Testing:
-- Pytest
-
-Deployment:
-- Docker
-- Docker Compose
-
-Optional observability after MVP:
-- Langfuse
-
----
-
-# 3. High-Level Architecture
+## 4. Repository layers
 
 ```text
-┌───────────────────────────────────────────────────────────────┐
-│                         React Chat UI                         │
-│                                                               │
-│        Login | Chat | Confirmation | Action Status            │
-└───────────────────────────────┬───────────────────────────────┘
-                                │
-                              HTTPS
-                                │
-                                ▼
-┌───────────────────────────────────────────────────────────────┐
-│                           FastAPI                             │
-│                                                               │
-│   Authentication                                              │
-│   JWT validation                                              │
-│   Request validation                                          │
-│   POST /api/v1/chat                                           │
-└───────────────────────────────┬───────────────────────────────┘
-                                │
-                                ▼
-┌───────────────────────────────────────────────────────────────┐
-│                    LangGraph Orchestrator                     │
-│                                                               │
-│                      Shared Agent State                       │
-│                              │                                │
-│                              ▼                                │
-│                         Intent Router                         │
-│                              │                                │
-│             ┌────────────────┼────────────────┐               │
-│             │                │                │               │
-│             ▼                ▼                ▼               │
-│       Leave Subgraph   Onboarding Subgraph Parking Subgraph   │
-│             │                │                │               │
-│             └────────────────┼────────────────┘               │
-│                              │                                │
-│                       Tool Invocation                         │
-│                              │                                │
-│                  Human Approval when needed                   │
-└───────────────────────────────┬───────────────────────────────┘
-                                │
-                  ┌─────────────┼──────────────┐
-                  │             │              │
-                  ▼             ▼              ▼
-          Application       RAG Service    Checkpoint/
-           Services                         State Store
-                  │             │
-                  ▼             ▼
-             PostgreSQL       Qdrant
+frontend/                         React presentation
+backend/app/api/                  HTTP routes, schemas, dependencies
+backend/app/agent/                LangGraph state and orchestration
+backend/app/application/          Leave and pending-action use cases
+backend/app/domain/               Entities, enums, and deterministic rules
+backend/app/rag/                  Policy extraction, chunking, ingestion, retrieval
+backend/app/infrastructure/       Database, repositories, embeddings, Qdrant, LLM adapter
+backend/evals/                    Versioned golden behavior suite
 ```
 
----
+Dependencies point inward: HTTP and LangGraph call application services; services depend on ports
+and domain objects; infrastructure implements storage and provider adapters.
 
-# 4. Architectural Style
+## 5. Authenticated request lifecycle
 
-Use Clean Architecture principles.
+```mermaid
+sequenceDiagram
+    participant U as Employee/Manager
+    participant W as React UI
+    participant A as FastAPI
+    participant G as LangGraph
+    participant S as Application service
+    participant D as PostgreSQL/Qdrant
+
+    U->>W: Enter message
+    W->>A: POST /api/v1/chat + bearer token
+    A->>A: Validate JWT and construct AuthenticatedUser
+    A->>G: Message, session ID, trusted actor
+    G->>D: Load conversation and pending action
+    alt Pending action exists
+        G->>S: Confirm or cancel validated action
+        S->>D: Atomic transaction
+    else Normal request
+        G->>G: Route and apply deterministic guards
+        G->>S: Invoke leave service or policy retrieval
+        S->>D: Read operational data or policy chunks
+    end
+    G->>D: Persist conversation state
+    G-->>A: Message, intent, sources, pending summary
+    A-->>W: Typed JSON response
+    W-->>U: Answer and confirmation controls
+```
+
+The JWT supplies `user_id`, `employee_id`, and `role`. User text and model output cannot overwrite
+those values.
+
+## 6. Implemented LangGraph
+
+The application compiles one graph with these nodes:
+
+```mermaid
+flowchart LR
+    START --> RESOLVE[resolve_pending_action]
+    RESOLVE -->|pending action| CONFIRM[confirmation]
+    RESOLVE -->|none| ROUTER[router]
+    ROUTER --> POLICY[policy]
+    ROUTER --> LEAVE[leave]
+    ROUTER --> GENERAL[general]
+    ROUTER --> UNSUPPORTED[unsupported]
+    CONFIRM --> END
+    POLICY --> END
+    LEAVE --> END
+    GENERAL --> END
+    UNSUPPORTED --> END
+```
+
+### Shared state
+
+The graph carries:
+
+- Session and authenticated actor identifiers
+- Current user message and recent message history
+- Active domain
+- Validated `RouteDecision`
+- Pending action and user-facing summary
+- Response and policy sources
+- Per-request LLM call count
+
+### Routing
+
+The router produces a validated Pydantic object containing domain, intent, confidence, leave type,
+dates, reason, and request ID. Post-model guards enforce important invariants:
+
+- Explicit self-service balance questions route to the authenticated employee's balance.
+- Dates and leave types cannot be invented when the user did not provide them.
+- Manager decisions require a request ID; rejection requires a reason.
+- Policy-manipulation prompt attacks route directly to grounded retrieval.
+- Low-confidence or invalid router output can escalate to the complex model tier.
+- Each request has a strict maximum number of model calls.
+
+## 7. Application tools and deterministic boundaries
+
+The implementation uses tool-like application-service invocations from LangGraph. They are not
+model-native function calls: the orchestrator selects a validated operation and invokes trusted
+Python code directly.
+
+| Capability | Implementation | Source of truth |
+|---|---|---|
+| Policy search | `PolicyKnowledgeService.search` | Qdrant policy chunks |
+| Leave balance | `LeaveService.get_leave_balance` | PostgreSQL |
+| Working days | `LeaveService.calculate_leave_days` | Python rules + holidays |
+| Eligibility | `LeaveService.check_leave_eligibility` | Rules, balance, overlaps |
+| Leave application | Pending handler + `LeaveService` | Confirmed transaction |
+| Employee requests | `LeaveService.get_my_leave_requests` | Authenticated employee |
+| Manager queue | `LeaveService.get_managed_leave_requests` | Reporting hierarchy |
+| Approve/reject | Pending handler + `LeaveService` | Authorized transaction |
+| Cancel request | Pending handler + `LeaveService` | Request ownership |
+| Audit history | `LeaveService.get_leave_request_history` | Request events |
+
+This separation prevents the LLM from performing arithmetic, generating authoritative employee
+IDs, changing statuses, or constructing SQL.
+
+## 8. Leave lifecycle
+
+### Read operations
+
+- Balance responses combine total, used, and pending days.
+- Eligibility excludes weekends and seeded holidays.
+- Active overlapping requests prevent duplicate leave applications.
+- Employees can read only their own requests.
+- Managers see direct-report requests; HR can see the authorized broader queue.
+
+### Mutating operations
 
 ```text
-Presentation
-     │
-     ▼
-Application / Agent
-     │
-     ▼
-Domain
-     │
-     ▼
-Infrastructure
+User request
+  → structured route
+  → validate fields and authorization
+  → calculate/revalidate business rules
+  → store expiring PendingAction
+  → show summary
+  → explicit yes/cancel
+  → revalidate inside transaction
+  → execute once
+  → append audit event
+  → remove pending action
 ```
 
-## Presentation Layer
+Pending actions are owned by both session and authenticated user, expire automatically, and are
+consumed atomically. Approval consumes balance only after confirmation. Replay attempts cannot
+execute the same action twice.
 
-Contains:
+## 9. Policy RAG
 
-- FastAPI routes
-- Authentication dependencies
-- Request/response schemas
-- HTTP error mapping
-
-It must not contain business rules.
-
----
-
-## Agent/Application Layer
-
-Contains:
-
-- LangGraph
-- Router
-- Workflow nodes
-- Tools
-- Application services
-- Use cases
-- Pending-action coordination
-
-Agent tools should be thin adapters into application services.
-
----
-
-## Domain Layer
-
-Contains:
-
-- Domain entities
-- Business rules
-- Validation
-- Domain exceptions
-- Domain service interfaces
-
-This layer should not depend on:
-
-- FastAPI
-- LangGraph
-- Qdrant
-- LLM providers
-
----
-
-## Infrastructure Layer
-
-Contains:
-
-- SQLAlchemy repositories
-- PostgreSQL implementation
-- Qdrant adapter
-- Embedding adapter
-- LLM provider adapter
-- External service adapters
-
----
-
-# 5. Main Request Flow
+### Ingestion
 
 ```text
-React
-  │
-  ▼
-POST /api/v1/chat
-  │
-  ▼
-JWT validation
-  │
-  ▼
-AuthenticatedUser
-  │
-  ▼
-Load conversation/checkpoint
-  │
-  ▼
-LangGraph
-  │
-  ▼
-Pending action?
-  │
-  ├── YES → confirmation handling
-  │
-  └── NO
-       │
-       ▼
-     Router
-       │
-       ├── Leave
-       ├── Onboarding
-       ├── Parking
-       ├── Policy
-       └── General
-       │
-       ▼
-Domain Subgraph
-       │
-       ▼
-Tools / RAG
-       │
-       ▼
-Final response
-       │
-       ▼
-Persist state
-       │
-       ▼
-React
+32 policy PDFs
+  → native text extraction
+  → 300-DPI OCR fallback for image-only pages
+  → extraction confidence checks
+  → section-aware overlapping chunks
+  → BGE embeddings
+  → idempotent document replacement in Qdrant
 ```
 
----
+Each chunk preserves document, page, section, and category metadata. Unreadable non-blank pages
+fail ingestion instead of silently creating poor evidence.
 
-# 6. LangGraph Architecture
-
-Use one top-level graph.
-
-Conceptually:
+### Retrieval and answer generation
 
 ```text
-START
-  │
-  ▼
-load_context
-  │
-  ▼
-resolve_pending_action
-  │
-  ├──── Pending confirmation ────► confirmation_node
-  │
-  ▼
-router
-  │
-  ├────────────┬─────────────┐
-  ▼            ▼             ▼
-leave       onboarding     parking
-subgraph     subgraph       subgraph
-  │            │             │
-  └────────────┴─────────────┘
-               │
-               ▼
-        response_node
-               │
-               ▼
-              END
+Policy question
+  → query expansion for selected HR terminology
+  → query embedding
+  → top-k Qdrant search with score threshold
+  → context containing source boundaries
+  → constrained GPT OSS 120B answer
+  → response cleanup
+  → grouped source metadata in the UI
 ```
 
-A general/policy route can also be provided.
+The answer prompt requires a direct, short, plain-text response and forbids adding unsupported
+rules. No matches above the threshold produce an insufficient-evidence error rather than a
+hallucinated answer.
 
----
+## 10. Model routing and cost controls
 
-# 7. Shared Agent State
+| Tier | Model | Use |
+|---|---|---|
+| Router | `openai.gpt-oss-20b` | Normal structured routing with low reasoning effort |
+| Standard | `openai.gpt-oss-120b` | Grounded policy response generation |
+| Complex | `openai.gpt-oss-120b` | Low-confidence or invalid routing fallback with medium effort |
 
-Conceptual state:
+Cost and stability controls include:
 
-```python
-class AgentState(TypedDict):
-    messages: list
-    session_id: str
+- Deterministic business responses after routing
+- Deterministic greeting/capability response
+- Security and extraction guards before/after model routing
+- Small router output budget
+- Per-tier output-token limits
+- Maximum model calls per request
+- Retrieval limited to top-k evidence
+- No reasoning-model call during confirmation execution
 
-    user_id: str
-    employee_id: str
-    role: str
+## 11. Persistence model
 
-    active_domain: str | None
+| Table | Purpose |
+|---|---|
+| `employees` | Employee profile and reporting manager relationship |
+| `users` | Login identity, password hash, role, employee link |
+| `conversation_sessions` | Recent conversation state and active domain |
+| `pending_actions` | Expiring, single-use action awaiting confirmation |
+| `leave_balances` | Total and used days by employee and leave type |
+| `leave_requests` | Dates, working days, status, manager, decision metadata |
+| `leave_request_events` | Immutable lifecycle/audit entries |
+| `holidays` | Dates excluded from working-day calculations |
 
-    leave_context: dict
-    onboarding_context: dict
-    parking_context: dict
+Alembic owns schema evolution. PostgreSQL constraints, foreign keys, indexes, row locking, and
+application transactions support integrity and concurrency safety.
 
-    pending_action: dict | None
-```
+## 12. Security controls
 
-Do not allow user messages or LLM output to overwrite trusted:
+- Passwords use a modern one-way password hash.
+- JWT expiry and signature validation happen in FastAPI dependencies.
+- Employee identity is derived only from the validated token.
+- Service-layer checks enforce employee ownership and manager/HR roles.
+- Model-produced fields are validated by Pydantic and deterministic guards.
+- Prompt injection cannot change policy evidence or bypass confirmation.
+- CORS is restricted to configured origins.
+- Secrets stay in the ignored `.env` file and are never returned to the UI.
+- Structured logs include request IDs without logging credentials or JWTs.
 
-- user_id
-- employee_id
-- role
+## 13. Frontend
 
-These values originate from authenticated server context.
+Ideator PeopleDesk provides:
 
----
+- Employee, manager, and HR demo login selection
+- JWT-authenticated session storage
+- Role-aware prompts and request/approval panels
+- Policy source display grouped by document and pages
+- Pending-action Confirm and Cancel controls
+- Responsive desktop/mobile layout
+- Explicit status and error presentation
 
-# 8. Routing Architecture
+The frontend renders server decisions; it is not an authorization boundary.
 
-Use structured LLM output.
+## 14. Quality strategy
 
-Conceptual schema:
+- **84 deterministic tests** cover authentication, security, leave rules, services, pending
+  actions, manager lifecycle, RAG, orchestration, evaluation contracts, and repeatable demo seed.
+- **85 versioned golden scenarios** exercise the live API and configured models across policy,
+  leave, safety, scope, manager workflow, and API safety categories.
+- The latest complete live release gate scored **98.9%**, above the configured 95% threshold.
+- Hardened regression scenarios for greeting stability, policy injection, and missing dates passed
+  at **100%** after deterministic guards were added.
+- The React production build is compiled with TypeScript before packaging.
 
-```python
-class RouteDecision(BaseModel):
-    domain: Literal[
-        "leave",
-        "onboarding",
-        "parking",
-        "policy",
-        "general"
-    ]
-```
+## 15. Deployment and demo reset
 
-Example:
-
-Input:
-
-"Can you reserve parking for tomorrow?"
-
-Output:
-
-```json
-{
-  "domain": "parking"
-}
-```
-
-Use LangGraph conditional edges to dispatch.
-
-Do not use brittle parsing such as:
-
-```python
-if "parking" in llm_response:
-```
-
-Pending actions and active workflows should be resolved before invoking the general router.
-
----
-
-# 9. Leave Subgraph
+Docker Compose runs four services:
 
 ```text
-                 leave_entry
-                     │
-                     ▼
-              classify_leave_task
-                     │
-      ┌──────────────┼───────────────┐
-      ▼              ▼               ▼
- policy_question   balance       eligibility
-      │              │               │
-      ▼              ▼        ┌──────┼──────┐
- policy_rag       balance     balance       holidays
-                                │             │
-                                └──────┬──────┘
-                                       ▼
-                                policy retrieval
-                                       │
-                                       ▼
-                               eligibility service
-                                       │
-                                       ▼
-                                application needed?
-                                   /          \
-                                 NO            YES
-                                                │
-                                         pending action
-                                                │
-                                          confirmation
-                                                │
-                                           apply_leave
+frontend :5173  → Nginx serving the Vite build
+backend  :8000  → FastAPI/Uvicorn
+postgres :5432  → operational database
+qdrant   :6333  → policy vectors
 ```
 
-Business calculations belong in LeaveService / LeaveEligibilityService.
+Backend startup applies Alembic migrations and performs non-destructive idempotent seeding. Before
+a recording, the explicit reset command clears only demo-identity activity and restores a known
+balance and approval scenario:
 
----
+```bash
+docker compose exec -T backend python -m app.seed --reset-demo
+```
 
-# 10. Onboarding Subgraph
+## 16. Future extensions
+
+Onboarding and parking remain future phases. Their domain labels are recognized so the assistant
+can state that they are unavailable, but no onboarding or parking transaction is presented as
+implemented. New domains can reuse the existing pattern:
 
 ```text
-              onboarding_entry
-                     │
-                     ▼
-                extract_fields
-                     │
-                     ▼
-             merge_with_context
-                     │
-                     ▼
-            required_fields_complete?
-                 /             \
-               NO               YES
-               │                 │
-         ask_missing_fields      ▼
-               │         authorization_check
-               │                 │
-               │                 ▼
-               │        check_employee_exists
-               │                 │
-               │                 ▼
-               │       determine_requirements
-               │                 │
-               │                 ▼
-               │          build_action_plan
-               │                 │
-               │                 ▼
-               │          pending confirmation
-               │                 │
-               │                 ▼
-               │           execute_actions
-               │                 │
-               └─────────────────┤
-                                 ▼
-                           status_response
+validated route
+  → domain application service
+  → repository port
+  → pending action for mutations
+  → confirmation
+  → atomic execution and audit event
 ```
 
-Use structured extraction for onboarding fields.
-
-Do not ask the user again for information already available in state.
-
----
-
-# 11. Parking Subgraph
-
-```text
-                parking_entry
-                     │
-                     ▼
-                 extract_date
-                     │
-                     ▼
-                  date known?
-                 /          \
-               NO            YES
-               │              │
-           ask_for_date       ▼
-                        get_vehicle
-                              │
-                              ▼
-                       check_availability
-                          /          \
-                    AVAILABLE        FULL
-                        │              │
-                        ▼              ▼
-                    offer_slot    offer_waitlist
-                        │              │
-                        ▼              ▼
-                 pending_action  pending_action
-                        │              │
-                        └───────┬──────┘
-                                ▼
-                          confirmation
-                                │
-                                ▼
-                            execution
-```
-
----
-
-# 12. Tool Architecture
-
-Tools are not business services.
-
-Correct:
-
-```text
-LangGraph
-   │
-   ▼
-Tool
-   │
-   ▼
-Application Service
-   │
-   ▼
-Repository Interface
-   │
-   ▼
-Infrastructure Repository
-   │
-   ▼
-PostgreSQL
-```
-
-Example:
-
-```text
-reserve_parking tool
-        │
-        ▼
-ParkingService.reserve()
-        │
-        ▼
-ParkingRepository.reserve()
-        │
-        ▼
-PostgreSQL transaction
-```
-
-Tools should:
-
-- Validate structured arguments
-- Pass trusted user context
-- Invoke application service
-- Convert result into agent-friendly structured output
-
-Tools should not contain large amounts of SQL or business logic.
-
----
-
-# 13. Proposed Tool Registry
-
-## Policy
-
-- search_hr_policy
-
-## Leave
-
-- get_leave_balance
-- get_holidays
-- calculate_leave_days
-- check_leave_eligibility
-- apply_leave
-- get_my_leave_requests
-
-## Onboarding
-
-- check_employee_exists
-- determine_onboarding_requirements
-- create_employee
-- create_email_account_request
-- create_equipment_request
-- create_access_request
-- assign_onboarding_tasks
-- get_onboarding_status
-
-## Parking
-
-- get_employee_vehicle
-- check_parking_availability
-- reserve_parking
-- get_my_parking_reservations
-- cancel_parking
-- join_parking_waitlist
-
----
-
-# 14. RAG Architecture
-
-## Indexing
-
-```text
-Policy PDFs
-    │
-    ▼
-Document Loader
-    │
-    ▼
-Text Normalization
-    │
-    ▼
-Recursive Chunker
-    │
-    ▼
-BGE Embeddings
-    │
-    ▼
-Qdrant
-```
-
-Store metadata:
-
-```json
-{
-  "document": "Leave Policy",
-  "page": 4,
-  "section": "Casual Leave",
-  "category": "leave"
-}
-```
-
----
-
-## Retrieval
-
-```text
-Question
-   │
-   ▼
-Query Embedding
-   │
-   ▼
-Qdrant
-   │
-   ▼
-Top-K Chunks
-   │
-   ▼
-Context Builder
-   │
-   ▼
-LLM
-   │
-   ▼
-Grounded Response
-   +
-Source Metadata
-```
-
-RAG answers should explicitly handle insufficient evidence rather than hallucinating policy.
-
----
-
-# 15. Persistence Architecture
-
-## PostgreSQL
-
-System of record for transactional information.
-
-Suggested tables:
-
-```text
-users
-employees
-
-leave_balances
-leave_requests
-holidays
-
-onboarding_requests
-onboarding_tasks
-
-vehicles
-parking_slots
-parking_reservations
-parking_waitlist
-```
-
-Use proper foreign keys and indexes.
-
----
-
-# 16. Parking Concurrency
-
-Parking reservations require transaction safety.
-
-The following race must not occur:
-
-```text
-Employee A → sees B-24 available
-Employee B → sees B-24 available
-
-Employee A → reserves B-24
-Employee B → reserves B-24
-```
-
-Protect with database constraints/transaction semantics.
-
-At minimum, create a unique constraint logically equivalent to:
-
-```text
-(slot_id, reservation_date)
-```
-
-for active reservations.
-
-Availability must be revalidated during reservation execution.
-
----
-
-# 17. Authentication
-
-```text
-Login
-  │
-  ▼
-Authentication Service
-  │
-  ▼
-JWT
-  │
-  ▼
-React stores token appropriately
-  │
-  ▼
-Authorization: Bearer <token>
-  │
-  ▼
-FastAPI JWT Dependency
-  │
-  ▼
-AuthenticatedUser
-  │
-  ├── user_id
-  ├── employee_id
-  └── role
-```
-
-Trusted context is injected into agent execution.
-
----
-
-# 18. Authorization
-
-Authorization should be enforced in application services.
-
-Example:
-
-```text
-create onboarding
-      │
-      ▼
-OnboardingService
-      │
-      ▼
-role in allowed_roles?
-   /            \
- YES             NO
-  │               │
-continue       Forbidden
-```
-
-Never rely on:
-
-"You are an employee, don't call this tool."
-
-as the sole authorization mechanism.
-
----
-
-# 19. Human-in-the-Loop Architecture
-
-Use a generic PendingAction structure.
-
-Conceptual model:
-
-```text
-PendingAction
-
-action_type
-tool_name
-arguments
-created_by
-session_id
-expires_at
-```
-
-Flow:
-
-```text
-Agent proposes mutation
-       │
-       ▼
-Validate preliminary request
-       │
-       ▼
-Store PendingAction
-       │
-       ▼
-"Would you like me to proceed?"
-       │
-       ▼
-User confirms
-       │
-       ▼
-Reload PendingAction
-       │
-       ▼
-Verify user/session
-       │
-       ▼
-Revalidate business rules
-       │
-       ▼
-Execute
-       │
-       ▼
-Clear PendingAction
-```
-
-Confirmation should be generic enough to work for:
-
-- leave
-- onboarding
-- parking
-
----
-
-# 20. LLM Provider Abstraction
-
-Do not tightly couple application code to one model vendor.
-
-Provide an infrastructure abstraction/factory.
-
-Example configuration:
-
-```text
-LLM_PROVIDER=
-LLM_MODEL=
-LLM_API_KEY=
-```
-
-The rest of the application should depend on an application-level LLM interface or centralized model factory.
-
-This allows switching providers without rewriting workflows.
-
----
-
-# 21. Suggested Backend Structure
-
-```text
-src/
-├── main.py
-│
-├── api/
-│   ├── routes/
-│   │   ├── auth.py
-│   │   └── chat.py
-│   ├── schemas/
-│   └── dependencies/
-│       └── auth.py
-│
-├── agent/
-│   ├── graph.py
-│   ├── state.py
-│   ├── router.py
-│   ├── confirmation.py
-│   │
-│   ├── leave/
-│   │   ├── graph.py
-│   │   ├── nodes.py
-│   │   ├── schemas.py
-│   │   └── tools.py
-│   │
-│   ├── onboarding/
-│   │   ├── graph.py
-│   │   ├── nodes.py
-│   │   ├── schemas.py
-│   │   └── tools.py
-│   │
-│   └── parking/
-│       ├── graph.py
-│       ├── nodes.py
-│       ├── schemas.py
-│       └── tools.py
-│
-├── application/
-│   ├── leave/
-│   │   └── service.py
-│   ├── onboarding/
-│   │   └── service.py
-│   ├── parking/
-│   │   └── service.py
-│   └── policy/
-│       └── service.py
-│
-├── domain/
-│   ├── employee/
-│   ├── leave/
-│   ├── onboarding/
-│   └── parking/
-│
-├── infrastructure/
-│   ├── database/
-│   │   ├── models/
-│   │   ├── repositories/
-│   │   └── session.py
-│   │
-│   ├── vector_store/
-│   │   └── qdrant.py
-│   │
-│   ├── embeddings/
-│   └── llm/
-│
-├── rag/
-│   ├── ingestion.py
-│   ├── chunking.py
-│   ├── retrieval.py
-│   └── context_builder.py
-│
-└── core/
-    ├── config.py
-    ├── security.py
-    ├── logging.py
-    └── exceptions.py
-
-tests/
-├── unit/
-├── integration/
-└── agent/
-```
-
-The exact directory structure may evolve if a simpler structure improves maintainability, but architectural boundaries must remain.
-
----
-
-# 22. Frontend Architecture
-
-Keep frontend deliberately simple.
-
-```text
-React Application
-      │
-      ├── Login
-      │
-      └── Chat
-            │
-            ├── Message list
-            ├── Input
-            ├── Confirmation UI
-            └── Observable action status
-```
-
-Do not create separate Leave, Onboarding and Parking screens for MVP.
-
-The primary experience is conversational.
-
----
-
-# 23. API Architecture
-
-Primary APIs:
-
-```text
-POST /api/v1/auth/login
-POST /api/v1/chat
-GET  /api/v1/health
-```
-
-Domain APIs may exist internally for testing/administration but the frontend should primarily interact through chat.
-
-Example chat request:
-
-```json
-{
-  "session_id": "session-123",
-  "message": "Book parking tomorrow"
-}
-```
-
-Authenticated identity comes from JWT, not request body.
-
-Example response:
-
-```json
-{
-  "session_id": "session-123",
-  "message": "Slot B-24 is available tomorrow. Would you like me to reserve it?",
-  "requires_confirmation": true,
-  "metadata": {
-    "domain": "parking"
-  }
-}
-```
-
-Do not expose hidden model reasoning.
-
----
-
-# 24. Observability
-
-Use structured logging.
-
-Useful fields:
-
-```text
-request_id
-session_id
-user_id
-domain
-node
-tool
-duration_ms
-status
-error_type
-```
-
-Optional later:
-
-Langfuse tracing for:
-
-- LLM calls
-- retrieval
-- agent transitions
-- tool execution
-
-Do not delay MVP completion for observability integration.
-
----
-
-# 25. Docker Architecture
-
-```text
-                    Docker Compose
-
-┌────────────────────────────────────────────┐
-│                                            │
-│ React Frontend                             │
-│       │                                    │
-│       ▼                                    │
-│ FastAPI Backend                            │
-│       │                                    │
-│       ├────────────► PostgreSQL             │
-│       │                                    │
-│       ├────────────► Qdrant                 │
-│       │                                    │
-│       └────────────► External LLM API       │
-│                                            │
-└────────────────────────────────────────────┘
-```
-
-Required:
-
-```text
-docker-compose.yml
-.env.example
-```
-
-The complete application should be startable with minimal setup.
-
----
-
-# 26. Security Principles
-
-1. Never trust LLM-generated identity.
-2. Never expose arbitrary SQL to the LLM.
-3. Never let the LLM directly mutate the database.
-4. All writes pass through application services.
-5. Authorization occurs in deterministic code.
-6. Mutations require confirmation.
-7. Revalidate before mutation.
-8. Validate all tool arguments with Pydantic.
-9. Keep secrets in environment variables.
-10. Do not log tokens/secrets.
-11. Scope employee data to authenticated identity.
-12. Protect parking reservations with database constraints.
-
----
-
-# 27. Architectural Principle
-
-The architecture should maintain this separation:
-
-```text
-LLM
-│
-├── Understand
-├── Extract
-├── Route
-├── Select tools
-└── Generate natural language
-
-Application Services
-│
-├── Validate
-├── Authorize
-├── Calculate
-├── Execute business rules
-└── Coordinate transactions
-
-PostgreSQL
-│
-└── Transactional source of truth
-
-Qdrant
-│
-└── Organizational knowledge retrieval
-```
-
-The model is an intelligent orchestration layer, not the source of truth.
-
----
-
-# 28. Architecture Summary
-
-The application uses a single LangGraph orchestrator behind one FastAPI chat endpoint.
-
-The top-level graph routes natural-language requests to Leave, Onboarding or Parking subgraphs.
-
-LangGraph manages conversational workflow and state.
-
-Domain/application services contain deterministic business rules.
-
-PostgreSQL stores transactional enterprise information.
-
-Qdrant stores searchable policy knowledge.
-
-JWT provides authenticated identity and role context.
-
-All side-effecting actions require human confirmation and deterministic backend validation.
-
-This architecture provides enough agentic behavior for the assessment while maintaining production-oriented separation of concerns and remaining achievable within the project deadline.
+This keeps the assessment release focused on one complete, demonstrable HR workflow while leaving
+an intentional path for additional employee services.
