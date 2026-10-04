@@ -47,7 +47,8 @@ def db_session():
         ])
         db.add_all([
             LeaveBalance(employee_id=employee.id, leave_type="CASUAL", total_days=12, used_days=8),
-            LeaveBalance(employee_id=employee.id, leave_type="PRIVILEGE", total_days=18, used_days=3),
+            LeaveBalance(employee_id=employee.id, leave_type="EARNED", total_days=12, used_days=3, carry_forward_limit_days=8),
+            LeaveBalance(employee_id=employee.id, leave_type="SICK", total_days=10, used_days=1),
             LeaveBalance(employee_id=manager.id, leave_type="CASUAL", total_days=12, used_days=2),
             Holiday(holiday_date=date(2026, 10, 7), name="Test Holiday", category="PUBLIC"),
         ])

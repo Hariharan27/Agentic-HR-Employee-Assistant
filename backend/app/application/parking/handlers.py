@@ -8,6 +8,12 @@ from app.core.exceptions import ValidationError
 from app.core.security import AuthenticatedUser
 
 
+class RegisterVehicleArguments(BaseModel):
+    registration_number: str = Field(min_length=1, max_length=32)
+    vehicle_type: str = Field(min_length=1, max_length=24)
+    make_model: str | None = Field(default=None, max_length=120)
+
+
 class ReserveParkingArguments(BaseModel):
     requested_date: date
     slot_id: int = Field(gt=0)
@@ -25,6 +31,28 @@ class JoinParkingWaitlistArguments(BaseModel):
 class ParkingAdminActionArguments(BaseModel):
     reservation_id: int = Field(gt=0)
     reason: str | None = Field(default=None, max_length=1000)
+
+
+class RegisterVehicleHandler:
+    action_type = "register_vehicle"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return RegisterVehicleArguments.model_validate(arguments).model_dump(mode="json")
+        except PydanticValidationError as exc:
+            raise ValidationError("Invalid arguments for vehicle registration") from exc
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = RegisterVehicleArguments.model_validate(arguments)
+        return self.parking_service.stage_vehicle_registration(
+            actor,
+            validated.registration_number,
+            validated.vehicle_type,
+            validated.make_model,
+        )
 
 
 class ReserveParkingHandler:

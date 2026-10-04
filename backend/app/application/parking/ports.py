@@ -14,6 +14,14 @@ from app.domain.parking.entities import (
 
 class ParkingRepository(Protocol):
     def get_active_vehicle(self, employee_id: int) -> VehicleData | None: ...
+    def get_vehicle_by_registration(self, registration_number: str) -> VehicleData | None: ...
+    def upsert_vehicle(
+        self,
+        employee_id: int,
+        registration_number: str,
+        vehicle_type: str,
+        make_model: str | None,
+    ) -> VehicleData: ...
     def list_active_slots(self) -> list[ParkingSlotData]: ...
     def list_available_slots(
         self, requested_date: date, *, for_update: bool = False

@@ -40,6 +40,37 @@ class SQLAlchemyParkingRepository:
         )
         return self._to_vehicle(row) if row else None
 
+    def get_vehicle_by_registration(self, registration_number: str) -> VehicleData | None:
+        row = self.db.scalar(
+            select(Vehicle).where(Vehicle.registration_number == registration_number)
+        )
+        return self._to_vehicle(row) if row else None
+
+    def upsert_vehicle(
+        self,
+        employee_id: int,
+        registration_number: str,
+        vehicle_type: str,
+        make_model: str | None,
+    ) -> VehicleData:
+        row = self.db.scalar(select(Vehicle).where(Vehicle.employee_id == employee_id))
+        if row is None:
+            row = Vehicle(
+                employee_id=employee_id,
+                registration_number=registration_number,
+                vehicle_type=vehicle_type,
+                make_model=make_model,
+                active=True,
+            )
+            self.db.add(row)
+        else:
+            row.registration_number = registration_number
+            row.vehicle_type = vehicle_type
+            row.make_model = make_model
+            row.active = True
+        self.db.flush()
+        return self._to_vehicle(row)
+
     def list_active_slots(self) -> list[ParkingSlotData]:
         rows = self.db.scalars(
             select(ParkingSlot)

@@ -6,13 +6,21 @@ from enum import StrEnum
 
 class LeaveType(StrEnum):
     CASUAL = "CASUAL"
-    PRIVILEGE = "PRIVILEGE"
+    EARNED = "EARNED"
     SICK = "SICK"
 
     @classmethod
     def parse(cls, value: str) -> "LeaveType":
         normalized = value.strip().upper().replace(" ", "_")
-        aliases = {"CL": cls.CASUAL, "PL": cls.PRIVILEGE, "SL": cls.SICK, "EARNED": cls.PRIVILEGE}
+        aliases = {
+            "CL": cls.CASUAL,
+            "SL": cls.SICK,
+            "EL": cls.EARNED,
+            "EARNED_LEAVE": cls.EARNED,
+            "PRIVILEGE": cls.EARNED,
+            "PRIVILEGE_LEAVE": cls.EARNED,
+            "PL": cls.EARNED,
+        }
         return aliases.get(normalized, cls(normalized))
 
 
@@ -28,6 +36,7 @@ class LeaveBalanceSnapshot:
     leave_type: LeaveType
     total_days: Decimal
     used_days: Decimal
+    carry_forward_limit_days: Decimal = Decimal("0")
     pending_days: Decimal = Decimal("0")
 
     @property

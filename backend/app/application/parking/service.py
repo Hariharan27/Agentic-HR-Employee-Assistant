@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from datetime import UTC, date, datetime, time, timedelta
+import re
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
@@ -24,6 +25,7 @@ from app.domain.parking.entities import (
     ParkingWaitlistData,
     ParkingWaitlistStatus,
     VehicleData,
+    VehicleType,
 )
 
 
@@ -49,6 +51,79 @@ class ParkingService:
                 "No active vehicle is registered for your employee account. Contact Workplace Operations."
             )
         return vehicle
+
+    def prepare_vehicle_registration(
+        self,
+        actor: AuthenticatedUser,
+        registration_number: str,
+        vehicle_type: str,
+        make_model: str | None = None,
+    ) -> tuple[str, VehicleType, str | None]:
+        require_role(actor, "EMPLOYEE")
+        normalized_registration = re.sub(r"[\s-]+", "", registration_number).upper()
+        if not re.fullmatch(r"[A-Z0-9]{6,20}", normalized_registration):
+            raise ValidationError(
+                "Vehicle registration must contain 6 to 20 letters or numbers."
+            )
+        if not re.search(r"[A-Z]", normalized_registration) or not re.search(
+            r"\d", normalized_registration
+        ):
+            raise ValidationError(
+                "Vehicle registration must contain both letters and numbers."
+            )
+        normalized_type = vehicle_type.strip().upper().replace(" ", "_")
+        normalized_type = {
+            "BIKE": "MOTORCYCLE",
+            "MOTORBIKE": "MOTORCYCLE",
+            "TWO_WHEELER": "MOTORCYCLE",
+        }.get(normalized_type, normalized_type)
+        try:
+            parsed_type = VehicleType(normalized_type)
+        except ValueError as exc:
+            raise ValidationError("Vehicle type must be Car or Motorcycle.") from exc
+        normalized_model = make_model.strip() if make_model and make_model.strip() else None
+        if normalized_model and len(normalized_model) > 120:
+            raise ValidationError("Vehicle make and model must be 120 characters or fewer.")
+        existing = self.repository.get_vehicle_by_registration(normalized_registration)
+        if existing is not None and existing.employee_id != actor.employee_id:
+            raise ConflictError("This vehicle registration is already assigned to another employee.")
+        return normalized_registration, parsed_type, normalized_model
+
+    def register_vehicle(
+        self,
+        actor: AuthenticatedUser,
+        registration_number: str,
+        vehicle_type: str,
+        make_model: str | None = None,
+    ) -> VehicleData:
+        try:
+            vehicle = self.stage_vehicle_registration(
+                actor, registration_number, vehicle_type, make_model
+            )
+            self.repository.commit()
+            return vehicle
+        except Exception:
+            self.repository.rollback()
+            raise
+
+    def stage_vehicle_registration(
+        self,
+        actor: AuthenticatedUser,
+        registration_number: str,
+        vehicle_type: str,
+        make_model: str | None = None,
+    ) -> VehicleData:
+        normalized_registration, parsed_type, normalized_model = (
+            self.prepare_vehicle_registration(
+                actor, registration_number, vehicle_type, make_model
+            )
+        )
+        return self.repository.upsert_vehicle(
+            actor.employee_id,
+            normalized_registration,
+            parsed_type.value,
+            normalized_model,
+        )
 
     def check_availability(
         self, actor: AuthenticatedUser, requested_date: date

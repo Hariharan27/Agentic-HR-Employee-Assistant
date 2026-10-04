@@ -25,6 +25,7 @@ Intent = Literal[
     "approve_onboarding",
     "reject_onboarding",
     "parking_vehicle",
+    "register_vehicle",
     "parking_availability",
     "reserve_parking",
     "parking_reservations",
@@ -59,6 +60,9 @@ class RouteDecision(BaseModel):
     location: str | None = Field(default=None, max_length=120)
     employment_type: str | None = Field(default=None, max_length=40)
     parking_date: date | None = None
+    vehicle_registration: str | None = Field(default=None, max_length=32)
+    vehicle_type: str | None = Field(default=None, max_length=24)
+    vehicle_make_model: str | None = Field(default=None, max_length=120)
 
     @model_validator(mode="after")
     def align_domain_with_intent(self):
@@ -81,6 +85,7 @@ class RouteDecision(BaseModel):
             "approve_onboarding": "onboarding",
             "reject_onboarding": "onboarding",
             "parking_vehicle": "parking",
+            "register_vehicle": "parking",
             "parking_availability": "parking",
             "reserve_parking": "parking",
             "parking_reservations": "parking",
@@ -109,13 +114,14 @@ class RouteDecision(BaseModel):
             "CASUAL_LEAVE": "CASUAL",
             "SL": "SICK",
             "SICK_LEAVE": "SICK",
-            "PL": "PRIVILEGE",
-            "EL": "PRIVILEGE",
-            "EARNED": "PRIVILEGE",
-            "EARNED_LEAVE": "PRIVILEGE",
-            "PRIVILEGE_LEAVE": "PRIVILEGE",
+            "PL": "EARNED",
+            "EL": "EARNED",
+            "EARNED": "EARNED",
+            "EARNED_LEAVE": "EARNED",
+            "PRIVILEGE": "EARNED",
+            "PRIVILEGE_LEAVE": "EARNED",
         }
         result = aliases.get(normalized, normalized)
-        if result not in {"CASUAL", "SICK", "PRIVILEGE"}:
+        if result not in {"CASUAL", "SICK", "EARNED"}:
             raise ValueError("unsupported leave type")
         return result

@@ -37,6 +37,9 @@ TASK_TITLES: dict[OnboardingTaskType, str] = {
 class EmployeeReference:
     id: int
     name: str
+    employee_code: str | None = None
+    designation: str | None = None
+    department: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

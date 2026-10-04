@@ -139,7 +139,7 @@ def test_hr_admin_approval_atomically_activates_employee_account(db_session):
     assert employee.email == "priya.raman@example.com"
     assert user.role == "EMPLOYEE"
     assert verify_password(result.temporary_password, user.password_hash)
-    assert {item.leave_type for item in balances} == {"CASUAL", "PRIVILEGE", "SICK"}
+    assert {item.leave_type for item in balances} == {"CASUAL", "EARNED", "SICK"}
 
 
 def test_only_hr_admin_can_review_and_requester_cannot_self_approve(db_session):

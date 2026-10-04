@@ -27,7 +27,15 @@ class SQLAlchemyLeaveRepository:
         if for_update:
             statement = statement.with_for_update()
         rows = self.db.scalars(statement.order_by(LeaveBalance.leave_type)).all()
-        return [LeaveBalanceSnapshot(LeaveType(row.leave_type), row.total_days, row.used_days) for row in rows]
+        return [
+            LeaveBalanceSnapshot(
+                LeaveType.parse(row.leave_type),
+                row.total_days,
+                row.used_days,
+                row.carry_forward_limit_days,
+            )
+            for row in rows
+        ]
 
     def get_holidays(self, start_date: date, end_date: date) -> set[date]:
         statement = select(Holiday.holiday_date).where(Holiday.holiday_date.between(start_date, end_date))
@@ -151,7 +159,7 @@ class SQLAlchemyLeaveRepository:
     def _to_request_data(self, row: LeaveRequest) -> LeaveRequestData:
         employee = self.db.get(Employee, row.employee_id)
         return LeaveRequestData(
-            row.id, row.employee_id, LeaveType(row.leave_type), row.start_date, row.end_date,
+            row.id, row.employee_id, LeaveType.parse(row.leave_type), row.start_date, row.end_date,
             row.working_days, row.reason, LeaveStatus(row.status), row.manager_employee_id,
             row.decided_by_user_id, row.decision_comment, row.decided_at,
             employee.employee_code if employee else None,

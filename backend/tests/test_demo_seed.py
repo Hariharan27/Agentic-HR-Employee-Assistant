@@ -12,7 +12,6 @@ from app.infrastructure.database.models import (
     Employee,
     LeaveBalance,
     LeaveRequest,
-    LeaveRequestEvent,
     ParkingReservation,
     ParkingReservationEvent,
     ParkingSlot,
@@ -45,15 +44,13 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
                 LeaveBalance.leave_type == "CASUAL",
             )
         )
-        request = db.scalar(select(LeaveRequest).where(LeaveRequest.employee_id == employee.id))
         parking_admin = db.scalar(select(User).where(User.username == "parkingadmin"))
         vehicle = db.scalar(select(Vehicle).where(Vehicle.employee_id == employee.id))
 
         assert verify_password("employee123", employee_user.password_hash)
-        assert casual.total_days == Decimal("12")
-        assert casual.used_days == Decimal("8")
-        assert request.status == "PENDING"
-        assert request.manager_employee_id == employee.manager_employee_id
+        assert casual.total_days == Decimal("6")
+        assert casual.used_days == Decimal("2")
+        assert db.scalar(select(func.count()).select_from(LeaveRequest)) == 0
         assert parking_admin.role == "PARKING_ADMIN"
         assert verify_password("parkingadmin123", parking_admin.password_hash)
         assert vehicle.registration_number == "TN01AR1001"
@@ -106,8 +103,32 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
                 expires_at=datetime.now(UTC) + timedelta(minutes=5),
             )
         )
-        casual.used_days = Decimal("11")
+        casual.used_days = Decimal("5")
         employee_user.password_hash = "changed-for-test"
+        legacy_employee = Employee(
+            employee_code="E1001",
+            name="Asha Rao",
+            email="asha@example.test",
+            designation="Software Engineer",
+            department="Engineering",
+            manager_name="Karthik Iyer",
+            location="Chennai",
+            employment_type="Permanent",
+            joining_date=date(2022, 5, 2),
+        )
+        db.add(legacy_employee)
+        db.flush()
+        db.add(
+            LeaveRequest(
+                employee_id=legacy_employee.id,
+                manager_employee_id=employee.manager_employee_id,
+                leave_type="CASUAL",
+                start_date=date.today() + timedelta(days=10),
+                end_date=date.today() + timedelta(days=10),
+                working_days=Decimal("1"),
+                status="PENDING",
+            )
+        )
         db.commit()
 
         seed_database(db, reset_demo=True)
@@ -119,11 +140,11 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
             select(func.count()).select_from(LeaveRequest).where(
                 LeaveRequest.employee_id == employee.id
             )
-        ) == 1
-        assert db.scalar(select(func.count()).select_from(LeaveRequestEvent)) == 1
+        ) == 0
+        assert db.scalar(select(Employee).where(Employee.employee_code == "E1001")) is None
         assert db.scalar(select(func.count()).select_from(ParkingReservation)) == 1
         assert db.scalar(select(func.count()).select_from(ParkingReservationEvent)) == 1
         assert db.scalar(select(func.count()).select_from(ParkingWaitlistEntry)) == 0
         assert db.scalar(select(func.count()).select_from(ParkingSlot)) == 5
-        assert casual.used_days == Decimal("8")
+        assert casual.used_days == Decimal("2")
         assert verify_password("employee123", employee_user.password_hash)

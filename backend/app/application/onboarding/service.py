@@ -56,6 +56,10 @@ class OnboardingService:
             normalized
         ) or self.repository.active_onboarding_email_exists(normalized)
 
+    def list_reporting_managers(self, actor: AuthenticatedUser):
+        require_role(actor, "MANAGER", "HR", "HR_ADMIN")
+        return self.repository.list_reporting_managers()
+
     def create_onboarding(
         self, actor: AuthenticatedUser, candidate: OnboardingCandidate
     ) -> OnboardingRequestData:

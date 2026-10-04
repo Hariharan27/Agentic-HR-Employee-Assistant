@@ -79,6 +79,20 @@ def test_manager_can_preview_plan_without_creating_data(client, db_session):
     assert db_session.scalar(select(func.count()).select_from(OnboardingRequest)) == 0
 
 
+def test_manager_can_list_reporting_managers_for_structured_form(client):
+    manager_token = _token(client, "manager", "manager-password")
+
+    response = client.get(
+        "/api/v1/manager/onboarding/reporting-managers",
+        headers=_headers(manager_token),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert any(item["name"] == "Test Manager" for item in payload)
+    assert all({"id", "name", "employee_code", "designation", "department"} <= set(item) for item in payload)
+
+
 def test_employee_cannot_use_onboarding_tools(client):
     employee_token = _token(client, "employee", "correct-password")
 

@@ -22,6 +22,7 @@ from app.application.parking.handlers import (
     JoinParkingWaitlistHandler,
     MarkParkingNoShowHandler,
     OverrideParkingNoShowHandler,
+    RegisterVehicleHandler,
     ReserveParkingHandler,
 )
 from app.application.parking.service import ParkingService
@@ -93,6 +94,7 @@ def chat(
             "create_onboarding": CreateOnboardingHandler(onboarding),
             "approve_onboarding": ApproveOnboardingHandler(onboarding),
             "reject_onboarding": RejectOnboardingHandler(onboarding),
+            "register_vehicle": RegisterVehicleHandler(parking),
             "reserve_parking": ReserveParkingHandler(parking),
             "cancel_parking": CancelParkingHandler(parking),
             "join_parking_waitlist": JoinParkingWaitlistHandler(parking),

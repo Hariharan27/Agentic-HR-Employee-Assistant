@@ -22,6 +22,7 @@ from app.application.parking.handlers import (
     JoinParkingWaitlistHandler,
     MarkParkingNoShowHandler,
     OverrideParkingNoShowHandler,
+    RegisterVehicleHandler,
     ReserveParkingHandler,
 )
 from app.application.parking.service import ParkingService
@@ -189,6 +190,7 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, par
             "create_onboarding": CreateOnboardingHandler(onboarding),
             "approve_onboarding": ApproveOnboardingHandler(onboarding),
             "reject_onboarding": RejectOnboardingHandler(onboarding),
+            "register_vehicle": RegisterVehicleHandler(parking),
             "reserve_parking": ReserveParkingHandler(parking),
             "cancel_parking": CancelParkingHandler(parking),
             "join_parking_waitlist": JoinParkingWaitlistHandler(parking),
@@ -251,6 +253,38 @@ def test_parking_reservation_requires_confirmation_and_reuses_single_chat(db_ses
     balance = service.chat("parking-book", "How many casual leaves do I have?")
     assert balance.domain == "leave"
     assert "Casual: 4 available" in balance.message
+
+
+def test_employee_registers_vehicle_with_form_context_and_confirmation(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(domain="general", intent="general"),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    form = service.chat("vehicle-registration", "Register my vehicle")
+    proposal = service.chat(
+        "vehicle-registration",
+        "Register vehicle with these details: registration number: tn-01 zz 4321; "
+        "vehicle type: CAR; make and model: Tata Nexon",
+    )
+
+    assert form.intent == "register_vehicle"
+    assert "vehicle registration form below" in form.message
+    assert proposal.intent == "register_vehicle"
+    assert "TN01ZZ4321" in proposal.message
+    assert proposal.pending_action is not None
+    assert db_session.scalar(select(Vehicle)) is None
+
+    confirmed = service.chat("vehicle-registration", "yes")
+    vehicle = db_session.scalar(select(Vehicle))
+
+    assert "registered successfully" in confirmed.message
+    assert "reserve parking" in confirmed.message
+    assert vehicle.registration_number == "TN01ZZ4321"
+    assert vehicle.make_model == "Tata Nexon"
 
 
 def test_parking_booking_can_be_found_and_cancelled_with_confirmation(db_session):
@@ -867,6 +901,7 @@ def test_recent_leave_requests_is_distinct_from_single_request_audit_history(db_
 
     assert result.intent == "leave_requests"
     assert "Your recent leave requests" in result.message
+    assert "Request ID #" in result.message
 
 
 def test_leave_request_status_lists_requests_instead_of_applying_leave(db_session):
@@ -880,6 +915,7 @@ def test_leave_request_status_lists_requests_instead_of_applying_leave(db_sessio
 
     assert result.intent == "leave_requests"
     assert "Your recent leave requests" in result.message
+    assert "Request ID #" in result.message
     assert result.pending_action is None
 
 
@@ -918,13 +954,13 @@ def test_leave_guard_extracts_duration_from_today():
 def test_leave_guard_extracts_duration_from_textual_start_date():
     decision = RouteDecision.model_validate_json(route(
         intent="apply_leave",
-        leave_type="PRIVILEGE",
+        leave_type="EARNED",
         start_date=None,
         end_date=None,
     ))
 
     guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Apply privilege leave from 5 October for 5 days", today=date(2026, 10, 4)
+        decision, "Apply earned leave from 5 October for 5 days", today=date(2026, 10, 4)
     )
 
     assert guarded.start_date == date(2026, 10, 5)
@@ -980,6 +1016,96 @@ def test_apply_leave_handles_common_casual_typo_with_textual_date(db_session):
     assert result.intent == "apply_leave"
     assert "Casual leave from 2026-10-05 to 2026-10-05" in result.message
     assert result.pending_action is not None
+
+
+def test_apply_leave_correction_after_overlap_reuses_leave_type(db_session):
+    LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 5), date(2026, 10, 5)
+    )
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    rejected = service.chat("leave-overlap-correction", "i want casual leave on 5th october")
+    proposal = service.chat(
+        "leave-overlap-correction", "ok then create a request on 6th october"
+    )
+
+    assert "overlaps" in rejected.message
+    assert proposal.intent == "apply_leave"
+    assert "Casual leave from 2026-10-06 to 2026-10-06" in proposal.message
+    assert proposal.pending_action is not None
+
+
+def test_apply_leave_follow_up_handles_tomorrow_typo(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    missing = service.chat("leave-tomorrow-typo", "can you create a leave request for me")
+    proposal = service.chat("leave-tomorrow-typo", "Sick leave tommorrow")
+
+    assert "leave type" in missing.message
+    assert proposal.intent == "apply_leave"
+    assert "Sick leave from 2026-10-05 to 2026-10-05" in proposal.message
+    assert proposal.pending_action is not None
+
+
+def test_apply_leave_follow_up_preserves_textual_date_range_after_cancel(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type="CASUAL", start_date="2026-10-06", end_date="2026-10-06"),
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+        ]),
+    )
+    service.chat("leave-range-after-cancel", "apply casual leave on 6th october")
+    service.chat("leave-range-after-cancel", "cancel")
+
+    missing_type = service.chat(
+        "leave-range-after-cancel",
+        "i asked to create a leave from 13th october to 14th october",
+    )
+    proposal = service.chat("leave-range-after-cancel", "casual")
+
+    assert "leave type" in missing_type.message
+    assert proposal.intent == "apply_leave"
+    assert "Casual leave from 2026-10-13 to 2026-10-14" in proposal.message
+    assert proposal.pending_action is not None
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_type", "expected_start", "expected_end"),
+    [
+        ("please create casual leave request on 5 October", "CASUAL", date(2026, 10, 5), date(2026, 10, 5)),
+        ("I need sick leave tomorrow", "SICK", date(2026, 10, 5), date(2026, 10, 5)),
+        ("I need sick leave tommorrow", "SICK", date(2026, 10, 5), date(2026, 10, 5)),
+        ("raise privilege leave request from 5 October for 2 days", "EARNED", date(2026, 10, 5), date(2026, 10, 6)),
+        ("create leave from 13th october to 14th october", None, date(2026, 10, 13), date(2026, 10, 14)),
+    ],
+)
+def test_apply_leave_guard_supports_varied_phrasings(
+    message, expected_type, expected_start, expected_end
+):
+    decision = RouteDecision.model_validate_json(route(domain="general", intent="general"))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, message, today=date(2026, 10, 4)
+    )
+
+    assert guarded.intent == "apply_leave"
+    assert guarded.leave_type == expected_type
+    assert guarded.start_date == expected_start
+    assert guarded.end_date == expected_end
 
 
 def test_manager_can_switch_from_approval_queue_to_policy_question(db_session):

@@ -119,7 +119,8 @@ passwords, balances, registered vehicles, five parking slots, one occupied-slot 
 pending Casual Leave request for the manager flow. Policy vectors, schema, and unrelated employees
 are not changed.
 
-Follow [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the exact 6–8 minute assessment walkthrough.
+Follow [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the end-to-end assessment walkthrough and
+[ROLES_AND_RESPONSIBILITIES.md](ROLES_AND_RESPONSIBILITIES.md) for the authorization hierarchy.
 
 ## Implemented agent flow
 
@@ -156,7 +157,7 @@ or native provider function calls.
 | Policy | Search policy evidence and return source metadata |
 | Employee leave | Balance, holidays, calculation, eligibility, apply, list, cancel |
 | Manager/HR | Approval queue, approve, reject, request audit history |
-| Employee parking | Vehicle, availability, reserve, list, cancel, and waitlist |
+| Employee parking | Register/update vehicle, availability, reserve, list, cancel, and waitlist |
 | Parking Admin | Daily queue, check-in, late cancellation, no-show, completion, and override |
 | Confirmation | Propose, inspect, cancel, expire, and atomically execute pending actions |
 

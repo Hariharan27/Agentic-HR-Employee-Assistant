@@ -85,6 +85,61 @@ def test_employee_can_read_vehicle_and_database_availability(db_session):
     assert [slot.code for slot in availability.available_slots] == ["B-22"]
 
 
+def test_employee_can_register_and_update_vehicle(db_session):
+    service = _service(db_session)
+    employee = _actor(db_session)
+
+    created = service.register_vehicle(
+        employee, "tn-01 aa 1001", "car", "Hyundai i20"
+    )
+    updated = service.register_vehicle(
+        employee, "tn01aa1002", "motorcycle", "Royal Enfield Hunter"
+    )
+
+    assert created.registration_number == "TN01AA1001"
+    assert updated.id == created.id
+    assert updated.registration_number == "TN01AA1002"
+    assert updated.vehicle_type.value == "MOTORCYCLE"
+    assert updated.make_model == "Royal Enfield Hunter"
+    assert db_session.scalar(
+        select(func.count()).select_from(Vehicle).where(
+            Vehicle.employee_id == employee.employee_id
+        )
+    ) == 1
+
+
+def test_vehicle_registration_is_employee_only_and_validated(db_session):
+    service = _service(db_session)
+
+    with pytest.raises(AuthorizationError):
+        service.prepare_vehicle_registration(
+            _actor(db_session, "manager"), "TN01AA1001", "CAR"
+        )
+    with pytest.raises(ValidationError, match="letters and numbers"):
+        service.prepare_vehicle_registration(
+            _actor(db_session), "INVALID", "CAR"
+        )
+    with pytest.raises(ValidationError, match="Car or Motorcycle"):
+        service.prepare_vehicle_registration(
+            _actor(db_session), "TN01AA1001", "TRUCK"
+        )
+
+
+def test_vehicle_registration_cannot_be_shared_between_employees(db_session):
+    service = _service(db_session)
+    employee = _actor(db_session)
+    manager = _actor(db_session, "manager")
+    second_employee = AuthenticatedUser(
+        manager.user_id, manager.employee_id, "EMPLOYEE"
+    )
+    service.register_vehicle(employee, "TN01AA1001", "CAR")
+
+    with pytest.raises(ConflictError, match="another employee"):
+        service.prepare_vehicle_registration(
+            second_employee, "TN01AA1001", "MOTORCYCLE"
+        )
+
+
 def test_reservation_is_revalidated_and_audited(db_session):
     _, _, slots = _setup_parking(db_session, slot_count=1)
     actor = _actor(db_session)

@@ -86,6 +86,9 @@ class LeaveBalance(Base):
     leave_type: Mapped[str] = mapped_column(String(32))
     total_days: Mapped[Decimal] = mapped_column(Numeric(6, 2))
     used_days: Mapped[Decimal] = mapped_column(Numeric(6, 2), default=Decimal("0"))
+    carry_forward_limit_days: Mapped[Decimal] = mapped_column(
+        Numeric(6, 2), default=Decimal("0"), server_default="0"
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (

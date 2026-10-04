@@ -110,11 +110,11 @@ DEMO_USERS = (
 )
 
 DEMO_BALANCES = {
-    "EMPLOYEE": (("CASUAL", 12, 8), ("PRIVILEGE", 18, 3), ("SICK", 10, 1)),
-    "MANAGER": (("CASUAL", 12, 2), ("PRIVILEGE", 18, 4), ("SICK", 10, 0)),
-    "HR": (("CASUAL", 12, 1), ("PRIVILEGE", 18, 2), ("SICK", 10, 0)),
-    "HR_ADMIN": (("CASUAL", 12, 1), ("PRIVILEGE", 18, 2), ("SICK", 10, 0)),
-    "PARKING_ADMIN": (("CASUAL", 12, 1), ("PRIVILEGE", 18, 2), ("SICK", 10, 0)),
+    "EMPLOYEE": (("CASUAL", 6, 2, 0), ("SICK", 6, 1, 0), ("EARNED", 12, 3, 8)),
+    "MANAGER": (("CASUAL", 6, 1, 0), ("SICK", 6, 0, 0), ("EARNED", 12, 2, 8)),
+    "HR": (("CASUAL", 6, 1, 0), ("SICK", 6, 0, 0), ("EARNED", 12, 2, 8)),
+    "HR_ADMIN": (("CASUAL", 6, 1, 0), ("SICK", 6, 0, 0), ("EARNED", 12, 2, 8)),
+    "PARKING_ADMIN": (("CASUAL", 6, 1, 0), ("SICK", 6, 0, 0), ("EARNED", 12, 2, 8)),
 }
 
 DEMO_VEHICLES = {
@@ -132,12 +132,7 @@ DEMO_PARKING_SLOTS = (
     ("B-25", "Chennai HQ - Basement B", "ACCESSIBLE"),
 )
 
-
-def _next_demo_workday() -> date:
-    candidate = date.today() + timedelta(days=14)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate
+LEGACY_DEMO_EMPLOYEE_CODES = ("E1001", "M1001", "H1001", "H1002")
 
 
 def _next_parking_workday() -> date:
@@ -217,6 +212,78 @@ def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[in
     db.execute(delete(LeaveRequest).where(LeaveRequest.employee_id.in_(employee_ids)))
     db.execute(delete(PendingAction).where(PendingAction.user_id.in_(user_ids)))
     db.execute(delete(ConversationSession).where(ConversationSession.user_id.in_(user_ids)))
+    _clear_legacy_demo_identities(db)
+
+
+def _clear_legacy_demo_identities(db: Session) -> None:
+    legacy_employee_ids = list(
+        db.scalars(
+            select(Employee.id).where(Employee.employee_code.in_(LEGACY_DEMO_EMPLOYEE_CODES))
+        )
+    )
+    if not legacy_employee_ids:
+        return
+    legacy_user_ids = list(
+        db.scalars(select(User.id).where(User.employee_id.in_(legacy_employee_ids)))
+    )
+
+    legacy_request_ids = select(LeaveRequest.id).where(
+        LeaveRequest.employee_id.in_(legacy_employee_ids)
+    )
+    db.execute(
+        delete(LeaveRequestEvent).where(
+            LeaveRequestEvent.leave_request_id.in_(legacy_request_ids)
+        )
+    )
+    db.execute(delete(LeaveRequest).where(LeaveRequest.employee_id.in_(legacy_employee_ids)))
+
+    parking_reservation_ids = select(ParkingReservation.id).where(
+        ParkingReservation.employee_id.in_(legacy_employee_ids)
+    )
+    db.execute(
+        delete(ParkingReservationEvent).where(
+            ParkingReservationEvent.reservation_id.in_(parking_reservation_ids)
+        )
+    )
+    db.execute(
+        delete(ParkingWaitlistEntry).where(
+            ParkingWaitlistEntry.employee_id.in_(legacy_employee_ids)
+        )
+    )
+    db.execute(
+        delete(ParkingReservation).where(
+            ParkingReservation.employee_id.in_(legacy_employee_ids)
+        )
+    )
+
+    onboarding_ids = select(OnboardingRequest.id).where(
+        OnboardingRequest.manager_employee_id.in_(legacy_employee_ids)
+        | OnboardingRequest.activated_employee_id.in_(legacy_employee_ids)
+    )
+    db.execute(
+        delete(OnboardingTask).where(OnboardingTask.onboarding_request_id.in_(onboarding_ids))
+    )
+    db.execute(
+        delete(OnboardingRequest).where(
+            OnboardingRequest.manager_employee_id.in_(legacy_employee_ids)
+            | OnboardingRequest.activated_employee_id.in_(legacy_employee_ids)
+        )
+    )
+
+    db.execute(delete(LeaveBalance).where(LeaveBalance.employee_id.in_(legacy_employee_ids)))
+    db.execute(delete(Vehicle).where(Vehicle.employee_id.in_(legacy_employee_ids)))
+    if legacy_user_ids:
+        db.execute(delete(PendingAction).where(PendingAction.user_id.in_(legacy_user_ids)))
+        db.execute(
+            delete(ConversationSession).where(ConversationSession.user_id.in_(legacy_user_ids))
+        )
+        db.execute(delete(User).where(User.id.in_(legacy_user_ids)))
+    for employee in db.scalars(
+        select(Employee).where(Employee.manager_employee_id.in_(legacy_employee_ids))
+    ):
+        employee.manager_employee_id = None
+    db.flush()
+    db.execute(delete(Employee).where(Employee.id.in_(legacy_employee_ids)))
 
 
 def seed_database(db: Session, *, reset_demo: bool = False) -> None:
@@ -264,9 +331,33 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
             [user.id for user in users.values()],
             [employee.id for employee in employees.values()],
         )
+        for employee in employees.values():
+            earned = db.scalar(
+                select(LeaveBalance).where(
+                    LeaveBalance.employee_id == employee.id,
+                    LeaveBalance.leave_type == "EARNED",
+                )
+            )
+            legacy_privilege = db.scalar(
+                select(LeaveBalance).where(
+                    LeaveBalance.employee_id == employee.id,
+                    LeaveBalance.leave_type == "PRIVILEGE",
+                )
+            )
+            if legacy_privilege is not None and earned is None:
+                legacy_privilege.leave_type = "EARNED"
+            elif legacy_privilege is not None:
+                db.delete(legacy_privilege)
+        db.flush()
+        db.execute(
+            delete(LeaveBalance).where(
+                LeaveBalance.employee_id.in_([employee.id for employee in employees.values()]),
+                LeaveBalance.leave_type.not_in(("CASUAL", "SICK", "EARNED")),
+            )
+        )
 
     for role, employee in employees.items():
-        for leave_type, total, used in DEMO_BALANCES[role]:
+        for leave_type, total, used, carry_forward_limit in DEMO_BALANCES[role]:
             balance = db.scalar(
                 select(LeaveBalance).where(
                     LeaveBalance.employee_id == employee.id,
@@ -280,11 +371,13 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
                         leave_type=leave_type,
                         total_days=total,
                         used_days=used,
+                        carry_forward_limit_days=carry_forward_limit,
                     )
                 )
             elif reset_demo:
                 balance.total_days = Decimal(total)
                 balance.used_days = Decimal(used)
+                balance.carry_forward_limit_days = Decimal(carry_forward_limit)
 
     vehicles: dict[str, Vehicle] = {}
     for role, (registration_number, vehicle_type, make_model) in DEMO_VEHICLES.items():
@@ -338,30 +431,6 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
         elif reset_demo:
             holiday.name = name
             holiday.category = "PUBLIC"
-
-    if reset_demo:
-        request_date = _next_demo_workday()
-        request = LeaveRequest(
-            employee_id=employees["EMPLOYEE"].id,
-            manager_employee_id=employees["MANAGER"].id,
-            leave_type="CASUAL",
-            start_date=request_date,
-            end_date=request_date,
-            working_days=Decimal("1"),
-            reason="Family appointment",
-            status="PENDING",
-        )
-        db.add(request)
-        db.flush()
-        db.add(
-            LeaveRequestEvent(
-                leave_request_id=request.id,
-                actor_user_id=users["EMPLOYEE"].id,
-                from_status=None,
-                to_status="PENDING",
-                comment="Demo request submitted by employee",
-            )
-        )
 
     parking_date = _next_parking_workday()
     occupied = db.scalar(
