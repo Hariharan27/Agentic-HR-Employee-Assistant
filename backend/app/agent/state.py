@@ -15,6 +15,7 @@ class AgentState(TypedDict, total=False):
     sources: list[dict[str, object]]
     pending_summary: str | None
     llm_calls: int
+    leave_context: dict[str, str]
     onboarding_context: dict[str, str]
     parking_context: dict[str, str]
     sensitive_response: bool

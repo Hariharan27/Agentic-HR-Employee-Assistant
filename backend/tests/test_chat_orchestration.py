@@ -869,6 +869,119 @@ def test_recent_leave_requests_is_distinct_from_single_request_audit_history(db_
     assert "Your recent leave requests" in result.message
 
 
+def test_leave_request_status_lists_requests_instead_of_applying_leave(db_session):
+    LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
+    )
+
+    result = orchestrator(
+        db_session, FakeLLM([route(intent="apply_leave", leave_type="CASUAL")])
+    ).chat("employee-request-status", "leave request status")
+
+    assert result.intent == "leave_requests"
+    assert "Your recent leave requests" in result.message
+    assert result.pending_action is None
+
+
+def test_leave_guard_extracts_textual_single_date():
+    decision = RouteDecision.model_validate_json(route(
+        intent="apply_leave",
+        leave_type="CASUAL",
+        start_date=None,
+        end_date=None,
+    ))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Apply casual leave on 5 October", today=date(2026, 10, 4)
+    )
+
+    assert guarded.start_date == date(2026, 10, 5)
+    assert guarded.end_date == date(2026, 10, 5)
+
+
+def test_leave_guard_extracts_duration_from_today():
+    decision = RouteDecision.model_validate_json(route(
+        intent="apply_leave",
+        leave_type="CASUAL",
+        start_date=None,
+        end_date=None,
+    ))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Apply casual leave for 5 days from today", today=date(2026, 10, 5)
+    )
+
+    assert guarded.start_date == date(2026, 10, 5)
+    assert guarded.end_date == date(2026, 10, 9)
+
+
+def test_leave_guard_extracts_duration_from_textual_start_date():
+    decision = RouteDecision.model_validate_json(route(
+        intent="apply_leave",
+        leave_type="PRIVILEGE",
+        start_date=None,
+        end_date=None,
+    ))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Apply privilege leave from 5 October for 5 days", today=date(2026, 10, 4)
+    )
+
+    assert guarded.start_date == date(2026, 10, 5)
+    assert guarded.end_date == date(2026, 10, 9)
+
+
+def test_apply_leave_remembers_date_then_accepts_leave_type_follow_up(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    missing_type = service.chat("leave-date-first", "can you apply leave for the 5th october")
+    proposal = service.chat("leave-date-first", "Casual")
+
+    assert "leave type" in missing_type.message
+    assert proposal.intent == "apply_leave"
+    assert "2026-10-05 to 2026-10-05" in proposal.message
+    assert "Reply yes to confirm" in proposal.message
+    assert proposal.pending_action is not None
+
+
+def test_apply_leave_remembers_type_then_accepts_date_follow_up(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    missing_type = service.chat("leave-type-first", "can you apply leave")
+    missing_dates = service.chat("leave-type-first", "casual")
+    proposal = service.chat("leave-type-first", "5th october")
+
+    assert "leave type" in missing_type.message
+    assert "start date" in missing_dates.message
+    assert proposal.intent == "apply_leave"
+    assert "Casual leave from 2026-10-05 to 2026-10-05" in proposal.message
+    assert proposal.pending_action is not None
+
+
+def test_apply_leave_handles_common_casual_typo_with_textual_date(db_session):
+    result = orchestrator(
+        db_session,
+        FakeLLM([route(intent="apply_leave", leave_type=None)]),
+    ).chat("leave-casula-typo", "i want casula leave on 5th october")
+
+    assert result.intent == "apply_leave"
+    assert "Casual leave from 2026-10-05 to 2026-10-05" in result.message
+    assert result.pending_action is not None
+
+
 def test_manager_can_switch_from_approval_queue_to_policy_question(db_session):
     llm = FakeLLM([
         route(intent="general", domain="general"),

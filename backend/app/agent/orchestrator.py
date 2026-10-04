@@ -130,6 +130,7 @@ class HRAssistantOrchestrator:
             "user_message": message.strip(),
             "messages": history,
             "active_domain": self._safe_domain(stored.get("active_domain")),
+            "leave_context": self._safe_leave_context(stored.get("leave_context")),
             "onboarding_context": self._safe_onboarding_context(
                 stored.get("onboarding_context")
             ),
@@ -155,6 +156,7 @@ class HRAssistantOrchestrator:
             {
                 "messages": updated_history,
                 "active_domain": result.get("active_domain"),
+                "leave_context": result.get("leave_context", {}),
                 "onboarding_context": result.get("onboarding_context", {}),
                 "parking_context": result.get("parking_context", state.get("parking_context", {})),
             },
@@ -223,6 +225,7 @@ class HRAssistantOrchestrator:
                 "response": "The pending action has been cancelled. No changes were made.",
                 "active_domain": self._action_domain(action.action_type),
                 "pending_summary": None,
+                "leave_context": {},
                 "onboarding_context": {},
                 "parking_context": {},
             }
@@ -285,6 +288,7 @@ class HRAssistantOrchestrator:
             "response": response,
             "active_domain": self._action_domain(action_type),
             "pending_summary": None,
+            "leave_context": {},
             "onboarding_context": {},
             "parking_context": {},
         }
@@ -348,6 +352,20 @@ class HRAssistantOrchestrator:
         ):
             decision = decision.model_copy(
                 update={"domain": "parking", "intent": "parking", "confidence": 0.99}
+            )
+        elif (
+            state.get("active_domain") == "leave"
+            and state.get("leave_context")
+            and (
+                decision.domain == "general"
+                or self._message_is_only_leave_type(state["user_message"])
+                or self._extract_leave_dates(
+                    state["user_message"], date.fromisoformat(today)
+                ) != (None, None)
+            )
+        ):
+            decision = decision.model_copy(
+                update={"domain": "leave", "intent": "apply_leave", "confidence": 0.99}
             )
         return {"route": decision, "active_domain": decision.domain, "llm_calls": calls}
 
@@ -428,22 +446,22 @@ class HRAssistantOrchestrator:
                 f"({self._number(balance.pending_days)} pending)"
                 for balance in balances
             ]
-            return {"response": "Your leave balance:\n" + "\n".join(lines), "active_domain": "leave"}
+            return {"response": "Your leave balance:\n" + "\n".join(lines), "active_domain": "leave", "leave_context": {}}
         if route.intent == "leave_requests":
             requests = self.leave.get_my_leave_requests(self.actor)
             if not requests:
-                return {"response": "You do not have any leave requests.", "active_domain": "leave"}
+                return {"response": "You do not have any leave requests.", "active_domain": "leave", "leave_context": {}}
             lines = [
                 f"#{item.id}: {item.leave_type.value.title()} {item.start_date} to {item.end_date} "
                 f"— {self._number(item.working_days)} day(s), {item.status.value.title()}"
                 for item in requests[:10]
             ]
-            return {"response": "Your recent leave requests:\n" + "\n".join(lines), "active_domain": "leave"}
+            return {"response": "Your recent leave requests:\n" + "\n".join(lines), "active_domain": "leave", "leave_context": {}}
         if route.intent == "manager_leave_requests":
             requests = self.leave.get_managed_leave_requests(self.actor)
             if not requests:
                 return {"response": "There are no pending leave requests in your approval queue.",
-                        "active_domain": "leave"}
+                        "active_domain": "leave", "leave_context": {}}
             lines = [
                 f"#{item.id}: {item.employee_name or item.employee_code or item.employee_id} — "
                 f"{item.leave_type.value.title()} {item.start_date} to {item.end_date}, "
@@ -451,10 +469,10 @@ class HRAssistantOrchestrator:
                 for item in requests[:20]
             ]
             return {"response": "Pending leave approvals:\n" + "\n".join(lines),
-                    "active_domain": "leave"}
+                    "active_domain": "leave", "leave_context": {}}
         if route.intent == "leave_request_history":
             if route.request_id is None:
-                return {"response": "Please provide the leave request ID.", "active_domain": "leave"}
+                return {"response": "Please provide the leave request ID.", "active_domain": "leave", "leave_context": {}}
             events = self.leave.get_leave_request_history(self.actor, route.request_id)
             lines = [
                 f"{item.to_status.value.title()} by user #{item.actor_user_id}"
@@ -462,13 +480,13 @@ class HRAssistantOrchestrator:
                 for item in events
             ]
             return {"response": f"History for leave request #{route.request_id}:\n" + "\n".join(lines),
-                    "active_domain": "leave"}
+                    "active_domain": "leave", "leave_context": {}}
         if route.intent in {"approve_leave_request", "reject_leave_request", "cancel_leave_request"}:
             if route.request_id is None:
-                return {"response": "Please provide the leave request ID.", "active_domain": "leave"}
+                return {"response": "Please provide the leave request ID.", "active_domain": "leave", "leave_context": {}}
             if route.intent == "reject_leave_request" and not route.reason:
                 return {"response": "Please provide a reason for rejecting the leave request.",
-                        "active_domain": "leave"}
+                        "active_domain": "leave", "leave_context": {}}
             if route.intent == "cancel_leave_request":
                 request = self.leave.prepare_leave_cancellation(self.actor, route.request_id)
                 action_type = "cancel_leave_request"
@@ -490,29 +508,48 @@ class HRAssistantOrchestrator:
             return {
                 "response": f"{action.summary}. Reply yes to confirm or cancel.",
                 "active_domain": "leave",
+                "leave_context": {},
                 "pending_summary": action.summary,
             }
+        if route.intent == "apply_leave":
+            context = self._merge_leave_context(
+                state.get("leave_context", {}), route, state["user_message"]
+            )
+            route = route.model_copy(
+                update={
+                    "leave_type": context.get("leave_type"),
+                    "start_date": date.fromisoformat(context["start_date"]) if context.get("start_date") else None,
+                    "end_date": date.fromisoformat(context["end_date"]) if context.get("end_date") else None,
+                    "reason": context.get("reason"),
+                }
+            )
+        else:
+            context = {}
         if route.intent in {"leave_eligibility", "apply_leave", "calculate_leave_days", "holidays"}:
             missing = self._missing_leave_fields(route)
             if missing:
-                return {"response": f"Please provide {', '.join(missing)}.", "active_domain": "leave"}
+                return {
+                    "response": f"Please provide {', '.join(missing)}.",
+                    "active_domain": "leave",
+                    "leave_context": context if route.intent == "apply_leave" else {},
+                }
         if route.intent == "holidays":
             holidays = sorted(self.leave.get_holidays(route.start_date, route.end_date))
             message = "No configured holidays fall in that range."
             if holidays:
                 message = "Configured holidays in that range: " + ", ".join(map(str, holidays)) + "."
-            return {"response": message, "active_domain": "leave"}
+            return {"response": message, "active_domain": "leave", "leave_context": {}}
         if route.intent == "calculate_leave_days":
             days = self.leave.calculate_leave_days(route.start_date, route.end_date)
             return {"response": f"That range contains {self._number(days)} working leave day(s).",
-                    "active_domain": "leave"}
+                    "active_domain": "leave", "leave_context": {}}
         if route.intent in {"leave_eligibility", "apply_leave"}:
             eligibility = self.leave.check_leave_eligibility(
                 self.actor, route.leave_type, route.start_date, route.end_date
             )
             if not eligibility.eligible:
                 return {"response": f"You are not eligible for this request: {eligibility.reason}.",
-                        "active_domain": "leave"}
+                        "active_domain": "leave", "leave_context": {}}
             if route.intent == "leave_eligibility":
                 return {
                     "response": (
@@ -520,6 +557,7 @@ class HRAssistantOrchestrator:
                         f"working day(s), and you have {self._number(eligibility.available_days)} available."
                     ),
                     "active_domain": "leave",
+                    "leave_context": {},
                 }
             summary = (
                 f"Apply for {self._number(eligibility.working_days)} working day(s) of "
@@ -540,11 +578,13 @@ class HRAssistantOrchestrator:
             return {
                 "response": f"{action.summary}. Reply yes to confirm or cancel.",
                 "active_domain": "leave",
+                "leave_context": {},
                 "pending_summary": action.summary,
             }
         return {
             "response": "I can help with leave balance, eligibility, applications, holidays, and request history.",
             "active_domain": "leave",
+            "leave_context": {},
         }
 
     def _handle_onboarding(self, state: AgentState) -> AgentState:
@@ -1039,10 +1079,12 @@ class HRAssistantOrchestrator:
         return self.llm.complete(tier, system=system, user=user, json_mode=json_mode), calls + 1
 
     def _routing_input(self, state: AgentState, today: str) -> str:
+        leave_context = json.dumps(state.get("leave_context", {}), sort_keys=True)
         onboarding_context = json.dumps(state.get("onboarding_context", {}), sort_keys=True)
         parking_context = json.dumps(state.get("parking_context", {}), sort_keys=True)
         return (
             f"Today's date is {today}.\n"
+            f"Current leave application context: {leave_context}\n"
             f"Current onboarding context: {onboarding_context}\n"
             f"Current parking context: {parking_context}\n"
             f"{self._history_text(state)}"
@@ -1080,7 +1122,7 @@ class HRAssistantOrchestrator:
         """Enforce high-value routing and extraction invariants after probabilistic classification."""
         normalized = message.casefold()
         patterns = {
-            "CASUAL": r"\b(casual(?:\s+leave)?|cl)\b",
+            "CASUAL": r"\b(casual(?:\s+leave)?|casula(?:\s+leave)?|cl)\b",
             "SICK": r"\b(sick(?:\s+leave)?|sl)\b",
             "PRIVILEGE": r"\b(privilege(?:\s+leave)?|earned(?:\s+leave)?|pl|el)\b",
         }
@@ -1092,7 +1134,7 @@ class HRAssistantOrchestrator:
             re.search(r"\b(balance|available\s+to\s+me|do\s+i\s+have|i\s+have)\b", normalized)
         )
         apply_signal = (
-            bool(re.search(r"\b(apply|submit|request)\b", normalized))
+            bool(re.search(r"\b(apply|submit|request|want|take)\b", normalized))
             and (personal or normalized.lstrip().startswith(("apply ", "submit ", "request ")))
             and ("leave" in normalized or explicit_type is not None)
         )
@@ -1130,10 +1172,15 @@ class HRAssistantOrchestrator:
         )
         history_signal = bool(re.search(r"\b(history|audit(?:\s+trail)?)\b", normalized)) and "request" in normalized
         own_request_list_signal = (
-            personal
-            and bool(re.search(r"\b(recent|list|show|view|my)\b", normalized))
+            (
+                personal
+                or bool(re.search(r"\bleave\s+request(?:s)?\s+(?:status|list|summary)\b", normalized))
+                or bool(re.search(r"\b(?:show|view|list|recent|status)\b", normalized))
+            )
+            and bool(re.search(r"\b(recent|list|show|view|status|my)\b", normalized))
             and bool(re.search(r"\bleave\s+requests?\b", normalized))
             and not history_signal
+            and request_id is None
             and not re.search(r"\b(approve|reject|decline|cancel|withdraw)\b", normalized)
         )
         approve_signal = bool(re.search(r"\bapprove\b", normalized)) and "request" in normalized
@@ -1344,15 +1391,90 @@ class HRAssistantOrchestrator:
             updates["leave_type"] = explicit_type
 
         if guarded_intent in {"apply_leave", "leave_eligibility", "calculate_leave_days", "holidays"}:
-            iso_dates = [date.fromisoformat(value) for value in re.findall(r"\b\d{4}-\d{2}-\d{2}\b", message)]
-            if len(iso_dates) == 1:
-                updates.update(start_date=iso_dates[0], end_date=iso_dates[0])
-            elif len(iso_dates) >= 2:
-                updates.update(start_date=iso_dates[0], end_date=iso_dates[1])
+            parsed_start, parsed_end = HRAssistantOrchestrator._extract_leave_dates(message, today)
+            if parsed_start and parsed_end:
+                updates.update(start_date=parsed_start, end_date=parsed_end)
             elif not HRAssistantOrchestrator._contains_date_reference(message):
                 updates.update(start_date=None, end_date=None)
 
         return decision.model_copy(update=updates) if updates else decision
+
+    @staticmethod
+    def _extract_leave_dates(message: str, today: date | None = None) -> tuple[date | None, date | None]:
+        current = today or date.today()
+        normalized = message.casefold()
+        iso_dates = [date.fromisoformat(value) for value in re.findall(r"\b\d{4}-\d{2}-\d{2}\b", message)]
+        if len(iso_dates) == 1:
+            return iso_dates[0], iso_dates[0]
+        if len(iso_dates) >= 2:
+            return iso_dates[0], iso_dates[1]
+
+        anchor = HRAssistantOrchestrator._extract_single_leave_date(message, current)
+        duration_match = re.search(
+            r"\b(?:for\s+)?(\d{1,2})\s+(?:working\s+)?days?\s+(?:from|starting|start(?:ing)?\s+from)\b",
+            normalized,
+        )
+        trailing_duration_match = re.search(r"\bfor\s+(\d{1,2})\s+(?:working\s+)?days?\b", normalized)
+        duration = int((duration_match or trailing_duration_match).group(1)) if (duration_match or trailing_duration_match) else None
+        if duration and anchor:
+            return anchor, anchor + timedelta(days=duration - 1)
+        if anchor:
+            return anchor, anchor
+        return None, None
+
+    @staticmethod
+    def _extract_single_leave_date(message: str, current: date) -> date | None:
+        normalized = message.casefold()
+        if re.search(r"\bday after tomorrow\b", normalized):
+            return current + timedelta(days=2)
+        if re.search(r"\btomorrow\b", normalized):
+            return current + timedelta(days=1)
+        if re.search(r"\btoday\b", normalized):
+            return current
+
+        month_values = {
+            "jan": 1, "january": 1,
+            "feb": 2, "february": 2,
+            "mar": 3, "march": 3,
+            "apr": 4, "april": 4,
+            "may": 5,
+            "jun": 6, "june": 6,
+            "jul": 7, "july": 7,
+            "aug": 8, "august": 8,
+            "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10,
+            "nov": 11, "november": 11,
+            "dec": 12, "december": 12,
+        }
+        month_pattern = "|".join(sorted(month_values, key=len, reverse=True))
+        day_month = re.search(
+            rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
+            normalized,
+        )
+        month_day = re.search(
+            rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*|\s+)?(\d{{4}})?\b",
+            normalized,
+        )
+        if day_month:
+            day = int(day_month.group(1))
+            month = month_values[day_month.group(2)]
+            year = int(day_month.group(3) or current.year)
+            return date(year, month, day)
+        if month_day:
+            month = month_values[month_day.group(1)]
+            day = int(month_day.group(2))
+            year = int(month_day.group(3) or current.year)
+            return date(year, month, day)
+
+        numeric = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", normalized)
+        if numeric:
+            day = int(numeric.group(1))
+            month = int(numeric.group(2))
+            year = int(numeric.group(3) or current.year)
+            if year < 100:
+                year += 2000
+            return date(year, month, day)
+        return None
 
     @staticmethod
     def _contains_date_reference(message: str) -> bool:
@@ -1384,6 +1506,56 @@ class HRAssistantOrchestrator:
         return missing
 
     @staticmethod
+    def _merge_leave_context(
+        existing: dict[str, str], route: RouteDecision, message: str
+    ) -> dict[str, str]:
+        context = dict(existing)
+        context["mode"] = "apply_leave"
+        explicit_type = HRAssistantOrchestrator._explicit_leave_type(message)
+        if explicit_type:
+            context["leave_type"] = explicit_type
+        elif route.leave_type:
+            context["leave_type"] = route.leave_type
+
+        parsed_start, parsed_end = HRAssistantOrchestrator._extract_leave_dates(message)
+        start_date = parsed_start or route.start_date
+        end_date = parsed_end or route.end_date
+        if start_date:
+            context["start_date"] = start_date.isoformat()
+        if end_date:
+            context["end_date"] = end_date.isoformat()
+
+        reason_match = re.search(r"\b(?:because|reason\s*:|due\s+to)\s+(.+)$", message, re.I)
+        if reason_match:
+            context["reason"] = reason_match.group(1).strip()
+        elif route.reason:
+            context["reason"] = route.reason
+        return context
+
+    @staticmethod
+    def _explicit_leave_type(message: str) -> str | None:
+        patterns = {
+            "CASUAL": r"\b(casual(?:\s+leave)?|casula(?:\s+leave)?|cl)\b",
+            "SICK": r"\b(sick(?:\s+leave)?|sl)\b",
+            "PRIVILEGE": r"\b(privilege(?:\s+leave)?|earned(?:\s+leave)?|pl|el)\b",
+        }
+        matches = [
+            leave_type
+            for leave_type, pattern in patterns.items()
+            if re.search(pattern, message, re.I)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _message_is_only_leave_type(message: str) -> bool:
+        normalized = " ".join(re.sub(r"[^\w]+", " ", message.casefold()).split())
+        return normalized in {
+            "casual", "casual leave", "casula", "casula leave", "cl",
+            "sick", "sick leave", "sl",
+            "privilege", "privilege leave", "earned", "earned leave", "pl", "el",
+        }
+
+    @staticmethod
     def _number(value: Decimal) -> str:
         return format(value.normalize(), "f")
 
@@ -1402,6 +1574,28 @@ class HRAssistantOrchestrator:
     @staticmethod
     def _safe_domain(value: object) -> str | None:
         return value if value in {"leave", "policy", "onboarding", "parking", "general"} else None
+
+    @staticmethod
+    def _safe_leave_context(value: object) -> dict[str, str]:
+        allowed = {"mode", "leave_type", "start_date", "end_date", "reason"}
+        if not isinstance(value, dict):
+            return {}
+        result = {
+            key: item
+            for key, item in value.items()
+            if key in allowed and isinstance(item, str) and item.strip()
+        }
+        if "leave_type" in result and result["leave_type"] not in {"CASUAL", "SICK", "PRIVILEGE"}:
+            result.pop("leave_type")
+        if result.get("mode") != "apply_leave":
+            result.pop("mode", None)
+        for field in ("start_date", "end_date"):
+            if field in result:
+                try:
+                    date.fromisoformat(result[field])
+                except ValueError:
+                    result.pop(field)
+        return result
 
     @staticmethod
     def _safe_onboarding_context(value: object) -> dict[str, str]:
