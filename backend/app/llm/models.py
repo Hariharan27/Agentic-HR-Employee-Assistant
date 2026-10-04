@@ -24,6 +24,12 @@ Intent = Literal[
     "onboarding_approvals",
     "approve_onboarding",
     "reject_onboarding",
+    "parking_vehicle",
+    "parking_availability",
+    "reserve_parking",
+    "parking_reservations",
+    "cancel_parking",
+    "join_parking_waitlist",
     "parking",
     "general",
 ]
@@ -46,6 +52,7 @@ class RouteDecision(BaseModel):
     joining_date: date | None = None
     location: str | None = Field(default=None, max_length=120)
     employment_type: str | None = Field(default=None, max_length=40)
+    parking_date: date | None = None
 
     @model_validator(mode="after")
     def align_domain_with_intent(self):
@@ -67,6 +74,12 @@ class RouteDecision(BaseModel):
             "onboarding_approvals": "onboarding",
             "approve_onboarding": "onboarding",
             "reject_onboarding": "onboarding",
+            "parking_vehicle": "parking",
+            "parking_availability": "parking",
+            "reserve_parking": "parking",
+            "parking_reservations": "parking",
+            "cancel_parking": "parking",
+            "join_parking_waitlist": "parking",
             "parking": "parking",
             "general": "general",
         }

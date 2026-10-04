@@ -13,7 +13,7 @@ const quickPrompts: Record<Profile["role"], string[]> = {
   EMPLOYEE: [
     "What is my leave balance?",
     "What is the casual leave policy?",
-    "Show my recent leave requests",
+    "Reserve parking tomorrow",
   ],
   MANAGER: [
     "Start onboarding a new employee",
@@ -244,7 +244,7 @@ function App() {
         <div className="content-grid">
           <section className="chat-panel">
             <div className="messages">
-              {messages.length === 0 && <div className="welcome"><div className="spark">✦</div><h3>Hello, {profile.name.split(" ")[0]}</h3><p>Ask PeopleDesk about HR policies, balances, eligibility, or leave requests.{profile.role === "HR_ADMIN" ? " You can also review onboarding requests and activate employee accounts." : canCreateOnboarding ? " You can also onboard and track new Ideators." : ""} I’ll show sources and confirm before changing anything.</p><div className="suggestions">{suggestions.map((prompt) => <button key={prompt} onClick={() => void submitMessage(prompt)}>{prompt}<span>→</span></button>)}</div></div>}
+              {messages.length === 0 && <div className="welcome"><div className="spark">✦</div><h3>Hello, {profile.name.split(" ")[0]}</h3><p>Ask PeopleDesk about HR policies, balances, leave requests, or workplace parking.{profile.role === "HR_ADMIN" ? " You can also review onboarding requests and activate employee accounts." : canCreateOnboarding ? " You can also onboard and track new Ideators." : ""} I’ll show sources and confirm before changing anything.</p><div className="suggestions">{suggestions.map((prompt) => <button key={prompt} onClick={() => void submitMessage(prompt)}>{prompt}<span>→</span></button>)}</div></div>}
               {messages.map((message) => <article key={message.id} className={`message ${message.role}${message.intent?.includes("onboarding") ? " onboarding-message" : ""}`}><div className="message-label">{message.role === "assistant" ? "Ideator PeopleDesk" : "You"}{message.intent && <span>{message.intent.replaceAll("_", " ")}</span>}</div><p>{message.text}</p>{message.sources && message.sources.length > 0 && <div className="sources"><strong>Based on</strong>{groupedSourceLabels(message.sources).map((label) => <span key={label}>{label}</span>)}</div>}</article>)}
               {loading && <article className="message assistant typing"><span /><span /><span /></article>}
               <div ref={messageEnd} />

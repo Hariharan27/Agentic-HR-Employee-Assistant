@@ -16,4 +16,5 @@ class AgentState(TypedDict, total=False):
     pending_summary: str | None
     llm_calls: int
     onboarding_context: dict[str, str]
+    parking_context: dict[str, str]
     sensitive_response: bool

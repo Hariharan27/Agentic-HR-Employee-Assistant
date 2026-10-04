@@ -28,6 +28,13 @@ class ParkingWaitlistStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class ParkingAvailability:
+    requested_date: date
+    vehicle: "VehicleData"
+    available_slots: tuple["ParkingSlotData", ...]
+
+
+@dataclass(frozen=True, slots=True)
 class VehicleData:
     id: int
     employee_id: int

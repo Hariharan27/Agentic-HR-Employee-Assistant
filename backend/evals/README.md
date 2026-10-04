@@ -31,7 +31,7 @@ Run the release quality gate:
 
 The gate fails unless all deterministic tests pass and the live evaluation achieves at least 95%
 overall pass rate, at least 95% repeat consistency, and 100% pass rates for `safety`, `api_safety`,
-and `onboarding_workflow`. It requires three repetitions so consistency is measured rather than
+`onboarding_workflow`, and `parking_workflow`. It requires three repetitions so consistency is measured rather than
 assumed. Add `--include-mutating` only on a freshly reset disposable database.
 
 Use `--category policy` to limit cost while tuning RAG. Cases tagged as mutating are skipped unless

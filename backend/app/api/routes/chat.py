@@ -14,6 +14,12 @@ from app.application.onboarding.handler import (
     RejectOnboardingHandler,
 )
 from app.application.onboarding.service import OnboardingService
+from app.application.parking.handlers import (
+    CancelParkingHandler,
+    JoinParkingWaitlistHandler,
+    ReserveParkingHandler,
+)
+from app.application.parking.service import ParkingService
 from app.application.pending.handlers import (
     ApplyLeaveHandler,
     ApproveLeaveRequestHandler,
@@ -27,6 +33,7 @@ from app.infrastructure.llm.mantle import MantleLLMGateway
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.infrastructure.repositories.leave import SQLAlchemyLeaveRepository
 from app.infrastructure.repositories.onboarding import SQLAlchemyOnboardingRepository
+from app.infrastructure.repositories.parking import SQLAlchemyParkingRepository
 from app.infrastructure.repositories.pending_action import SQLAlchemyPendingActionRepository
 from app.infrastructure.vector_store.qdrant import QdrantPolicyVectorStore
 from app.llm.ports import LLMGateway
@@ -70,6 +77,7 @@ def chat(
 ) -> ChatResponse:
     leave = LeaveService(SQLAlchemyLeaveRepository(db))
     onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db))
+    parking = ParkingService(SQLAlchemyParkingRepository(db), settings)
     pending = PendingActionCoordinator(
         SQLAlchemyPendingActionRepository(db),
         {
@@ -80,6 +88,9 @@ def chat(
             "create_onboarding": CreateOnboardingHandler(onboarding),
             "approve_onboarding": ApproveOnboardingHandler(onboarding),
             "reject_onboarding": RejectOnboardingHandler(onboarding),
+            "reserve_parking": ReserveParkingHandler(parking),
+            "cancel_parking": CancelParkingHandler(parking),
+            "join_parking_waitlist": JoinParkingWaitlistHandler(parking),
         },
     )
     service = HRAssistantOrchestrator(
@@ -88,6 +99,7 @@ def chat(
         conversations=SQLAlchemyConversationRepository(db),
         leave=leave,
         onboarding=onboarding,
+        parking=parking,
         pending=pending,
         policies=policies,
         llm=llm,

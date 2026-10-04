@@ -23,6 +23,10 @@ class ConflictError(ApplicationError):
     code = "conflict"
 
 
+class ParkingUnavailableError(ConflictError):
+    code = "parking_unavailable"
+
+
 class ValidationError(ApplicationError):
     code = "validation_error"
 

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime
 
 from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import NotFoundError
 from app.domain.parking.entities import (
     ParkingReservationData,
+    ParkingReservationEventData,
     ParkingReservationStatus,
     ParkingSlotData,
     ParkingSlotType,
@@ -16,6 +17,7 @@ from app.domain.parking.entities import (
 )
 from app.infrastructure.database.models import (
     ParkingReservation,
+    ParkingReservationEvent,
     ParkingSlot,
     ParkingWaitlistEntry,
     Vehicle,
@@ -45,7 +47,9 @@ class SQLAlchemyParkingRepository:
         ).all()
         return [self._to_slot(row) for row in rows]
 
-    def list_available_slots(self, requested_date: date) -> list[ParkingSlotData]:
+    def list_available_slots(
+        self, requested_date: date, *, for_update: bool = False
+    ) -> list[ParkingSlotData]:
         occupied = exists().where(
             ParkingReservation.slot_id == ParkingSlot.id,
             ParkingReservation.reservation_date == requested_date,
@@ -56,18 +60,24 @@ class SQLAlchemyParkingRepository:
                 )
             ),
         )
-        rows = self.db.scalars(
+        statement = (
             select(ParkingSlot)
-            .where(ParkingSlot.active.is_(True), ~occupied)
+            .where(
+                ParkingSlot.active.is_(True),
+                ParkingSlot.slot_type == ParkingSlotType.REGULAR.value,
+                ~occupied,
+            )
             .order_by(ParkingSlot.code)
-        ).all()
+        )
+        if for_update:
+            statement = statement.with_for_update(skip_locked=True)
+        rows = self.db.scalars(statement).all()
         return [self._to_slot(row) for row in rows]
 
     def get_active_reservation(
-        self, employee_id: int, requested_date: date
+        self, employee_id: int, requested_date: date, *, for_update: bool = False
     ) -> ParkingReservationData | None:
-        row = self.db.scalar(
-            select(ParkingReservation).where(
+        statement = select(ParkingReservation).where(
                 ParkingReservation.employee_id == employee_id,
                 ParkingReservation.reservation_date == requested_date,
                 ParkingReservation.status.in_(
@@ -75,27 +85,137 @@ class SQLAlchemyParkingRepository:
                         ParkingReservationStatus.RESERVED.value,
                         ParkingReservationStatus.CHECKED_IN.value,
                     )
-                ),
-            )
+                )
         )
+        if for_update:
+            statement = statement.with_for_update()
+        row = self.db.scalar(statement)
         if row is None:
             return None
+        return self._reservation_data(row)
+
+    def get_reservation(
+        self, reservation_id: int, *, for_update: bool = False
+    ) -> ParkingReservationData | None:
+        statement = select(ParkingReservation).where(ParkingReservation.id == reservation_id)
+        if for_update:
+            statement = statement.with_for_update()
+        row = self.db.scalar(statement)
+        return self._reservation_data(row) if row else None
+
+    def list_reservations(self, employee_id: int) -> list[ParkingReservationData]:
+        rows = self.db.scalars(
+            select(ParkingReservation)
+            .where(ParkingReservation.employee_id == employee_id)
+            .order_by(
+                ParkingReservation.reservation_date.desc(),
+                ParkingReservation.id.desc(),
+            )
+        ).all()
+        return [self._reservation_data(row) for row in rows]
+
+    def add_reservation(
+        self, employee_id: int, vehicle_id: int, slot_id: int, requested_date: date
+    ) -> ParkingReservationData:
+        row = ParkingReservation(
+            employee_id=employee_id,
+            vehicle_id=vehicle_id,
+            slot_id=slot_id,
+            reservation_date=requested_date,
+            status=ParkingReservationStatus.RESERVED.value,
+        )
+        self.db.add(row)
+        self.db.flush()
+        return self._reservation_data(row)
+
+    def update_reservation_status(
+        self, reservation_id: int, status: ParkingReservationStatus
+    ) -> ParkingReservationData:
+        row = self.db.get(ParkingReservation, reservation_id)
+        if row is None:
+            raise NotFoundError("Parking reservation was not found")
+        row.status = status.value
+        now = datetime.now(UTC)
+        if status is ParkingReservationStatus.CANCELLED:
+            row.cancelled_at = now
+        elif status is ParkingReservationStatus.CHECKED_IN:
+            row.checked_in_at = now
+        elif status is ParkingReservationStatus.COMPLETED:
+            row.completed_at = now
+        elif status is ParkingReservationStatus.NO_SHOW:
+            row.no_show_at = now
+        self.db.flush()
+        return self._reservation_data(row)
+
+    def add_reservation_event(
+        self, event: ParkingReservationEventData
+    ) -> ParkingReservationEventData:
+        row = ParkingReservationEvent(
+            reservation_id=event.reservation_id,
+            actor_user_id=event.actor_user_id,
+            from_status=event.from_status.value if event.from_status else None,
+            to_status=event.to_status.value,
+            reason=event.reason,
+        )
+        self.db.add(row)
+        self.db.flush()
+        return ParkingReservationEventData(
+            row.id,
+            row.reservation_id,
+            row.actor_user_id,
+            ParkingReservationStatus(row.from_status) if row.from_status else None,
+            ParkingReservationStatus(row.to_status),
+            row.reason,
+            row.created_at,
+        )
+
+    def get_waitlist_entry(
+        self, employee_id: int, requested_date: date, *, for_update: bool = False
+    ) -> ParkingWaitlistData | None:
+        statement = select(ParkingWaitlistEntry).where(
+                ParkingWaitlistEntry.employee_id == employee_id,
+                ParkingWaitlistEntry.requested_date == requested_date,
+                ParkingWaitlistEntry.status == ParkingWaitlistStatus.WAITING.value,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        row = self.db.scalar(statement)
+        return self._to_waitlist(row) if row else None
+
+    def add_waitlist_entry(
+        self, employee_id: int, vehicle_id: int, requested_date: date
+    ) -> ParkingWaitlistData:
+        row = ParkingWaitlistEntry(
+            employee_id=employee_id,
+            vehicle_id=vehicle_id,
+            requested_date=requested_date,
+            status=ParkingWaitlistStatus.WAITING.value,
+        )
+        self.db.add(row)
+        self.db.flush()
+        return self._to_waitlist(row)
+
+    def update_waitlist_status(
+        self, entry_id: int, status: ParkingWaitlistStatus
+    ) -> ParkingWaitlistData:
+        row = self.db.get(ParkingWaitlistEntry, entry_id)
+        if row is None:
+            raise NotFoundError("Parking waitlist entry was not found")
+        row.status = status.value
+        self.db.flush()
+        return self._to_waitlist(row)
+
+    def commit(self) -> None:
+        self.db.commit()
+
+    def rollback(self) -> None:
+        self.db.rollback()
+
+    def _reservation_data(self, row: ParkingReservation) -> ParkingReservationData:
         slot = self.db.get(ParkingSlot, row.slot_id)
         if slot is None:
             raise NotFoundError("The parking slot for this reservation no longer exists")
         return self._to_reservation(row, slot)
-
-    def get_waitlist_entry(
-        self, employee_id: int, requested_date: date
-    ) -> ParkingWaitlistData | None:
-        row = self.db.scalar(
-            select(ParkingWaitlistEntry).where(
-                ParkingWaitlistEntry.employee_id == employee_id,
-                ParkingWaitlistEntry.requested_date == requested_date,
-                ParkingWaitlistEntry.status == ParkingWaitlistStatus.WAITING.value,
-            )
-        )
-        return self._to_waitlist(row) if row else None
 
     @staticmethod
     def _to_vehicle(row: Vehicle) -> VehicleData:
