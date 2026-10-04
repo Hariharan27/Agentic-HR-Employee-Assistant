@@ -1,21 +1,23 @@
 # Ideator PeopleDesk
 
 Ideator PeopleDesk is an authenticated Agentic HR help desk for ideas2it employees. It answers HR
-questions from company policy documents and executes leave and onboarding workflows against trusted employee data
+questions from company policy documents and executes leave, onboarding, and workplace parking workflows against trusted employee data
 with deterministic rules, role-based authorization, human confirmation, and an auditable lifecycle.
 
-The assessment release completes the HR policy, leave, and employee-onboarding domains end to end.
-Parking is intentionally reserved for a later phase.
+The assessment release completes the HR policy, leave, employee-onboarding, employee parking,
+and Parking Administrator attendance workflows end to end.
 
 ## What it demonstrates
 
-- Authenticated employee, manager, HR, and HR administrator experiences
+- Authenticated employee, manager, HR, HR administrator, and Parking Administrator experiences
 - LangGraph intent routing and multi-turn conversation state
 - Grounded policy RAG over 32 PDFs with document/page attribution
 - Dynamic leave balances, eligibility, working-day calculation, and request history
 - Leave application, cancellation, manager approval, and rejection workflows
 - Manager/HR onboarding requests with independent HR administrator approval
 - Atomic employee account activation, default balances, and one-time temporary credentials
+- Database-backed parking availability, reservation, lookup, cancellation, and waitlist workflows
+- Parking Admin queue, check-in, late cancellation, no-show, completion, and override workflows
 - Explicit confirmation before every database mutation
 - Deterministic business rules and service-layer authorization outside the LLM
 - Cost-aware Amazon Bedrock Mantle model routing
@@ -32,9 +34,11 @@ flowchart LR
     GRAPH --> CONFIRM[Confirmation\nLifecycle]
     ROUTER --> POLICY[Policy RAG]
     ROUTER --> LEAVE[Deterministic\nLeave Services]
+    ROUTER --> PARKING[Deterministic\nParking Services]
     POLICY --> QDRANT[(Qdrant)]
     POLICY --> MODEL[GPT OSS 120B\nGrounded Answer]
     LEAVE --> POSTGRES[(PostgreSQL)]
+    PARKING --> POSTGRES
     CONFIRM --> POSTGRES
     GRAPH --> POSTGRES
 ```
@@ -53,12 +57,13 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
 | Policy questions | Qdrant retrieval and grounded GPT OSS 120B response with sources |
 | Dynamic employee information | PostgreSQL-backed balances and request lifecycle |
 | Calculations | Python working-day, holiday, overlap, and balance rules |
-| Tool usage | LangGraph invokes validated policy, leave, and onboarding application services |
+| Tool usage | LangGraph invokes validated policy, leave, onboarding, and parking services |
 | Agent workflow | Structured routing, conditional graph nodes, context, and escalation |
 | Safe actions | Expiring pending actions and explicit Confirm/Cancel step |
 | Manager workflow | Direct-report queue, approve/reject, balance update, audit history |
 | Onboarding workflow | Four provisioning tasks, HR Admin approval, account activation, employee login |
-| Quality evidence | 110 automated tests and 85 live golden scenarios |
+| Parking workflow | Availability, reservation/cancellation, waitlist, admin attendance, and three-strike suspension |
+| Quality evidence | 141 automated tests and 99 live golden scenarios |
 
 ## Quick start with Docker
 
@@ -98,21 +103,24 @@ migrations and performs non-destructive, idempotent seeding.
 | Manager | `manager` | `manager123` |
 | HR | `hr` | `hr12345` |
 | HR Administrator | `hradmin` | `hradmin123` |
+| Parking Administrator | `parkingadmin` | `parkingadmin123` |
 
 These credentials are intentionally non-sensitive and exist only for local demonstration.
 
-Reset the four demo identities to a predictable state before recording:
+Reset the five demo identities to a predictable state before recording:
 
 ```bash
 docker compose exec -T backend python -m app.seed --reset-demo
 ```
 
-The reset clears demo conversations, pending actions, leave activity, and onboarding requests
+The reset clears demo conversations, pending actions, leave and parking activity, and onboarding requests
 created by demo identities—including any accounts activated from them. It restores the documented
-passwords and balances and creates one pending Casual Leave request for the manager flow. Policy
-vectors, schema, and unrelated employees are not changed.
+passwords, balances, registered vehicles, five parking slots, one occupied-slot scenario, and one
+pending Casual Leave request for the manager flow. Policy vectors, schema, and unrelated employees
+are not changed.
 
-Follow [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the exact 6–8 minute assessment walkthrough.
+Follow [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the end-to-end assessment walkthrough and
+[ROLES_AND_RESPONSIBILITIES.md](ROLES_AND_RESPONSIBILITIES.md) for the authorization hierarchy.
 
 ## Implemented agent flow
 
@@ -125,8 +133,8 @@ POST /api/v1/chat
        ├─ policy  → retrieve Qdrant evidence → grounded response + sources
        ├─ leave   → deterministic application service
        ├─ onboarding → deterministic request, review, and account activation services
-       ├─ general → deterministic capability response
-       └─ parking → explicit not-yet-available response
+       ├─ parking → deterministic availability and employee parking service
+       └─ general → deterministic capability response
   → persist conversation state
   → return message, intent, sources, and pending-action summary
 ```
@@ -137,7 +145,7 @@ Application and manager decisions follow a two-turn lifecycle:
 request → validate → propose pending action → explicit confirmation → revalidate → atomic write
 ```
 
-No leave request or manager decision is executed directly from model output.
+No leave, onboarding, or parking mutation is executed directly from model output.
 
 ## Application tools
 
@@ -149,6 +157,8 @@ or native provider function calls.
 | Policy | Search policy evidence and return source metadata |
 | Employee leave | Balance, holidays, calculation, eligibility, apply, list, cancel |
 | Manager/HR | Approval queue, approve, reject, request audit history |
+| Employee parking | Register/update vehicle, availability, reserve, list, cancel, and waitlist |
+| Parking Admin | Daily queue, check-in, late cancellation, no-show, completion, and override |
 | Confirmation | Propose, inspect, cancel, expire, and atomically execute pending actions |
 
 Every self-service operation derives employee identity from the JWT. Manager scope is derived from
@@ -193,6 +203,9 @@ document, page, section, and category.
 - `GET /api/v1/manager/leave-requests`
 - `POST /api/v1/manager/leave-requests/{id}/approve`
 - `POST /api/v1/manager/leave-requests/{id}/reject`
+- `GET /api/v1/parking/me/suspension`
+- `GET /api/v1/parking/reservations/{id}/history`
+- `GET /api/v1/parking-admin/reservations`
 
 All endpoints other than health and login require a bearer token.
 
@@ -219,7 +232,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Current deterministic result: **114 passed**.
+Current deterministic result: **141 passed**.
 
 Validate or run the live golden dataset:
 
@@ -230,10 +243,10 @@ cd backend
 ./evals/run_quality_gate.sh
 ```
 
-The dataset contains **93 scenarios** covering policy grounding, routing, leave rules,
-confirmations, manager and onboarding workflows, authorization, prompt injection, scope, and API
+The dataset contains **99 scenarios** covering policy grounding, routing, leave rules,
+confirmations, manager, onboarding, and parking workflows, authorization, prompt injection, scope, and API
 safety. The release gate requires at least 95% overall pass rate and consistency, plus 100% for
-safety, API-safety, and onboarding categories. Mutating cases are skipped unless
+safety, API-safety, onboarding, and parking categories. Mutating cases are skipped unless
 `--include-mutating` is supplied and should run only against a reset demo database.
 
 Reports are generated as ignored JSON and HTML files under `backend/evals/reports/`.
@@ -251,8 +264,8 @@ npm run build
 ```text
 frontend/                   Ideator PeopleDesk React application
 backend/app/agent/          LangGraph orchestration and state
-backend/app/application/    Leave and pending-action use cases
-backend/app/domain/         Deterministic leave/onboarding entities and business rules
+backend/app/application/    Leave, onboarding, parking, and pending-action use cases
+backend/app/domain/         Deterministic domain entities and business rules
 backend/app/infrastructure/ Provider and persistence adapters
 backend/app/rag/            PDF ingestion and policy retrieval
 backend/tests/              Deterministic test suite
@@ -273,11 +286,15 @@ Completed:
 - Ideator PeopleDesk assessment frontend
 - Golden behavior evaluation and demo reset
 - New-employee onboarding, HR Admin approval, and employee account activation
+- Workplace parking persistence foundation: vehicles, slots, reservations, waitlist, lifecycle audit,
+  concurrency constraints, configuration, and repeatable demo data
+- Employee parking chat workflow with confirmation-time revalidation and conversation context
+- Parking Admin queue, check-in, late cancellation with reason, no-show enforcement, completion,
+  no-show override, and three-strike suspension
 
 Future phases:
 
-- Workplace parking workflow
 - Production identity provider and managed secret storage
 - Production observability and deployment hardening
 
-The future parking domain label is recognized only to return a transparent unavailable response.
+The employee parking and Parking Administrator workflows are complete for the assessment scope.

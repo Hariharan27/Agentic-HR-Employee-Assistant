@@ -7,6 +7,7 @@ from app.api.schemas.onboarding import (
     OnboardingPlanResponse,
     OnboardingStatusResponse,
     OnboardingTaskResponse,
+    ReportingManagerResponse,
 )
 from app.application.onboarding.service import OnboardingService
 from app.domain.onboarding.entities import TASK_TITLES, OnboardingRequestData
@@ -81,6 +82,20 @@ def check_employee_exists(
         email=normalized,
         exists=_service(db).check_employee_exists(actor, normalized),
     )
+
+
+@router.get("/reporting-managers", response_model=list[ReportingManagerResponse])
+def reporting_managers(actor: CurrentUser, db: Database) -> list[ReportingManagerResponse]:
+    return [
+        ReportingManagerResponse(
+            id=item.id,
+            name=item.name,
+            employee_code=item.employee_code,
+            designation=item.designation,
+            department=item.department,
+        )
+        for item in _service(db).list_reporting_managers(actor)
+    ]
 
 
 @router.post("/plan", response_model=OnboardingPlanResponse)

@@ -8,12 +8,25 @@ from app.agent.orchestrator import HRAssistantOrchestrator
 from app.api.dependencies import AppSettings, CurrentUser, Database
 from app.api.schemas.chat import ChatRequest, ChatResponse
 from app.application.leave.service import LeaveService
+from app.application.notifications.service import EmailService
 from app.application.onboarding.handler import (
     ApproveOnboardingHandler,
     CreateOnboardingHandler,
     RejectOnboardingHandler,
 )
 from app.application.onboarding.service import OnboardingService
+from app.application.parking.handlers import (
+    AdminCancelParkingHandler,
+    CancelParkingHandler,
+    CheckInParkingHandler,
+    CompleteParkingHandler,
+    JoinParkingWaitlistHandler,
+    MarkParkingNoShowHandler,
+    OverrideParkingNoShowHandler,
+    RegisterVehicleHandler,
+    ReserveParkingHandler,
+)
+from app.application.parking.service import ParkingService
 from app.application.pending.handlers import (
     ApplyLeaveHandler,
     ApproveLeaveRequestHandler,
@@ -27,8 +40,10 @@ from app.infrastructure.llm.mantle import MantleLLMGateway
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.infrastructure.repositories.leave import SQLAlchemyLeaveRepository
 from app.infrastructure.repositories.onboarding import SQLAlchemyOnboardingRepository
+from app.infrastructure.repositories.parking import SQLAlchemyParkingRepository
 from app.infrastructure.repositories.pending_action import SQLAlchemyPendingActionRepository
 from app.infrastructure.vector_store.qdrant import QdrantPolicyVectorStore
+from app.infrastructure.notifications.email import ConsoleEmailGateway
 from app.llm.ports import LLMGateway
 from app.rag.service import PolicyKnowledgeService
 
@@ -70,6 +85,8 @@ def chat(
 ) -> ChatResponse:
     leave = LeaveService(SQLAlchemyLeaveRepository(db))
     onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db))
+    parking = ParkingService(SQLAlchemyParkingRepository(db), settings)
+    email_service = EmailService(ConsoleEmailGateway())
     pending = PendingActionCoordinator(
         SQLAlchemyPendingActionRepository(db),
         {
@@ -78,8 +95,23 @@ def chat(
             "reject_leave_request": RejectLeaveRequestHandler(leave),
             "cancel_leave_request": CancelLeaveRequestHandler(leave),
             "create_onboarding": CreateOnboardingHandler(onboarding),
-            "approve_onboarding": ApproveOnboardingHandler(onboarding),
+            "approve_onboarding": ApproveOnboardingHandler(
+                onboarding,
+                email_service,
+                settings.finance_notification_email,
+                settings.it_notification_email,
+                settings.facilities_notification_email,
+            ),
             "reject_onboarding": RejectOnboardingHandler(onboarding),
+            "register_vehicle": RegisterVehicleHandler(parking),
+            "reserve_parking": ReserveParkingHandler(parking),
+            "cancel_parking": CancelParkingHandler(parking),
+            "join_parking_waitlist": JoinParkingWaitlistHandler(parking),
+            "check_in_parking": CheckInParkingHandler(parking),
+            "admin_cancel_parking": AdminCancelParkingHandler(parking),
+            "mark_parking_no_show": MarkParkingNoShowHandler(parking),
+            "override_parking_no_show": OverrideParkingNoShowHandler(parking),
+            "complete_parking": CompleteParkingHandler(parking),
         },
     )
     service = HRAssistantOrchestrator(
@@ -88,6 +120,7 @@ def chat(
         conversations=SQLAlchemyConversationRepository(db),
         leave=leave,
         onboarding=onboarding,
+        parking=parking,
         pending=pending,
         policies=policies,
         llm=llm,

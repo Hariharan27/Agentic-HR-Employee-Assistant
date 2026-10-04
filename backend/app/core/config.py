@@ -36,6 +36,20 @@ class Settings(BaseSettings):
     complex_escalation_threshold: float = 0.70
     llm_max_retries: int = 1
     llm_max_calls_per_request: int = 3
+    parking_booking_horizon_days: int = Field(default=30, ge=1, le=365)
+    parking_cancellation_cutoff_hour: int = Field(default=20, ge=0, le=23)
+    parking_check_in_open_hour: int = Field(default=7, ge=0, le=23)
+    parking_arrival_cutoff_hour: int = Field(default=11, ge=0, le=23)
+    parking_no_show_grace_minutes: int = Field(default=15, ge=0, le=180)
+    parking_no_show_lookback_days: int = Field(default=30, ge=1, le=365)
+    parking_no_show_strike_limit: int = Field(default=3, ge=1, le=20)
+    parking_suspension_days: int = Field(default=14, ge=1, le=365)
+    # Department notification recipients.
+    # These can be overridden through environment variables.
+    hr_notification_email: str = "hr@example.com"
+    it_notification_email: str = "it@example.com"
+    finance_notification_email: str = "finance@example.com"
+    facilities_notification_email: str = "facilities@example.com"
     cors_origins: str = "http://localhost:5173"
     log_level: str = "INFO"
 

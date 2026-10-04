@@ -32,17 +32,23 @@ def db_session():
         hr_admin = Employee(employee_code="HA1", name="Test HR Admin", email="hradmin@test.local",
                             designation="HR Administrator", department="People", manager_name=None,
                             location="Chennai", employment_type="Permanent", joining_date=date(2020, 1, 1))
-        db.add_all([employee, manager, hr, hr_admin]); db.flush()
+        parking_admin = Employee(employee_code="PA1", name="Test Parking Admin", email="parking@test.local",
+                                 designation="Parking Administrator", department="Workplace Operations",
+                                 manager_name=None, location="Chennai", employment_type="Permanent",
+                                 joining_date=date(2020, 6, 1))
+        db.add_all([employee, manager, hr, hr_admin, parking_admin]); db.flush()
         employee.manager_employee_id = manager.id
         db.add_all([
             User(username="employee", password_hash=hash_password("correct-password"), role="EMPLOYEE", employee_id=employee.id),
             User(username="manager", password_hash=hash_password("manager-password"), role="MANAGER", employee_id=manager.id),
             User(username="hr", password_hash=hash_password("hr-password"), role="HR", employee_id=hr.id),
             User(username="hradmin", password_hash=hash_password("hradmin-password"), role="HR_ADMIN", employee_id=hr_admin.id),
+            User(username="parkingadmin", password_hash=hash_password("parkingadmin-password"), role="PARKING_ADMIN", employee_id=parking_admin.id),
         ])
         db.add_all([
             LeaveBalance(employee_id=employee.id, leave_type="CASUAL", total_days=12, used_days=8),
-            LeaveBalance(employee_id=employee.id, leave_type="PRIVILEGE", total_days=18, used_days=3),
+            LeaveBalance(employee_id=employee.id, leave_type="EARNED", total_days=12, used_days=3, carry_forward_limit_days=8),
+            LeaveBalance(employee_id=employee.id, leave_type="SICK", total_days=10, used_days=1),
             LeaveBalance(employee_id=manager.id, leave_type="CASUAL", total_days=12, used_days=2),
             Holiday(holiday_date=date(2026, 10, 7), name="Test Holiday", category="PUBLIC"),
         ])

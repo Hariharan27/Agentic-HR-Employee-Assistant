@@ -7,7 +7,7 @@ from app.application.onboarding.service import OnboardingService
 from app.core.exceptions import ValidationError
 from app.core.security import AuthenticatedUser
 from app.domain.onboarding.entities import OnboardingCandidate
-
+from app.application.notifications.service import EmailService
 
 class CreateOnboardingArguments(BaseModel):
     name: str = Field(min_length=1, max_length=160)
@@ -56,8 +56,19 @@ class CreateOnboardingHandler:
 class ApproveOnboardingHandler:
     action_type = "approve_onboarding"
 
-    def __init__(self, onboarding_service: OnboardingService):
+    def __init__(
+        self,
+        onboarding_service: OnboardingService,
+        email_service: EmailService,
+        finance_notification_email: str,
+        it_notification_email: str,
+        facilities_notification_email: str,
+    ):
         self.onboarding_service = onboarding_service
+        self.email_service = email_service
+        self.finance_notification_email = finance_notification_email
+        self.it_notification_email = it_notification_email
+        self.facilities_notification_email = facilities_notification_email
 
     def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -68,7 +79,107 @@ class ApproveOnboardingHandler:
     def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
         validated = ApproveOnboardingArguments.model_validate(arguments)
         return self.onboarding_service.stage_approve_onboarding(
-            actor, validated.request_id, validated.comment
+            actor,
+            validated.request_id,
+            validated.comment,
+        )
+
+    def after_commit(
+        self,
+        actor: AuthenticatedUser,
+        arguments: dict[str, Any],
+        result,
+    ) -> None:
+        candidate = result.request.candidate
+        joining_date = candidate.joining_date.strftime("%d %B %Y")
+
+        employee_details = (
+            f"Employee Name: {candidate.name}\n"
+            f"Employee Code: {result.employee_code}\n"
+            f"Official Email: {candidate.email}\n"
+            f"Designation: {candidate.designation}\n"
+            f"Department: {candidate.department}\n"
+            f"Employment Type: {candidate.employment_type}\n"
+            f"Location: {candidate.location}\n"
+            f"Joining Date: {joining_date}\n"
+            f"Reporting Manager: {candidate.reporting_manager}"
+        )
+
+        # Finance notification
+        self.email_service.send_safely(
+            to=(self.finance_notification_email,),
+            subject=(
+                f"[Onboarding #{result.request.id}] Payroll Setup Required - "
+                f"{candidate.name} ({result.employee_code}) - Joining {joining_date}"
+            ),
+            body=(
+                "Dear Finance Team,\n\n"
+                f"{candidate.name} has successfully completed the HR onboarding "
+                "approval process. Please initiate the required payroll and salary "
+                "account setup.\n\n"
+                "Employee Details\n"
+                "----------------\n"
+                f"{employee_details}\n\n"
+                "Requested Action\n"
+                "----------------\n"
+                "Please complete the payroll registration and salary account "
+                "setup required for the employee's onboarding.\n\n"
+                "Regards,\n"
+                "PeopleDesk HR Assistant"
+            ),
+        )
+
+        # IT notification
+        self.email_service.send_safely(
+            to=(self.it_notification_email,),
+            subject=(
+                f"[Onboarding #{result.request.id}] IT Provisioning Required - "
+                f"{candidate.name} ({result.employee_code}) - Joining {joining_date}"
+            ),
+            body=(
+                "Dear IT Team,\n\n"
+                f"{candidate.name} has successfully completed the HR onboarding "
+                "approval process. Please initiate the required IT provisioning "
+                "before the employee's joining date.\n\n"
+                "Employee Details\n"
+                "----------------\n"
+                f"{employee_details}\n\n"
+                "Requested Actions\n"
+                "-----------------\n"
+                "- Provision the corporate email account\n"
+                "- Set up necessary IT equipment and access\n"
+                "- Arrange the required laptop/workstation\n\n"
+                "Please ensure the required IT assets and account access are "
+                "available for the employee's onboarding.\n\n"
+                "Regards,\n"
+                "PeopleDesk HR Assistant"
+            ),
+        )
+
+        # Facilities notification
+        self.email_service.send_safely(
+            to=(self.facilities_notification_email,),
+            subject=(
+                f"[Onboarding #{result.request.id}] Access Provisioning Required - "
+                f"{candidate.name} ({result.employee_code}) - Joining {joining_date}"
+            ),
+            body=(
+                "Dear Facilities Team,\n\n"
+                f"{candidate.name} has successfully completed the HR onboarding "
+                "approval process. Please initiate the required workplace access "
+                "provisioning.\n\n"
+                "Employee Details\n"
+                "----------------\n"
+                f"{employee_details}\n\n"
+                "Requested Actions\n"
+                "-----------------\n"
+                "- Prepare the permanent access card\n"
+                "- Arrange temporary access until permanent access is available\n\n"
+                "Please ensure the required access arrangements are available "
+                "for the employee's joining date.\n\n"
+                "Regards,\n"
+                "PeopleDesk HR Assistant"
+            ),
         )
 
 

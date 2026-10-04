@@ -24,6 +24,14 @@ class EmployeeExistsResponse(BaseModel):
     exists: bool
 
 
+class ReportingManagerResponse(BaseModel):
+    id: int
+    name: str
+    employee_code: str | None
+    designation: str | None
+    department: str | None
+
+
 class OnboardingPlanResponse(BaseModel):
     candidate: OnboardingCandidateRequest
     manager_employee_id: int

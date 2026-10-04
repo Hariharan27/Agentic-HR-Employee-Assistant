@@ -41,8 +41,13 @@ class LeaveService:
         if not balances:
             raise NotFoundError("No leave balance was found for the authenticated employee")
         return [
-            LeaveBalanceSnapshot(b.leave_type, b.total_days, b.used_days,
-                                 self.repository.get_pending_days(actor.employee_id, b.leave_type))
+            LeaveBalanceSnapshot(
+                b.leave_type,
+                b.total_days,
+                b.used_days,
+                b.carry_forward_limit_days,
+                pending_days=self.repository.get_pending_days(actor.employee_id, b.leave_type),
+            )
             for b in balances
         ]
 

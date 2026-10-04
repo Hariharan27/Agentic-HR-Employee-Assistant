@@ -62,7 +62,7 @@ def test_overlapping_active_request_is_rejected(db_session):
 def test_request_history_never_exposes_another_employee(db_session):
     employee = context(db_session, "employee")
     manager = context(db_session, "manager")
-    service(db_session).apply_leave(employee, "PRIVILEGE", date(2026, 10, 5), date(2026, 10, 5))
+    service(db_session).apply_leave(employee, "EARNED", date(2026, 10, 5), date(2026, 10, 5))
     assert len(service(db_session).get_my_leave_requests(employee)) == 1
     assert service(db_session).get_my_leave_requests(manager) == []
 

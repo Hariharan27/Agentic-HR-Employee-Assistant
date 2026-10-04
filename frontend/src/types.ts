@@ -4,7 +4,7 @@ export type Profile = {
   employee_code: string;
   name: string;
   email: string;
-  role: "EMPLOYEE" | "MANAGER" | "HR" | "HR_ADMIN";
+  role: "EMPLOYEE" | "MANAGER" | "HR" | "HR_ADMIN" | "PARKING_ADMIN";
 };
 
 export type Source = {
@@ -28,6 +28,8 @@ export type ChatMessage = {
   text: string;
   sources?: Source[];
   intent?: string | null;
+  showOnboardingForm?: boolean;
+  showVehicleForm?: boolean;
 };
 
 export type LeaveRequest = {
@@ -77,4 +79,28 @@ export type OnboardingStatus = {
   tasks: OnboardingTask[];
   created_at?: string | null;
   updated_at?: string | null;
+};
+
+export type ReportingManager = {
+  id: number;
+  name: string;
+  employee_code?: string | null;
+  designation?: string | null;
+  department?: string | null;
+};
+
+export type ParkingReservation = {
+  id: number;
+  employee_id: number;
+  employee_code?: string | null;
+  employee_name?: string | null;
+  vehicle_registration?: string | null;
+  slot_code: string;
+  slot_location: string;
+  reservation_date: string;
+  status: string;
+  cancelled_at?: string | null;
+  checked_in_at?: string | null;
+  completed_at?: string | null;
+  no_show_at?: string | null;
 };

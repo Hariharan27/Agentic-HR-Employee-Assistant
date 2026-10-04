@@ -1,8 +1,8 @@
 # Ideator PeopleDesk — As-Built Technical Architecture
 
 This document describes the implementation currently present in the repository. The assessment
-release implements authenticated HR policy, leave, and employee-onboarding lifecycles end to end;
-parking remains a future extension.
+release implements authenticated HR policy, leave, employee-onboarding, employee-parking, and
+Parking Administrator attendance lifecycles end to end.
 
 ## 1. Architecture goals
 
@@ -42,6 +42,7 @@ flowchart TB
     GRAPH --> CONFIRM[Pending-action\nconfirmation]
     ROUTER --> POLICY[Policy node]
     ROUTER --> LEAVE[Leave node]
+    ROUTER --> PARKING[Parking node]
     ROUTER --> GENERAL[Deterministic general response]
     ROUTER --> UNSUPPORTED[Future-domain response]
 
@@ -51,9 +52,11 @@ flowchart TB
     POLICY --> ANSWER[Grounded response\nGPT OSS 120B]
 
     LEAVE --> SERVICE[Deterministic LeaveService]
+    PARKING --> PARKING_SERVICE[Deterministic ParkingService]
     CONFIRM --> PENDING[PendingActionCoordinator]
     PENDING --> SERVICE
     SERVICE --> REPO[SQLAlchemy repositories]
+    PARKING_SERVICE --> REPO
     REPO --> POSTGRES[(PostgreSQL)]
 
     GRAPH --> CONVERSATION[Conversation repository]
@@ -123,11 +126,13 @@ flowchart LR
     RESOLVE -->|none| ROUTER[router]
     ROUTER --> POLICY[policy]
     ROUTER --> LEAVE[leave]
+    ROUTER --> PARKING[parking]
     ROUTER --> GENERAL[general]
     ROUTER --> UNSUPPORTED[unsupported]
     CONFIRM --> END
     POLICY --> END
     LEAVE --> END
+    PARKING --> END
     GENERAL --> END
     UNSUPPORTED --> END
 ```
@@ -143,6 +148,7 @@ The graph carries:
 - Pending action and user-facing summary
 - Response and policy sources
 - Per-request LLM call count
+- Validated parking date context for safe follow-up turns
 
 ### Routing
 
@@ -174,6 +180,12 @@ Python code directly.
 | Approve/reject | Pending handler + `LeaveService` | Authorized transaction |
 | Cancel request | Pending handler + `LeaveService` | Request ownership |
 | Audit history | `LeaveService.get_leave_request_history` | Request events |
+| Parking vehicle | `ParkingService.get_vehicle` | Authenticated employee vehicle |
+| Parking availability | `ParkingService.check_availability` | PostgreSQL slots/reservations |
+| Reserve/cancel | Pending handlers + `ParkingService` | Confirmed atomic transaction |
+| Parking waitlist | Pending handler + `ParkingService` | PostgreSQL waitlist |
+| Parking Admin queue | `ParkingService.get_daily_reservations` | `PARKING_ADMIN` role |
+| Parking attendance | Pending handlers + `ParkingService` | Check-in, no-show, completion, override |
 
 This separation prevents the LLM from performing arithmetic, generating authoritative employee
 IDs, changing statuses, or constructing SQL.
@@ -273,6 +285,11 @@ Cost and stability controls include:
 | `leave_requests` | Dates, working days, status, manager, decision metadata |
 | `leave_request_events` | Immutable lifecycle/audit entries |
 | `holidays` | Dates excluded from working-day calculations |
+| `vehicles` | One registered active vehicle per employee for the parking MVP |
+| `parking_slots` | Database-backed workplace parking inventory |
+| `parking_reservations` | Reservation and attendance lifecycle state |
+| `parking_reservation_events` | Auditable reservation status transitions and reasons |
+| `parking_waitlist` | One active waitlist entry per employee and date |
 
 Alembic owns schema evolution. PostgreSQL constraints, foreign keys, indexes, row locking, and
 application transactions support integrity and concurrency safety.
@@ -305,11 +322,11 @@ The frontend renders server decisions; it is not an authorization boundary.
 
 ## 14. Quality strategy
 
-- **114 deterministic tests** cover authentication, security, leave rules, onboarding approval and
-  account activation, pending actions, manager lifecycle, RAG, orchestration, evaluation contracts,
-  and repeatable demo seed.
-- **85 versioned golden scenarios** exercise the live API and configured models across policy,
-  leave, safety, scope, manager workflow, and API safety categories.
+- **131 deterministic tests** cover authentication, security, leave rules, onboarding approval and
+  account activation, parking persistence, employee workflows, allocation constraints, pending actions, manager
+  lifecycle, RAG, orchestration, evaluation contracts, and repeatable demo seed.
+- **96 versioned golden scenarios** exercise the live API and configured models across policy,
+  leave, parking, safety, scope, manager workflow, and API safety categories.
 - The latest complete live release gate scored **98.7%** with **99.0% consistency**, above both
   configured 95% thresholds; safety, API-safety, and onboarding categories passed at **100%**.
 - Hardened regression scenarios for greeting stability, policy injection, and missing dates passed
@@ -337,9 +354,12 @@ docker compose exec -T backend python -m app.seed --reset-demo
 
 ## 16. Future extensions
 
-Employee onboarding now uses the same validated, confirmed, atomic workflow pattern as leave.
-Parking remains a future phase and is reported transparently as unavailable. New domains can reuse
-the existing pattern:
+Employee onboarding and parking now use the same validated, confirmed, atomic workflow pattern
+as leave. Parking Phases 3A through 3C provide persistence, demo data, database allocation
+constraints, employee availability, confirmed reservation and cancellation, own-booking lookup,
+waitlisting, safe cross-domain conversation context, Parking Admin check-in, late cancellation,
+no-show enforcement, three-strike suspension, and overrides. New domains can reuse the existing
+pattern:
 
 ```text
 validated route

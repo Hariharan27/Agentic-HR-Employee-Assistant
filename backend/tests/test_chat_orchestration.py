@@ -1,5 +1,5 @@
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 
 import httpx
 import pytest
@@ -14,6 +14,18 @@ from app.application.onboarding.handler import (
     RejectOnboardingHandler,
 )
 from app.application.onboarding.service import OnboardingService
+from app.application.parking.handlers import (
+    AdminCancelParkingHandler,
+    CancelParkingHandler,
+    CheckInParkingHandler,
+    CompleteParkingHandler,
+    JoinParkingWaitlistHandler,
+    MarkParkingNoShowHandler,
+    OverrideParkingNoShowHandler,
+    RegisterVehicleHandler,
+    ReserveParkingHandler,
+)
+from app.application.parking.service import ParkingService
 from app.application.pending.handlers import (
     ApplyLeaveHandler,
     ApproveLeaveRequestHandler,
@@ -22,7 +34,12 @@ from app.application.pending.handlers import (
 )
 from app.application.pending.service import PendingActionCoordinator
 from app.core.config import Settings
-from app.core.exceptions import AuthorizationError, ConflictError, LLMServiceError
+from app.core.exceptions import (
+    AuthorizationError,
+    ConflictError,
+    LLMServiceError,
+    ParkingUnavailableError,
+)
 from app.core.security import AuthenticatedUser
 from app.domain.onboarding.entities import OnboardingCandidate
 from app.infrastructure.database.models import (
@@ -30,13 +47,17 @@ from app.infrastructure.database.models import (
     LeaveRequest,
     OnboardingRequest,
     OnboardingTask,
+    ParkingReservation,
+    ParkingSlot,
     PendingAction,
     User,
+    Vehicle,
 )
 from app.infrastructure.llm.mantle import MantleLLMGateway
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.infrastructure.repositories.leave import SQLAlchemyLeaveRepository
 from app.infrastructure.repositories.onboarding import SQLAlchemyOnboardingRepository
+from app.infrastructure.repositories.parking import SQLAlchemyParkingRepository
 from app.infrastructure.repositories.pending_action import SQLAlchemyPendingActionRepository
 from app.llm.models import ModelTier, RouteDecision
 from app.rag.models import PolicySearchResult
@@ -110,6 +131,37 @@ def complete_onboarding_message() -> str:
     )
 
 
+def setup_parking(db_session, *, slots: int = 2):
+    employee = actor(db_session)
+    manager = actor(db_session, "manager")
+    employee_vehicle = Vehicle(
+        employee_id=employee.employee_id,
+        registration_number="TN01AA1001",
+        vehicle_type="CAR",
+        make_model="Hyundai i20",
+        active=True,
+    )
+    manager_vehicle = Vehicle(
+        employee_id=manager.employee_id,
+        registration_number="TN01MM1001",
+        vehicle_type="CAR",
+        make_model="Honda City",
+        active=True,
+    )
+    parking_slots = [
+        ParkingSlot(
+            code=f"B-{index + 21}",
+            location="Chennai HQ",
+            slot_type="REGULAR",
+            active=True,
+        )
+        for index in range(slots)
+    ]
+    db_session.add_all([employee_vehicle, manager_vehicle, *parking_slots])
+    db_session.commit()
+    return employee_vehicle, manager_vehicle, parking_slots
+
+
 def test_route_decision_normalizes_domain_from_intent():
     decision = RouteDecision.model_validate_json(
         route(domain="leave", intent="policy_question", confidence=0.98)
@@ -118,10 +170,16 @@ def test_route_decision_normalizes_domain_from_intent():
     assert decision.domain == "policy"
 
 
-def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
+def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, parking_now=None):
     current_actor = current_actor or actor(db_session)
+    settings = settings or Settings()
     leave = LeaveService(SQLAlchemyLeaveRepository(db_session))
     onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db_session))
+    parking = ParkingService(
+        SQLAlchemyParkingRepository(db_session),
+        settings,
+        now=lambda: parking_now or datetime(2026, 10, 5, 4, 30, tzinfo=UTC),
+    )
     pending = PendingActionCoordinator(
         SQLAlchemyPendingActionRepository(db_session),
         {
@@ -132,14 +190,24 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
             "create_onboarding": CreateOnboardingHandler(onboarding),
             "approve_onboarding": ApproveOnboardingHandler(onboarding),
             "reject_onboarding": RejectOnboardingHandler(onboarding),
+            "register_vehicle": RegisterVehicleHandler(parking),
+            "reserve_parking": ReserveParkingHandler(parking),
+            "cancel_parking": CancelParkingHandler(parking),
+            "join_parking_waitlist": JoinParkingWaitlistHandler(parking),
+            "check_in_parking": CheckInParkingHandler(parking),
+            "admin_cancel_parking": AdminCancelParkingHandler(parking),
+            "mark_parking_no_show": MarkParkingNoShowHandler(parking),
+            "override_parking_no_show": OverrideParkingNoShowHandler(parking),
+            "complete_parking": CompleteParkingHandler(parking),
         },
     )
     return HRAssistantOrchestrator(
-        settings=settings or Settings(),
+        settings=settings,
         actor=current_actor,
         conversations=SQLAlchemyConversationRepository(db_session),
         leave=leave,
         onboarding=onboarding,
+        parking=parking,
         pending=pending,
         policies=FakePolicies(),
         llm=fake_llm,
@@ -154,6 +222,295 @@ def test_chat_routes_balance_to_deterministic_leave_service(db_session):
     assert result.domain == "leave"
     assert "Casual: 4 available" in result.message
     assert llm.calls == [("router", True)]
+
+
+def test_parking_reservation_requires_confirmation_and_reuses_single_chat(db_session):
+    setup_parking(db_session)
+    llm = FakeLLM(
+        [
+            route(
+                domain="parking",
+                intent="reserve_parking",
+                parking_date="2026-10-08",
+            ),
+            route(domain="leave", intent="leave_balance", leave_type="CASUAL"),
+        ]
+    )
+    service = orchestrator(db_session, llm)
+
+    proposal = service.chat("parking-book", "Book parking on 2026-10-08")
+
+    assert proposal.domain == "parking"
+    assert proposal.intent == "reserve_parking"
+    assert "Slot B-21 is available" in proposal.message
+    assert proposal.pending_action is not None
+    assert db_session.scalars(select(ParkingReservation)).all() == []
+
+    confirmed = service.chat("parking-book", "yes")
+    assert "slot B-21 is reserved" in confirmed.message
+    assert len(db_session.scalars(select(ParkingReservation)).all()) == 1
+
+    balance = service.chat("parking-book", "How many casual leaves do I have?")
+    assert balance.domain == "leave"
+    assert "Casual: 4 available" in balance.message
+
+
+def test_employee_registers_vehicle_with_form_context_and_confirmation(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(domain="general", intent="general"),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    form = service.chat("vehicle-registration", "Register my vehicle")
+    proposal = service.chat(
+        "vehicle-registration",
+        "Register vehicle with these details: registration number: tn-01 zz 4321; "
+        "vehicle type: CAR; make and model: Tata Nexon",
+    )
+
+    assert form.intent == "register_vehicle"
+    assert "vehicle registration form below" in form.message
+    assert proposal.intent == "register_vehicle"
+    assert "TN01ZZ4321" in proposal.message
+    assert proposal.pending_action is not None
+    assert db_session.scalar(select(Vehicle)) is None
+
+    confirmed = service.chat("vehicle-registration", "yes")
+    vehicle = db_session.scalar(select(Vehicle))
+
+    assert "registered successfully" in confirmed.message
+    assert "reserve parking" in confirmed.message
+    assert vehicle.registration_number == "TN01ZZ4321"
+    assert vehicle.make_model == "Tata Nexon"
+
+
+def test_parking_booking_can_be_found_and_cancelled_with_confirmation(db_session):
+    setup_parking(db_session)
+    service = orchestrator(
+        db_session,
+        FakeLLM(
+            [
+                route(
+                    domain="parking",
+                    intent="reserve_parking",
+                    parking_date="2026-10-08",
+                ),
+                route(
+                    domain="parking",
+                    intent="parking_reservations",
+                    parking_date="2026-10-08",
+                ),
+                route(
+                    domain="parking",
+                    intent="cancel_parking",
+                    parking_date="2026-10-08",
+                ),
+            ]
+        ),
+    )
+    service.chat("parking-lifecycle", "Reserve parking on 2026-10-08")
+    service.chat("parking-lifecycle", "yes")
+
+    lookup = service.chat("parking-lifecycle", "Show my parking booking for 2026-10-08")
+    assert "slot B-21, Reserved" in lookup.message
+
+    proposal = service.chat("parking-lifecycle", "Cancel parking on 2026-10-08")
+    assert "Reply yes to confirm" in proposal.message
+    cancelled = service.chat("parking-lifecycle", "yes")
+    assert "cancelled successfully" in cancelled.message
+    assert db_session.scalar(select(ParkingReservation)).status == "CANCELLED"
+
+
+def test_full_parking_offers_confirmed_waitlist(db_session):
+    _, manager_vehicle, slots = setup_parking(db_session, slots=1)
+    manager = actor(db_session, "manager")
+    db_session.add(
+        ParkingReservation(
+            employee_id=manager.employee_id,
+            vehicle_id=manager_vehicle.id,
+            slot_id=slots[0].id,
+            reservation_date=date(2026, 10, 8),
+            status="RESERVED",
+        )
+    )
+    db_session.commit()
+    service = orchestrator(
+        db_session,
+        FakeLLM(
+            [
+                route(
+                    domain="parking",
+                    intent="parking_availability",
+                    parking_date="2026-10-08",
+                )
+            ]
+        ),
+    )
+
+    proposal = service.chat("parking-full", "Can I get parking on 2026-10-08?")
+    assert "All regular parking slots are reserved" in proposal.message
+    assert "waitlist" in proposal.pending_action
+
+    confirmed = service.chat("parking-full", "yes")
+    assert "added to the parking waitlist" in confirmed.message
+
+
+def test_parking_date_is_kept_for_follow_up_request(db_session):
+    setup_parking(db_session)
+    service = orchestrator(
+        db_session,
+        FakeLLM(
+            [
+                route(
+                    domain="parking",
+                    intent="parking_reservations",
+                    parking_date="2026-10-08",
+                ),
+                route(domain="parking", intent="reserve_parking", parking_date=None),
+            ]
+        ),
+    )
+
+    first = service.chat("parking-context", "Show my booking for 2026-10-08")
+    assert "do not have" in first.message
+    follow_up = service.chat("parking-context", "Book parking for that day")
+    assert "2026-10-08" in follow_up.message
+    assert follow_up.pending_action is not None
+
+
+def test_parking_guard_does_not_allow_model_to_invent_date():
+    decision = RouteDecision.model_validate_json(
+        route(
+            domain="parking",
+            intent="reserve_parking",
+            parking_date="2026-10-08",
+        )
+    )
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Book parking"
+    )
+
+    assert guarded.intent == "reserve_parking"
+    assert guarded.parking_date is None
+
+
+def test_parking_confirmation_revalidates_slot_and_preserves_pending_action(db_session):
+    _, manager_vehicle, slots = setup_parking(db_session, slots=1)
+    manager = actor(db_session, "manager")
+    service = orchestrator(
+        db_session,
+        FakeLLM(
+            [
+                route(
+                    domain="parking",
+                    intent="reserve_parking",
+                    parking_date="2026-10-08",
+                )
+            ]
+        ),
+    )
+    service.chat("parking-revalidate", "Reserve parking on 2026-10-08")
+    db_session.add(
+        ParkingReservation(
+            employee_id=manager.employee_id,
+            vehicle_id=manager_vehicle.id,
+            slot_id=slots[0].id,
+            reservation_date=date(2026, 10, 8),
+            status="RESERVED",
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(ParkingUnavailableError, match="no longer available"):
+        service.chat("parking-revalidate", "yes")
+
+    assert db_session.scalar(
+        select(PendingAction).where(PendingAction.session_id == "parking-revalidate")
+    ) is not None
+    employee = actor(db_session)
+    assert db_session.scalar(
+        select(ParkingReservation).where(
+            ParkingReservation.employee_id == employee.employee_id
+        )
+    ) is None
+
+
+def test_parking_admin_queue_is_read_only_chat_workflow(db_session):
+    employee_vehicle, _, slots = setup_parking(db_session)
+    employee = actor(db_session)
+    db_session.add(
+        ParkingReservation(
+            employee_id=employee.employee_id,
+            vehicle_id=employee_vehicle.id,
+            slot_id=slots[0].id,
+            reservation_date=date(2026, 10, 8),
+            status="RESERVED",
+        )
+    )
+    db_session.commit()
+    service = orchestrator(
+        db_session,
+        FakeLLM([route(domain="parking", intent="parking")]),
+        current_actor=actor(db_session, "parkingadmin"),
+        parking_now=datetime(2026, 10, 8, 4, 0, tzinfo=UTC),
+    )
+
+    result = service.chat("parking-admin-queue", "Show parking admin queue for 2026-10-08")
+
+    assert result.domain == "parking"
+    assert result.intent == "parking_admin_reservations"
+    assert "Parking reservations for 2026-10-08" in result.message
+    assert "TN01AA1001" in result.message
+    assert result.pending_action is None
+
+
+def test_parking_admin_check_in_requires_confirmation(db_session):
+    employee_vehicle, _, slots = setup_parking(db_session)
+    employee = actor(db_session)
+    reservation = ParkingReservation(
+        employee_id=employee.employee_id,
+        vehicle_id=employee_vehicle.id,
+        slot_id=slots[0].id,
+        reservation_date=date(2026, 10, 8),
+        status="RESERVED",
+    )
+    db_session.add(reservation)
+    db_session.commit()
+    service = orchestrator(
+        db_session,
+        FakeLLM([route(domain="parking", intent="parking")]),
+        current_actor=actor(db_session, "parkingadmin"),
+        parking_now=datetime(2026, 10, 8, 4, 0, tzinfo=UTC),
+    )
+
+    proposal = service.chat(
+        "parking-admin-check-in", f"Check in parking reservation #{reservation.id}"
+    )
+    assert "Reply yes to confirm" in proposal.message
+    assert proposal.pending_action is not None
+    assert db_session.get(ParkingReservation, reservation.id).status == "RESERVED"
+
+    confirmed = service.chat("parking-admin-check-in", "yes")
+
+    assert "checked in" in confirmed.message
+    assert db_session.get(ParkingReservation, reservation.id).status == "CHECKED_IN"
+
+
+def test_employee_cannot_use_parking_admin_chat_action(db_session):
+    setup_parking(db_session)
+    service = orchestrator(
+        db_session,
+        FakeLLM([route(domain="parking", intent="parking")]),
+        current_actor=actor(db_session, "employee"),
+        parking_now=datetime(2026, 10, 8, 4, 0, tzinfo=UTC),
+    )
+
+    with pytest.raises(AuthorizationError):
+        service.chat("parking-employee-admin-action", "Check in parking reservation #999")
 
 
 def test_configured_holiday_range_is_guarded_to_leave_tool(db_session):
@@ -544,6 +901,211 @@ def test_recent_leave_requests_is_distinct_from_single_request_audit_history(db_
 
     assert result.intent == "leave_requests"
     assert "Your recent leave requests" in result.message
+    assert "Request ID #" in result.message
+
+
+def test_leave_request_status_lists_requests_instead_of_applying_leave(db_session):
+    LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
+    )
+
+    result = orchestrator(
+        db_session, FakeLLM([route(intent="apply_leave", leave_type="CASUAL")])
+    ).chat("employee-request-status", "leave request status")
+
+    assert result.intent == "leave_requests"
+    assert "Your recent leave requests" in result.message
+    assert "Request ID #" in result.message
+    assert result.pending_action is None
+
+
+def test_leave_guard_extracts_textual_single_date():
+    decision = RouteDecision.model_validate_json(route(
+        intent="apply_leave",
+        leave_type="CASUAL",
+        start_date=None,
+        end_date=None,
+    ))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Apply casual leave on 5 October", today=date(2026, 10, 4)
+    )
+
+    assert guarded.start_date == date(2026, 10, 5)
+    assert guarded.end_date == date(2026, 10, 5)
+
+
+def test_leave_guard_extracts_duration_from_today():
+    decision = RouteDecision.model_validate_json(route(
+        intent="apply_leave",
+        leave_type="CASUAL",
+        start_date=None,
+        end_date=None,
+    ))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Apply casual leave for 5 days from today", today=date(2026, 10, 5)
+    )
+
+    assert guarded.start_date == date(2026, 10, 5)
+    assert guarded.end_date == date(2026, 10, 9)
+
+
+def test_leave_guard_extracts_duration_from_textual_start_date():
+    decision = RouteDecision.model_validate_json(route(
+        intent="apply_leave",
+        leave_type="EARNED",
+        start_date=None,
+        end_date=None,
+    ))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Apply earned leave from 5 October for 5 days", today=date(2026, 10, 4)
+    )
+
+    assert guarded.start_date == date(2026, 10, 5)
+    assert guarded.end_date == date(2026, 10, 9)
+
+
+def test_apply_leave_remembers_date_then_accepts_leave_type_follow_up(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    missing_type = service.chat("leave-date-first", "can you apply leave for the 5th october")
+    proposal = service.chat("leave-date-first", "Casual")
+
+    assert "leave type" in missing_type.message
+    assert proposal.intent == "apply_leave"
+    assert "2026-10-05 to 2026-10-05" in proposal.message
+    assert "Reply yes to confirm" in proposal.message
+    assert proposal.pending_action is not None
+
+
+def test_apply_leave_remembers_type_then_accepts_date_follow_up(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    missing_type = service.chat("leave-type-first", "can you apply leave")
+    missing_dates = service.chat("leave-type-first", "casual")
+    proposal = service.chat("leave-type-first", "5th october")
+
+    assert "leave type" in missing_type.message
+    assert "start date" in missing_dates.message
+    assert proposal.intent == "apply_leave"
+    assert "Casual leave from 2026-10-05 to 2026-10-05" in proposal.message
+    assert proposal.pending_action is not None
+
+
+def test_apply_leave_handles_common_casual_typo_with_textual_date(db_session):
+    result = orchestrator(
+        db_session,
+        FakeLLM([route(intent="apply_leave", leave_type=None)]),
+    ).chat("leave-casula-typo", "i want casula leave on 5th october")
+
+    assert result.intent == "apply_leave"
+    assert "Casual leave from 2026-10-05 to 2026-10-05" in result.message
+    assert result.pending_action is not None
+
+
+def test_apply_leave_correction_after_overlap_reuses_leave_type(db_session):
+    LeaveService(SQLAlchemyLeaveRepository(db_session)).apply_leave(
+        actor(db_session), "CASUAL", date(2026, 10, 5), date(2026, 10, 5)
+    )
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    rejected = service.chat("leave-overlap-correction", "i want casual leave on 5th october")
+    proposal = service.chat(
+        "leave-overlap-correction", "ok then create a request on 6th october"
+    )
+
+    assert "overlaps" in rejected.message
+    assert proposal.intent == "apply_leave"
+    assert "Casual leave from 2026-10-06 to 2026-10-06" in proposal.message
+    assert proposal.pending_action is not None
+
+
+def test_apply_leave_follow_up_handles_tomorrow_typo(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+        ]),
+    )
+
+    missing = service.chat("leave-tomorrow-typo", "can you create a leave request for me")
+    proposal = service.chat("leave-tomorrow-typo", "Sick leave tommorrow")
+
+    assert "leave type" in missing.message
+    assert proposal.intent == "apply_leave"
+    assert "Sick leave from 2026-10-05 to 2026-10-05" in proposal.message
+    assert proposal.pending_action is not None
+
+
+def test_apply_leave_follow_up_preserves_textual_date_range_after_cancel(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(intent="apply_leave", leave_type="CASUAL", start_date="2026-10-06", end_date="2026-10-06"),
+            route(intent="apply_leave", leave_type=None),
+            route(domain="general", intent="general"),
+        ]),
+    )
+    service.chat("leave-range-after-cancel", "apply casual leave on 6th october")
+    service.chat("leave-range-after-cancel", "cancel")
+
+    missing_type = service.chat(
+        "leave-range-after-cancel",
+        "i asked to create a leave from 13th october to 14th october",
+    )
+    proposal = service.chat("leave-range-after-cancel", "casual")
+
+    assert "leave type" in missing_type.message
+    assert proposal.intent == "apply_leave"
+    assert "Casual leave from 2026-10-13 to 2026-10-14" in proposal.message
+    assert proposal.pending_action is not None
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_type", "expected_start", "expected_end"),
+    [
+        ("please create casual leave request on 5 October", "CASUAL", date(2026, 10, 5), date(2026, 10, 5)),
+        ("I need sick leave tomorrow", "SICK", date(2026, 10, 5), date(2026, 10, 5)),
+        ("I need sick leave tommorrow", "SICK", date(2026, 10, 5), date(2026, 10, 5)),
+        ("raise privilege leave request from 5 October for 2 days", "EARNED", date(2026, 10, 5), date(2026, 10, 6)),
+        ("create leave from 13th october to 14th october", None, date(2026, 10, 13), date(2026, 10, 14)),
+    ],
+)
+def test_apply_leave_guard_supports_varied_phrasings(
+    message, expected_type, expected_start, expected_end
+):
+    decision = RouteDecision.model_validate_json(route(domain="general", intent="general"))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, message, today=date(2026, 10, 4)
+    )
+
+    assert guarded.intent == "apply_leave"
+    assert guarded.leave_type == expected_type
+    assert guarded.start_date == expected_start
+    assert guarded.end_date == expected_end
 
 
 def test_manager_can_switch_from_approval_queue_to_policy_question(db_session):
@@ -801,6 +1363,40 @@ def test_authenticated_chat_endpoint_uses_orchestrator(client):
     assert response.json()["intent"] == "leave_balance"
     assert "Casual: 4 available" in response.json()["message"]
     assert response.json()["session_id"]
+
+
+def test_authenticated_chat_endpoint_wires_parking_workflow(client, db_session):
+    setup_parking(db_session)
+    fake_llm = FakeLLM(
+        [
+            route(
+                domain="parking",
+                intent="reserve_parking",
+                parking_date="2026-10-08",
+            )
+        ]
+    )
+    app.dependency_overrides[get_llm_gateway] = lambda: fake_llm
+    app.dependency_overrides[get_policy_service] = lambda: FakePolicies()
+    try:
+        token = client.post(
+            "/api/v1/auth/login",
+            json={"username": "employee", "password": "correct-password"},
+        ).json()["access_token"]
+        response = client.post(
+            "/api/v1/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"message": "Reserve parking on 2026-10-08"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_llm_gateway, None)
+        app.dependency_overrides.pop(get_policy_service, None)
+
+    assert response.status_code == 200
+    assert response.json()["domain"] == "parking"
+    assert response.json()["intent"] == "reserve_parking"
+    assert response.json()["pending_action"]
+    assert db_session.scalars(select(ParkingReservation)).all() == []
 
 
 def test_chat_endpoint_requires_authentication(client):

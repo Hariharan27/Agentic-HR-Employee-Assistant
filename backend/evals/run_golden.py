@@ -53,6 +53,7 @@ QUALITY_GATE_CATEGORY_THRESHOLDS = {
     "safety": 1.0,
     "api_safety": 1.0,
     "onboarding_workflow": 1.0,
+    "parking_workflow": 1.0,
 }
 
 

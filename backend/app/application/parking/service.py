@@ -1,0 +1,590 @@
+from collections.abc import Callable
+from datetime import UTC, date, datetime, time, timedelta
+import re
+from zoneinfo import ZoneInfo
+
+from sqlalchemy.exc import IntegrityError
+
+from app.application.parking.ports import ParkingRepository
+from app.core.config import Settings
+from app.core.exceptions import (
+    AuthorizationError,
+    ConflictError,
+    NotFoundError,
+    ParkingUnavailableError,
+    ValidationError,
+)
+from app.core.security import AuthenticatedUser, require_role
+from app.domain.parking.entities import (
+    ParkingAvailability,
+    ParkingReservationData,
+    ParkingReservationEventData,
+    ParkingReservationStatus,
+    ParkingSlotData,
+    ParkingSuspensionData,
+    ParkingWaitlistData,
+    ParkingWaitlistStatus,
+    VehicleData,
+    VehicleType,
+)
+
+
+class ParkingService:
+    """Deterministic employee parking use cases backed by transactional storage."""
+
+    def __init__(
+        self,
+        repository: ParkingRepository,
+        settings: Settings,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ):
+        self.repository = repository
+        self.settings = settings
+        self.timezone = ZoneInfo(settings.app_timezone)
+        self.now = now or (lambda: datetime.now(UTC))
+
+    def get_vehicle(self, actor: AuthenticatedUser) -> VehicleData:
+        vehicle = self.repository.get_active_vehicle(actor.employee_id)
+        if vehicle is None:
+            raise NotFoundError(
+                "No active vehicle is registered for your employee account. Contact Workplace Operations."
+            )
+        return vehicle
+
+    def prepare_vehicle_registration(
+        self,
+        actor: AuthenticatedUser,
+        registration_number: str,
+        vehicle_type: str,
+        make_model: str | None = None,
+    ) -> tuple[str, VehicleType, str | None]:
+        require_role(actor, "EMPLOYEE")
+        normalized_registration = re.sub(r"[\s-]+", "", registration_number).upper()
+        if not re.fullmatch(r"[A-Z0-9]{6,20}", normalized_registration):
+            raise ValidationError(
+                "Vehicle registration must contain 6 to 20 letters or numbers."
+            )
+        if not re.search(r"[A-Z]", normalized_registration) or not re.search(
+            r"\d", normalized_registration
+        ):
+            raise ValidationError(
+                "Vehicle registration must contain both letters and numbers."
+            )
+        normalized_type = vehicle_type.strip().upper().replace(" ", "_")
+        normalized_type = {
+            "BIKE": "MOTORCYCLE",
+            "MOTORBIKE": "MOTORCYCLE",
+            "TWO_WHEELER": "MOTORCYCLE",
+        }.get(normalized_type, normalized_type)
+        try:
+            parsed_type = VehicleType(normalized_type)
+        except ValueError as exc:
+            raise ValidationError("Vehicle type must be Car or Motorcycle.") from exc
+        normalized_model = make_model.strip() if make_model and make_model.strip() else None
+        if normalized_model and len(normalized_model) > 120:
+            raise ValidationError("Vehicle make and model must be 120 characters or fewer.")
+        existing = self.repository.get_vehicle_by_registration(normalized_registration)
+        if existing is not None and existing.employee_id != actor.employee_id:
+            raise ConflictError("This vehicle registration is already assigned to another employee.")
+        return normalized_registration, parsed_type, normalized_model
+
+    def register_vehicle(
+        self,
+        actor: AuthenticatedUser,
+        registration_number: str,
+        vehicle_type: str,
+        make_model: str | None = None,
+    ) -> VehicleData:
+        try:
+            vehicle = self.stage_vehicle_registration(
+                actor, registration_number, vehicle_type, make_model
+            )
+            self.repository.commit()
+            return vehicle
+        except Exception:
+            self.repository.rollback()
+            raise
+
+    def stage_vehicle_registration(
+        self,
+        actor: AuthenticatedUser,
+        registration_number: str,
+        vehicle_type: str,
+        make_model: str | None = None,
+    ) -> VehicleData:
+        normalized_registration, parsed_type, normalized_model = (
+            self.prepare_vehicle_registration(
+                actor, registration_number, vehicle_type, make_model
+            )
+        )
+        return self.repository.upsert_vehicle(
+            actor.employee_id,
+            normalized_registration,
+            parsed_type.value,
+            normalized_model,
+        )
+
+    def check_availability(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> ParkingAvailability:
+        self._validate_booking_date(requested_date)
+        vehicle = self.get_vehicle(actor)
+        slots = tuple(self.repository.list_available_slots(requested_date))
+        return ParkingAvailability(requested_date, vehicle, slots)
+
+    def get_active_reservation(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> ParkingReservationData | None:
+        return self.repository.get_active_reservation(actor.employee_id, requested_date)
+
+    def get_my_reservations(self, actor: AuthenticatedUser) -> list[ParkingReservationData]:
+        return self.repository.list_reservations(actor.employee_id)
+
+    def get_waitlist_entry(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> ParkingWaitlistData | None:
+        return self.repository.get_waitlist_entry(actor.employee_id, requested_date)
+
+    def prepare_reservation(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> tuple[VehicleData, ParkingSlotData]:
+        self._validate_booking_date(requested_date)
+        self._validate_booking_eligibility(actor)
+        existing = self.repository.get_active_reservation(actor.employee_id, requested_date)
+        if existing is not None:
+            raise ConflictError(
+                f"You already have parking slot {existing.slot.code} reserved for {requested_date}."
+            )
+        vehicle = self.get_vehicle(actor)
+        slots = self.repository.list_available_slots(requested_date)
+        if not slots:
+            raise ParkingUnavailableError(f"No regular parking slots are available for {requested_date}.")
+        return vehicle, slots[0]
+
+    def reserve_parking(
+        self, actor: AuthenticatedUser, requested_date: date, slot_id: int
+    ) -> ParkingReservationData:
+        try:
+            reservation = self.stage_reservation(actor, requested_date, slot_id)
+            self.repository.commit()
+            return reservation
+        except Exception:
+            self.repository.rollback()
+            raise
+
+    def stage_reservation(
+        self, actor: AuthenticatedUser, requested_date: date, slot_id: int
+    ) -> ParkingReservationData:
+        self._validate_booking_date(requested_date)
+        self._validate_booking_eligibility(actor)
+        vehicle = self.get_vehicle(actor)
+        existing = self.repository.get_active_reservation(
+            actor.employee_id, requested_date, for_update=True
+        )
+        if existing is not None:
+            raise ConflictError(
+                f"You already have parking slot {existing.slot.code} reserved for {requested_date}."
+            )
+        available = self.repository.list_available_slots(requested_date, for_update=True)
+        slot = next((item for item in available if item.id == slot_id), None)
+        if slot is None:
+            raise ParkingUnavailableError(
+                "The offered parking slot is no longer available. Please check availability again."
+            )
+        try:
+            created = self.repository.add_reservation(
+                actor.employee_id, vehicle.id, slot.id, requested_date
+            )
+        except IntegrityError as exc:
+            raise ConflictError(
+                "Parking availability changed while confirming. Please request a slot again."
+            ) from exc
+        self.repository.add_reservation_event(
+            ParkingReservationEventData(
+                id=0,
+                reservation_id=created.id,
+                actor_user_id=actor.user_id,
+                from_status=None,
+                to_status=ParkingReservationStatus.RESERVED,
+                reason="Reserved by employee",
+            )
+        )
+        waiting = self.repository.get_waitlist_entry(
+            actor.employee_id, requested_date, for_update=True
+        )
+        if waiting is not None:
+            self.repository.update_waitlist_status(waiting.id, ParkingWaitlistStatus.ALLOCATED)
+        return created
+
+    def prepare_cancellation(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> ParkingReservationData:
+        reservation = self.repository.get_active_reservation(actor.employee_id, requested_date)
+        if reservation is None:
+            raise NotFoundError(f"You do not have an active parking reservation for {requested_date}.")
+        self._validate_employee_cancellation(reservation)
+        return reservation
+
+    def cancel_parking(
+        self, actor: AuthenticatedUser, reservation_id: int, reason: str | None = None
+    ) -> ParkingReservationData:
+        try:
+            reservation = self.stage_cancellation(actor, reservation_id, reason)
+            self.repository.commit()
+            return reservation
+        except Exception:
+            self.repository.rollback()
+            raise
+
+    def stage_cancellation(
+        self, actor: AuthenticatedUser, reservation_id: int, reason: str | None = None
+    ) -> ParkingReservationData:
+        reservation = self.repository.get_reservation(reservation_id, for_update=True)
+        if reservation is None:
+            raise NotFoundError("Parking reservation was not found.")
+        if reservation.employee_id != actor.employee_id:
+            raise AuthorizationError("You can cancel only your own parking reservation.")
+        self._validate_employee_cancellation(reservation)
+        normalized_reason = self._normalize_reason(reason)
+        updated = self.repository.update_reservation_status(
+            reservation.id, ParkingReservationStatus.CANCELLED
+        )
+        self.repository.add_reservation_event(
+            ParkingReservationEventData(
+                id=0,
+                reservation_id=reservation.id,
+                actor_user_id=actor.user_id,
+                from_status=ParkingReservationStatus.RESERVED,
+                to_status=ParkingReservationStatus.CANCELLED,
+                reason=normalized_reason or "Cancelled by employee before cutoff",
+            )
+        )
+        return updated
+
+    def prepare_waitlist(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> VehicleData:
+        self._validate_booking_date(requested_date)
+        self._validate_booking_eligibility(actor)
+        vehicle = self.get_vehicle(actor)
+        if self.repository.get_active_reservation(actor.employee_id, requested_date) is not None:
+            raise ConflictError(f"You already have a parking reservation for {requested_date}.")
+        if self.repository.get_waitlist_entry(actor.employee_id, requested_date) is not None:
+            raise ConflictError(f"You are already on the parking waitlist for {requested_date}.")
+        if self.repository.list_available_slots(requested_date):
+            raise ConflictError(
+                "A regular parking slot is currently available. Please reserve it instead of joining the waitlist."
+            )
+        return vehicle
+
+    def join_waitlist(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> ParkingWaitlistData:
+        try:
+            entry = self.stage_join_waitlist(actor, requested_date)
+            self.repository.commit()
+            return entry
+        except Exception:
+            self.repository.rollback()
+            raise
+
+    def stage_join_waitlist(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> ParkingWaitlistData:
+        self._validate_booking_date(requested_date)
+        self._validate_booking_eligibility(actor)
+        vehicle = self.get_vehicle(actor)
+        if self.repository.get_active_reservation(
+            actor.employee_id, requested_date, for_update=True
+        ) is not None:
+            raise ConflictError(f"You already have a parking reservation for {requested_date}.")
+        if self.repository.get_waitlist_entry(
+            actor.employee_id, requested_date, for_update=True
+        ) is not None:
+            raise ConflictError(f"You are already on the parking waitlist for {requested_date}.")
+        if self.repository.list_available_slots(requested_date, for_update=True):
+            raise ConflictError(
+                "A parking slot became available. Please reserve it instead of joining the waitlist."
+            )
+        try:
+            return self.repository.add_waitlist_entry(
+                actor.employee_id, vehicle.id, requested_date
+            )
+        except IntegrityError as exc:
+            raise ConflictError(
+                f"You are already on the parking waitlist for {requested_date}."
+            ) from exc
+
+    def get_suspension(self, actor: AuthenticatedUser) -> ParkingSuspensionData:
+        today = self._local_now().date()
+        since = today - timedelta(days=self.settings.parking_no_show_lookback_days - 1)
+        no_shows = self.repository.list_no_show_reservations(actor.employee_id, since)
+        if len(no_shows) < self.settings.parking_no_show_strike_limit:
+            return ParkingSuspensionData(False, len(no_shows))
+        latest = max(item.reservation_date for item in no_shows)
+        suspended_until = latest + timedelta(days=self.settings.parking_suspension_days)
+        return ParkingSuspensionData(today <= suspended_until, len(no_shows), suspended_until)
+
+    def get_daily_reservations(
+        self, actor: AuthenticatedUser, requested_date: date
+    ) -> list[ParkingReservationData]:
+        require_role(actor, "PARKING_ADMIN")
+        return self.repository.list_reservations_for_date(requested_date)
+
+    def prepare_check_in(
+        self, actor: AuthenticatedUser, reservation_id: int, reason: str | None = None
+    ) -> ParkingReservationData:
+        require_role(actor, "PARKING_ADMIN")
+        reservation = self._get_reservation(reservation_id)
+        if reservation.status is not ParkingReservationStatus.RESERVED:
+            raise ConflictError("Only a reserved parking booking can be checked in.")
+        current = self._local_now()
+        if reservation.reservation_date != current.date():
+            raise ConflictError("A reservation can be checked in only on its reservation date.")
+        opens_at = datetime.combine(
+            reservation.reservation_date,
+            time(self.settings.parking_check_in_open_hour),
+            tzinfo=self.timezone,
+        )
+        if current < opens_at:
+            raise ConflictError(
+                f"Check-in opens at {opens_at.strftime('%H:%M')} on the reservation date."
+            )
+        if current > self._no_show_deadline(reservation.reservation_date):
+            self._require_reason(reason, "A reason is required for a late check-in.")
+        return reservation
+
+    def stage_check_in(
+        self, actor: AuthenticatedUser, reservation_id: int, reason: str | None = None
+    ) -> ParkingReservationData:
+        self.prepare_check_in(actor, reservation_id, reason)
+        reservation = self.repository.get_reservation(reservation_id, for_update=True)
+        if reservation is None or reservation.status is not ParkingReservationStatus.RESERVED:
+            raise ConflictError("The reservation is no longer available for check-in.")
+        normalized_reason = self._normalize_reason(reason)
+        updated = self.repository.update_reservation_status(
+            reservation_id, ParkingReservationStatus.CHECKED_IN
+        )
+        self._add_admin_event(
+            actor,
+            reservation,
+            ParkingReservationStatus.CHECKED_IN,
+            normalized_reason or "Arrival verified by Parking Administrator",
+        )
+        return updated
+
+    def prepare_admin_cancellation(
+        self, actor: AuthenticatedUser, reservation_id: int, reason: str
+    ) -> ParkingReservationData:
+        require_role(actor, "PARKING_ADMIN")
+        self._require_reason(reason, "A reason is required for an administrator cancellation.")
+        reservation = self._get_reservation(reservation_id)
+        if reservation.status is not ParkingReservationStatus.RESERVED:
+            raise ConflictError("Only a reserved parking booking can be cancelled.")
+        return reservation
+
+    def stage_admin_cancellation(
+        self, actor: AuthenticatedUser, reservation_id: int, reason: str
+    ) -> ParkingReservationData:
+        self.prepare_admin_cancellation(actor, reservation_id, reason)
+        reservation = self.repository.get_reservation(reservation_id, for_update=True)
+        if reservation is None or reservation.status is not ParkingReservationStatus.RESERVED:
+            raise ConflictError("The reservation is no longer available for cancellation.")
+        normalized_reason = self._require_reason(
+            reason, "A reason is required for an administrator cancellation."
+        )
+        updated = self.repository.update_reservation_status(
+            reservation_id, ParkingReservationStatus.CANCELLED
+        )
+        self._add_admin_event(
+            actor, reservation, ParkingReservationStatus.CANCELLED, normalized_reason
+        )
+        return updated
+
+    def prepare_no_show(
+        self, actor: AuthenticatedUser, reservation_id: int
+    ) -> ParkingReservationData:
+        require_role(actor, "PARKING_ADMIN")
+        reservation = self._get_reservation(reservation_id)
+        if reservation.status is not ParkingReservationStatus.RESERVED:
+            raise ConflictError("Only a reserved parking booking can be marked as a no-show.")
+        if self._local_now() < self._no_show_deadline(reservation.reservation_date):
+            deadline = self._no_show_deadline(reservation.reservation_date)
+            raise ConflictError(
+                f"This reservation cannot be marked as a no-show before {deadline.strftime('%Y-%m-%d %H:%M')}."
+            )
+        return reservation
+
+    def stage_no_show(
+        self, actor: AuthenticatedUser, reservation_id: int
+    ) -> ParkingReservationData:
+        self.prepare_no_show(actor, reservation_id)
+        reservation = self.repository.get_reservation(reservation_id, for_update=True)
+        if reservation is None or reservation.status is not ParkingReservationStatus.RESERVED:
+            raise ConflictError("The reservation is no longer available for no-show processing.")
+        updated = self.repository.update_reservation_status(
+            reservation_id, ParkingReservationStatus.NO_SHOW
+        )
+        self._add_admin_event(
+            actor,
+            reservation,
+            ParkingReservationStatus.NO_SHOW,
+            "Arrival cutoff and grace period elapsed",
+        )
+        return updated
+
+    def prepare_no_show_override(
+        self, actor: AuthenticatedUser, reservation_id: int, reason: str
+    ) -> ParkingReservationData:
+        require_role(actor, "PARKING_ADMIN")
+        self._require_reason(reason, "A reason is required to correct a no-show.")
+        reservation = self._get_reservation(reservation_id)
+        if reservation.status is not ParkingReservationStatus.NO_SHOW:
+            raise ConflictError("Only a no-show reservation can be corrected.")
+        return reservation
+
+    def stage_no_show_override(
+        self, actor: AuthenticatedUser, reservation_id: int, reason: str
+    ) -> ParkingReservationData:
+        self.prepare_no_show_override(actor, reservation_id, reason)
+        reservation = self.repository.get_reservation(reservation_id, for_update=True)
+        if reservation is None or reservation.status is not ParkingReservationStatus.NO_SHOW:
+            raise ConflictError("The reservation is no longer recorded as a no-show.")
+        normalized_reason = self._require_reason(
+            reason, "A reason is required to correct a no-show."
+        )
+        updated = self.repository.update_reservation_status(
+            reservation_id, ParkingReservationStatus.CANCELLED
+        )
+        self._add_admin_event(
+            actor, reservation, ParkingReservationStatus.CANCELLED, normalized_reason
+        )
+        return updated
+
+    def prepare_completion(
+        self, actor: AuthenticatedUser, reservation_id: int
+    ) -> ParkingReservationData:
+        require_role(actor, "PARKING_ADMIN")
+        reservation = self._get_reservation(reservation_id)
+        if reservation.status is not ParkingReservationStatus.CHECKED_IN:
+            raise ConflictError("Only a checked-in reservation can be completed.")
+        return reservation
+
+    def stage_completion(
+        self, actor: AuthenticatedUser, reservation_id: int
+    ) -> ParkingReservationData:
+        self.prepare_completion(actor, reservation_id)
+        reservation = self.repository.get_reservation(reservation_id, for_update=True)
+        if reservation is None or reservation.status is not ParkingReservationStatus.CHECKED_IN:
+            raise ConflictError("The reservation is no longer available for completion.")
+        updated = self.repository.update_reservation_status(
+            reservation_id, ParkingReservationStatus.COMPLETED
+        )
+        self._add_admin_event(
+            actor,
+            reservation,
+            ParkingReservationStatus.COMPLETED,
+            "Parking visit completed by administrator",
+        )
+        return updated
+
+    def get_reservation_history(
+        self, actor: AuthenticatedUser, reservation_id: int
+    ) -> list[ParkingReservationEventData]:
+        reservation = self._get_reservation(reservation_id)
+        if reservation.employee_id != actor.employee_id:
+            require_role(actor, "PARKING_ADMIN")
+        return self.repository.list_reservation_events(reservation_id)
+
+    def _validate_booking_date(self, requested_date: date) -> None:
+        current = self._local_now()
+        today = current.date()
+        if requested_date < today:
+            raise ValidationError("Parking cannot be reserved for a past date.")
+        if requested_date > today + timedelta(days=self.settings.parking_booking_horizon_days):
+            raise ValidationError(
+                f"Parking can be reserved only {self.settings.parking_booking_horizon_days} days in advance."
+            )
+        if requested_date == today and current.time() >= time(
+            self.settings.parking_arrival_cutoff_hour
+        ):
+            raise ValidationError("Today's parking reservation cutoff has passed.")
+
+    def _validate_booking_eligibility(self, actor: AuthenticatedUser) -> None:
+        suspension = self.get_suspension(actor)
+        if suspension.active:
+            raise ConflictError(
+                f"Parking reservations are suspended through {suspension.suspended_until} because "
+                f"you have {suspension.no_show_count} no-shows in the last "
+                f"{self.settings.parking_no_show_lookback_days} days. Contact the Parking Administrator "
+                "if a no-show is incorrect."
+            )
+
+    def _validate_employee_cancellation(self, reservation: ParkingReservationData) -> None:
+        if reservation.status is not ParkingReservationStatus.RESERVED:
+            raise ConflictError(
+                "Only a reserved parking booking can be cancelled by the employee."
+            )
+        cutoff_date = reservation.reservation_date - timedelta(days=1)
+        cutoff = datetime.combine(
+            cutoff_date,
+            time(self.settings.parking_cancellation_cutoff_hour),
+            tzinfo=self.timezone,
+        )
+        if self._local_now() >= cutoff:
+            raise ConflictError(
+                "The employee cancellation cutoff has passed. Contact the Parking Administrator for help."
+            )
+
+    def _local_now(self) -> datetime:
+        current = self.now()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        return current.astimezone(self.timezone)
+
+    def _no_show_deadline(self, reservation_date: date) -> datetime:
+        cutoff = datetime.combine(
+            reservation_date,
+            time(self.settings.parking_arrival_cutoff_hour),
+            tzinfo=self.timezone,
+        )
+        return cutoff + timedelta(minutes=self.settings.parking_no_show_grace_minutes)
+
+    def _get_reservation(self, reservation_id: int) -> ParkingReservationData:
+        reservation = self.repository.get_reservation(reservation_id)
+        if reservation is None:
+            raise NotFoundError("Parking reservation was not found.")
+        return reservation
+
+    def _add_admin_event(
+        self,
+        actor: AuthenticatedUser,
+        reservation: ParkingReservationData,
+        to_status: ParkingReservationStatus,
+        reason: str,
+    ) -> None:
+        self.repository.add_reservation_event(
+            ParkingReservationEventData(
+                id=0,
+                reservation_id=reservation.id,
+                actor_user_id=actor.user_id,
+                from_status=reservation.status,
+                to_status=to_status,
+                reason=reason,
+            )
+        )
+
+    @staticmethod
+    def _normalize_reason(reason: str | None) -> str | None:
+        normalized = reason.strip() if reason else ""
+        if len(normalized) > 1000:
+            raise ValidationError("Cancellation reason cannot exceed 1000 characters.")
+        return normalized or None
+
+    @classmethod
+    def _require_reason(cls, reason: str | None, message: str) -> str:
+        normalized = cls._normalize_reason(reason)
+        if normalized is None:
+            raise ValidationError(message)
+        return normalized

@@ -18,7 +18,7 @@ def test_golden_dataset_is_valid_and_covers_required_categories():
     assert len({case.id for case in cases}) == len(cases)
     assert {case.category for case in cases} >= {
         "api_safety", "leave_action", "leave_balance", "leave_rules", "manager_workflow",
-        "onboarding_workflow", "policy", "safety", "scope"
+        "onboarding_workflow", "parking_workflow", "policy", "safety", "scope"
     }
     assert any(case.mutating for case in cases)
     assert validate_quality_dataset(cases) == []
@@ -72,6 +72,7 @@ def test_quality_gate_requires_repetition_consistency_and_perfect_critical_categ
                 "safety": {"passed": 5, "total": 5},
                 "api_safety": {"passed": 5, "total": 5},
                 "onboarding_workflow": {"passed": 7, "total": 8},
+                "parking_workflow": {"passed": 8, "total": 8},
             },
         }
     }
@@ -92,6 +93,7 @@ def test_quality_gate_passes_when_all_release_thresholds_are_met():
                 "safety": {"passed": 6, "total": 6},
                 "api_safety": {"passed": 5, "total": 5},
                 "onboarding_workflow": {"passed": 8, "total": 8},
+                "parking_workflow": {"passed": 8, "total": 8},
             },
         }
     }

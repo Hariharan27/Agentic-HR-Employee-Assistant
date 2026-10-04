@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy import func, select
@@ -129,8 +129,8 @@ def test_hr_admin_approval_atomically_activates_employee_account(db_session):
     result = service.approve_onboarding(_actor(db_session, "hradmin"), created.id, "Approved")
 
     assert result.request.status is OnboardingStatus.ACTIVE
-    assert result.employee_code == "EON00001"
-    assert result.username == "eon00001"
+    assert result.employee_code == datetime.now(UTC).strftime("I%y001")
+    assert result.username == result.employee_code
     user = db_session.scalar(select(User).where(User.username == result.username))
     employee = db_session.scalar(select(Employee).where(Employee.id == user.employee_id))
     balances = db_session.scalars(
@@ -139,7 +139,7 @@ def test_hr_admin_approval_atomically_activates_employee_account(db_session):
     assert employee.email == "priya.raman@example.com"
     assert user.role == "EMPLOYEE"
     assert verify_password(result.temporary_password, user.password_hash)
-    assert {item.leave_type for item in balances} == {"CASUAL", "PRIVILEGE", "SICK"}
+    assert {item.leave_type for item in balances} == {"CASUAL", "EARNED", "SICK"}
 
 
 def test_only_hr_admin_can_review_and_requester_cannot_self_approve(db_session):

@@ -2,7 +2,7 @@ from datetime import date, datetime
 
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infrastructure.database.base import Base
@@ -86,6 +86,9 @@ class LeaveBalance(Base):
     leave_type: Mapped[str] = mapped_column(String(32))
     total_days: Mapped[Decimal] = mapped_column(Numeric(6, 2))
     used_days: Mapped[Decimal] = mapped_column(Numeric(6, 2), default=Decimal("0"))
+    carry_forward_limit_days: Mapped[Decimal] = mapped_column(
+        Numeric(6, 2), default=Decimal("0"), server_default="0"
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     __table_args__ = (
@@ -219,4 +222,175 @@ class OnboardingTask(Base):
             "onboarding_request_id", "task_type", name="uq_onboarding_tasks_request_type"
         ),
         Index("ix_onboarding_tasks_request_status", "onboarding_request_id", "status"),
+    )
+
+
+class Vehicle(Base):
+    __tablename__ = "vehicles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(
+        ForeignKey("employees.id", ondelete="CASCADE"), unique=True
+    )
+    registration_number: Mapped[str] = mapped_column(String(32), unique=True)
+    vehicle_type: Mapped[str] = mapped_column(String(24))
+    make_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("vehicle_type IN ('CAR', 'MOTORCYCLE')", name="ck_vehicles_type"),
+        Index("ix_vehicles_employee_active", "employee_id", "active"),
+    )
+
+
+class ParkingSlot(Base):
+    __tablename__ = "parking_slots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(String(24), unique=True)
+    location: Mapped[str] = mapped_column(String(120))
+    slot_type: Mapped[str] = mapped_column(String(24), default="REGULAR")
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "slot_type IN ('REGULAR', 'ACCESSIBLE')", name="ck_parking_slots_type"
+        ),
+        Index("ix_parking_slots_active_type", "active", "slot_type"),
+    )
+
+
+class ParkingReservation(Base):
+    __tablename__ = "parking_reservations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(
+        ForeignKey("employees.id", ondelete="CASCADE")
+    )
+    vehicle_id: Mapped[int] = mapped_column(ForeignKey("vehicles.id", ondelete="RESTRICT"))
+    slot_id: Mapped[int] = mapped_column(
+        ForeignKey("parking_slots.id", ondelete="RESTRICT")
+    )
+    reservation_date: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(24), default="RESERVED")
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    checked_in_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    no_show_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('RESERVED', 'CHECKED_IN', 'COMPLETED', 'CANCELLED', 'NO_SHOW')",
+            name="ck_parking_reservations_status",
+        ),
+        Index(
+            "uq_parking_reservations_employee_date_active",
+            "employee_id",
+            "reservation_date",
+            unique=True,
+            postgresql_where=text("status IN ('RESERVED', 'CHECKED_IN')"),
+            sqlite_where=text("status IN ('RESERVED', 'CHECKED_IN')"),
+        ),
+        Index(
+            "uq_parking_reservations_slot_date_active",
+            "slot_id",
+            "reservation_date",
+            unique=True,
+            postgresql_where=text("status IN ('RESERVED', 'CHECKED_IN')"),
+            sqlite_where=text("status IN ('RESERVED', 'CHECKED_IN')"),
+        ),
+        Index("ix_parking_reservations_employee_status", "employee_id", "status"),
+        Index("ix_parking_reservations_date_status", "reservation_date", "status"),
+    )
+
+
+class ParkingReservationEvent(Base):
+    __tablename__ = "parking_reservation_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reservation_id: Mapped[int] = mapped_column(
+        ForeignKey("parking_reservations.id", ondelete="CASCADE")
+    )
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    from_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(24))
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "from_status IS NULL OR from_status IN "
+            "('RESERVED', 'CHECKED_IN', 'COMPLETED', 'CANCELLED', 'NO_SHOW')",
+            name="ck_parking_reservation_events_from_status",
+        ),
+        CheckConstraint(
+            "to_status IN ('RESERVED', 'CHECKED_IN', 'COMPLETED', 'CANCELLED', 'NO_SHOW')",
+            name="ck_parking_reservation_events_to_status",
+        ),
+        Index(
+            "ix_parking_reservation_events_reservation_created",
+            "reservation_id",
+            "created_at",
+        ),
+    )
+
+
+class ParkingWaitlistEntry(Base):
+    __tablename__ = "parking_waitlist"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(
+        ForeignKey("employees.id", ondelete="CASCADE")
+    )
+    vehicle_id: Mapped[int] = mapped_column(ForeignKey("vehicles.id", ondelete="RESTRICT"))
+    requested_date: Mapped[date] = mapped_column(Date)
+    status: Mapped[str] = mapped_column(String(24), default="WAITING")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('WAITING', 'ALLOCATED', 'CANCELLED')",
+            name="ck_parking_waitlist_status",
+        ),
+        Index(
+            "uq_parking_waitlist_employee_date_waiting",
+            "employee_id",
+            "requested_date",
+            unique=True,
+            postgresql_where=text("status = 'WAITING'"),
+            sqlite_where=text("status = 'WAITING'"),
+        ),
+        Index("ix_parking_waitlist_date_status", "requested_date", "status"),
     )

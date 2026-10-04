@@ -11,6 +11,9 @@ from app.api.routes.chat import router as chat_router
 from app.api.routes.leave import router as leave_router
 from app.api.routes.onboarding import admin_router as onboarding_admin_router
 from app.api.routes.onboarding import router as onboarding_router
+from app.api.routes.parking import admin_router as parking_admin_router
+from app.api.routes.parking import router as parking_router
+from app.api.routes.inbound_email import router as inbound_email_router
 from app.core.config import get_settings
 from app.core.exceptions import ApplicationError
 from app.core.logging import configure_logging
@@ -32,6 +35,9 @@ app.include_router(chat_router)
 app.include_router(leave_router)
 app.include_router(onboarding_router)
 app.include_router(onboarding_admin_router)
+app.include_router(parking_router)
+app.include_router(parking_admin_router)
+app.include_router(inbound_email_router)
 
 
 @app.middleware("http")

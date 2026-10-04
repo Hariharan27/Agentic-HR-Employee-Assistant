@@ -1,4 +1,4 @@
-import type { ChatResponse, LeaveRequest, OnboardingStatus, Profile } from "./types";
+import type { ChatResponse, LeaveRequest, OnboardingStatus, ParkingReservation, Profile, ReportingManager } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
@@ -43,6 +43,13 @@ export const getLeaveRequests = (token: string, role: Profile["role"]) =>
     token,
   );
 
+export const getParkingAdminReservations = (token: string, reservationDate: string) =>
+  request<ParkingReservation[]>(
+    `/api/v1/parking-admin/reservations?reservation_date=${encodeURIComponent(reservationDate)}`,
+    {},
+    token,
+  );
+
 export const getOnboardingStatus = (token: string, query: string) => {
   const normalized = query.trim();
   const path = /^\d+$/.test(normalized)
@@ -50,6 +57,9 @@ export const getOnboardingStatus = (token: string, query: string) => {
     : `/api/v1/manager/onboarding/status/by-employee?employee=${encodeURIComponent(normalized)}`;
   return request<OnboardingStatus>(path, {}, token);
 };
+
+export const getReportingManagers = (token: string) =>
+  request<ReportingManager[]>("/api/v1/manager/onboarding/reporting-managers", {}, token);
 
 export const getPendingOnboardingApprovals = (token: string) =>
   request<OnboardingStatus[]>("/api/v1/hr-admin/onboarding/pending", {}, token);

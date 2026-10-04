@@ -32,6 +32,27 @@ class SQLAlchemyOnboardingRepository:
         statement = select(Employee.id).where(func.lower(Employee.email) == email.casefold()).limit(1)
         return self.db.scalar(statement) is not None
 
+    def next_employee_code(self) -> str:
+        year = datetime.now(UTC).strftime("%y")
+        prefix = f"I{year}"
+
+        employee_codes = self.db.scalars(
+            select(Employee.employee_code)
+            .where(Employee.employee_code.like(f"{prefix}%"))
+        ).all()
+
+        max_sequence = 0
+
+        for code in employee_codes:
+            sequence_part = code[len(prefix):]
+
+            if sequence_part.isdigit():
+                max_sequence = max(max_sequence, int(sequence_part))
+
+        next_sequence = max_sequence + 1
+
+        return f"{prefix}{next_sequence:03d}"
+
     def active_onboarding_email_exists(self, email: str) -> bool:
         statement = select(OnboardingRequest.id).where(
             func.lower(OnboardingRequest.email) == email.casefold(),
@@ -42,6 +63,18 @@ class SQLAlchemyOnboardingRepository:
         ).limit(1)
         return self.db.scalar(statement) is not None
 
+    def list_reporting_managers(self) -> list[EmployeeReference]:
+        rows = self.db.execute(
+            select(Employee)
+            .join(User, User.employee_id == Employee.id)
+            .where(User.role.in_(("MANAGER", "HR")))
+            .order_by(Employee.name.asc(), Employee.id.asc())
+        ).scalars().all()
+        return [
+            EmployeeReference(row.id, row.name, row.employee_code, row.designation, row.department)
+            for row in rows
+        ]
+
     def find_employee_by_name(self, name: str) -> EmployeeReference | None:
         row = self.db.scalar(
             select(Employee)
@@ -49,7 +82,11 @@ class SQLAlchemyOnboardingRepository:
             .order_by(Employee.id)
             .limit(1)
         )
-        return EmployeeReference(row.id, row.name) if row else None
+        return (
+            EmployeeReference(row.id, row.name, row.employee_code, row.designation, row.department)
+            if row
+            else None
+        )
 
     def add_request(
         self,
@@ -182,8 +219,13 @@ class SQLAlchemyOnboardingRepository:
                 leave_type=leave_type,
                 total_days=total_days,
                 used_days=0,
+                carry_forward_limit_days=carry_forward_limit_days,
             )
-            for leave_type, total_days in (("CASUAL", 12), ("PRIVILEGE", 18), ("SICK", 10))
+            for leave_type, total_days, carry_forward_limit_days in (
+                ("CASUAL", 6, 0),
+                ("SICK", 6, 0),
+                ("EARNED", 12, 8),
+            )
         ])
         row.status = OnboardingStatus.ACTIVE.value
         row.reviewed_by_user_id = reviewer_user_id
