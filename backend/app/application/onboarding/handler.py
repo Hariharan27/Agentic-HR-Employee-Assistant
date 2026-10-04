@@ -109,8 +109,8 @@ class ApproveOnboardingHandler:
         self.email_service.send_safely(
             to=(self.finance_notification_email,),
             subject=(
-                f"Payroll Setup Required - {candidate.name} "
-                f"({result.employee_code}) - Joining {joining_date}"
+                f"[Onboarding #{result.request.id}] Payroll Setup Required - "
+                f"{candidate.name} ({result.employee_code}) - Joining {joining_date}"
             ),
             body=(
                 "Dear Finance Team,\n\n"
@@ -133,8 +133,8 @@ class ApproveOnboardingHandler:
         self.email_service.send_safely(
             to=(self.it_notification_email,),
             subject=(
-                f"IT Provisioning Required - {candidate.name} "
-                f"({result.employee_code}) - Joining {joining_date}"
+                f"[Onboarding #{result.request.id}] IT Provisioning Required - "
+                f"{candidate.name} ({result.employee_code}) - Joining {joining_date}"
             ),
             body=(
                 "Dear IT Team,\n\n"
@@ -160,8 +160,8 @@ class ApproveOnboardingHandler:
         self.email_service.send_safely(
             to=(self.facilities_notification_email,),
             subject=(
-                f"Access Provisioning Required - {candidate.name} "
-                f"({result.employee_code}) - Joining {joining_date}"
+                f"[Onboarding #{result.request.id}] Access Provisioning Required - "
+                f"{candidate.name} ({result.employee_code}) - Joining {joining_date}"
             ),
             body=(
                 "Dear Facilities Team,\n\n"

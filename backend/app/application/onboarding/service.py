@@ -24,6 +24,7 @@ _ONBOARDING_TASKS = (
     OnboardingTaskType.LAPTOP,
     OnboardingTaskType.ACCESS_CARD,
     OnboardingTaskType.TEMPORARY_ACCESS_CARD,
+    OnboardingTaskType.PAYROLL_SETUP,
 )
 
 
@@ -232,6 +233,76 @@ class OnboardingService:
                 refreshed = self.repository.update_request_status(request_id, aggregate)
             self.repository.commit()
             return refreshed
+        except Exception:
+            self.repository.rollback()
+            raise
+
+    def apply_inbound_task_updates(
+        self,
+        request_id: int,
+        updates: dict[OnboardingTaskType, OnboardingTaskStatus],
+    ) -> OnboardingRequestData:
+        """Apply validated provisioning updates from a trusted inbound integration."""
+
+        if not updates:
+            raise ValidationError("At least one onboarding task update is required")
+
+        try:
+            request = self.repository.get_request(request_id, for_update=True)
+
+            if request is None:
+                raise NotFoundError("Onboarding request was not found")
+
+            if request.status is not OnboardingStatus.ACTIVE:
+                raise ConflictError(
+                    "Provisioning updates can be applied only to active onboarding requests"
+                )
+
+            tasks_by_type = {
+                task.task_type: task
+                for task in request.tasks
+            }
+
+            for task_type, status in updates.items():
+                task = tasks_by_type.get(task_type)
+
+                if task is None:
+                    raise NotFoundError(
+                        f"Onboarding task {task_type.value} was not found for this request"
+                    )
+
+                self.repository.update_task_status(
+                    task.id,
+                    status,
+                )
+
+            refreshed = self.repository.get_request(
+                request_id,
+                for_update=True,
+            )
+
+            if refreshed is None:
+                raise NotFoundError("Onboarding request was not found")
+
+            aggregate = (
+                OnboardingStatus.COMPLETED
+                if refreshed.tasks
+                and all(
+                    task.status is OnboardingTaskStatus.COMPLETED
+                    for task in refreshed.tasks
+                )
+                else OnboardingStatus.ACTIVE
+            )
+
+            if refreshed.status is not aggregate:
+                refreshed = self.repository.update_request_status(
+                    request_id,
+                    aggregate,
+                )
+
+            self.repository.commit()
+            return refreshed
+
         except Exception:
             self.repository.rollback()
             raise

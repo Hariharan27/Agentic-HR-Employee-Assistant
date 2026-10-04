@@ -23,6 +23,7 @@ class OnboardingTaskType(StrEnum):
     LAPTOP = "LAPTOP"
     ACCESS_CARD = "ACCESS_CARD"
     TEMPORARY_ACCESS_CARD = "TEMPORARY_ACCESS_CARD"
+    PAYROLL_SETUP = "PAYROLL_SETUP"
 
 
 TASK_TITLES: dict[OnboardingTaskType, str] = {
@@ -30,6 +31,7 @@ TASK_TITLES: dict[OnboardingTaskType, str] = {
     OnboardingTaskType.LAPTOP: "Request laptop",
     OnboardingTaskType.ACCESS_CARD: "Request permanent access card",
     OnboardingTaskType.TEMPORARY_ACCESS_CARD: "Request temporary access card",
+    OnboardingTaskType.PAYROLL_SETUP: "Set up payroll and salary account",
 }
 
 
