@@ -154,3 +154,69 @@ class Holiday(Base):
     category: Mapped[str] = mapped_column(String(40), default="PUBLIC")
 
     __table_args__ = (Index("ix_holidays_date", "holiday_date"),)
+
+
+class OnboardingRequest(Base):
+    __tablename__ = "onboarding_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_name: Mapped[str] = mapped_column(String(160))
+    email: Mapped[str] = mapped_column(String(255))
+    designation: Mapped[str] = mapped_column(String(120))
+    department: Mapped[str] = mapped_column(String(120))
+    manager_employee_id: Mapped[int] = mapped_column(
+        ForeignKey("employees.id", ondelete="RESTRICT")
+    )
+    manager_name: Mapped[str] = mapped_column(String(160))
+    joining_date: Mapped[date] = mapped_column(Date)
+    location: Mapped[str] = mapped_column(String(120))
+    employment_type: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(24), default="PENDING_APPROVAL")
+    created_by_user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    reviewed_by_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    review_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    activated_employee_id: Mapped[int | None] = mapped_column(
+        ForeignKey("employees.id", ondelete="SET NULL"), nullable=True, unique=True
+    )
+    activated_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, unique=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_onboarding_requests_email_status", "email", "status"),
+        Index("ix_onboarding_requests_manager_status", "manager_employee_id", "status"),
+        Index("ix_onboarding_requests_creator", "created_by_user_id"),
+        Index("ix_onboarding_requests_review_status", "reviewed_by_user_id", "status"),
+    )
+
+
+class OnboardingTask(Base):
+    __tablename__ = "onboarding_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    onboarding_request_id: Mapped[int] = mapped_column(
+        ForeignKey("onboarding_requests.id", ondelete="CASCADE")
+    )
+    task_type: Mapped[str] = mapped_column(String(48))
+    title: Mapped[str] = mapped_column(String(160))
+    status: Mapped[str] = mapped_column(String(24), default="PENDING")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "onboarding_request_id", "task_type", name="uq_onboarding_tasks_request_type"
+        ),
+        Index("ix_onboarding_tasks_request_status", "onboarding_request_id", "status"),
+    )

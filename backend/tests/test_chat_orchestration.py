@@ -8,6 +8,12 @@ from sqlalchemy import select
 from app.agent.orchestrator import HRAssistantOrchestrator
 from app.api.routes.chat import get_llm_gateway, get_policy_service
 from app.application.leave.service import LeaveService
+from app.application.onboarding.handler import (
+    ApproveOnboardingHandler,
+    CreateOnboardingHandler,
+    RejectOnboardingHandler,
+)
+from app.application.onboarding.service import OnboardingService
 from app.application.pending.handlers import (
     ApplyLeaveHandler,
     ApproveLeaveRequestHandler,
@@ -16,12 +22,21 @@ from app.application.pending.handlers import (
 )
 from app.application.pending.service import PendingActionCoordinator
 from app.core.config import Settings
-from app.core.exceptions import AuthorizationError, LLMServiceError
+from app.core.exceptions import AuthorizationError, ConflictError, LLMServiceError
 from app.core.security import AuthenticatedUser
-from app.infrastructure.database.models import ConversationSession, LeaveRequest, PendingAction, User
+from app.domain.onboarding.entities import OnboardingCandidate
+from app.infrastructure.database.models import (
+    ConversationSession,
+    LeaveRequest,
+    OnboardingRequest,
+    OnboardingTask,
+    PendingAction,
+    User,
+)
 from app.infrastructure.llm.mantle import MantleLLMGateway
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.infrastructure.repositories.leave import SQLAlchemyLeaveRepository
+from app.infrastructure.repositories.onboarding import SQLAlchemyOnboardingRepository
 from app.infrastructure.repositories.pending_action import SQLAlchemyPendingActionRepository
 from app.llm.models import ModelTier, RouteDecision
 from app.rag.models import PolicySearchResult
@@ -73,6 +88,28 @@ def route(**overrides) -> str:
     return json.dumps(payload)
 
 
+def complete_onboarding_route() -> str:
+    return route(
+        domain="onboarding",
+        intent="start_onboarding",
+        employee_name="Priya Raman",
+        employee_email="priya.raman@example.com",
+        designation="Backend Developer",
+        department="Engineering",
+        reporting_manager="Test Manager",
+        joining_date="2026-10-15",
+        location="Chennai",
+        employment_type="Permanent",
+    )
+
+
+def complete_onboarding_message() -> str:
+    return (
+        "Onboard Priya Raman, priya.raman@example.com, as Backend Developer in Engineering, "
+        "reporting to Test Manager, joining 2026-10-15 in Chennai as Permanent"
+    )
+
+
 def test_route_decision_normalizes_domain_from_intent():
     decision = RouteDecision.model_validate_json(
         route(domain="leave", intent="policy_question", confidence=0.98)
@@ -84,6 +121,7 @@ def test_route_decision_normalizes_domain_from_intent():
 def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
     current_actor = current_actor or actor(db_session)
     leave = LeaveService(SQLAlchemyLeaveRepository(db_session))
+    onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db_session))
     pending = PendingActionCoordinator(
         SQLAlchemyPendingActionRepository(db_session),
         {
@@ -91,6 +129,9 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
             "approve_leave_request": ApproveLeaveRequestHandler(leave),
             "reject_leave_request": RejectLeaveRequestHandler(leave),
             "cancel_leave_request": CancelLeaveRequestHandler(leave),
+            "create_onboarding": CreateOnboardingHandler(onboarding),
+            "approve_onboarding": ApproveOnboardingHandler(onboarding),
+            "reject_onboarding": RejectOnboardingHandler(onboarding),
         },
     )
     return HRAssistantOrchestrator(
@@ -98,6 +139,7 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
         actor=current_actor,
         conversations=SQLAlchemyConversationRepository(db_session),
         leave=leave,
+        onboarding=onboarding,
         pending=pending,
         policies=FakePolicies(),
         llm=fake_llm,
@@ -123,6 +165,206 @@ def test_general_capabilities_response_is_stable_and_uses_no_answer_model(db_ses
     assert "leave" in result.message
     assert result.domain == "general"
     assert llm.calls == [("router", True)]
+
+
+def test_manager_onboarding_collects_fields_then_confirms_atomically(db_session):
+    llm = FakeLLM([
+        route(
+            domain="onboarding",
+            intent="start_onboarding",
+            employee_name="Priya Raman",
+            designation="Backend Developer",
+            joining_date="2026-10-15",
+        ),
+        route(
+            domain="general",
+            intent="general",
+            employee_email="priya.raman@example.com",
+            department="Engineering",
+            reporting_manager="Test Manager",
+            location="Chennai",
+            employment_type="Permanent",
+        ),
+    ])
+    service = orchestrator(
+        db_session, llm, current_actor=actor(db_session, "manager")
+    )
+
+    missing = service.chat(
+        "onboarding-session",
+        "Onboard Priya Raman as a Backend Developer joining October 15",
+    )
+    assert "email" in missing.message
+    assert "department" in missing.message
+    assert db_session.scalars(select(OnboardingRequest)).all() == []
+
+    proposal = service.chat(
+        "onboarding-session",
+        "priya.raman@example.com, Engineering, Test Manager, Chennai, Permanent",
+    )
+    assert "New employee onboarding" in proposal.message
+    assert "Request corporate email" in proposal.message
+    assert "Request temporary access card" in proposal.message
+    assert "Reply yes to confirm" in proposal.message
+    assert db_session.scalars(select(OnboardingRequest)).all() == []
+    assert db_session.scalar(
+        select(PendingAction).where(PendingAction.session_id == "onboarding-session")
+    ).action_type == "create_onboarding"
+
+    confirmed = service.chat("onboarding-session", "yes")
+
+    assert "pending HR administrator approval" in confirmed.message
+    assert "4 provisioning tasks" in confirmed.message
+    created = db_session.scalar(select(OnboardingRequest))
+    assert created.employee_name == "Priya Raman"
+    assert len(db_session.scalars(select(OnboardingTask)).all()) == 4
+    assert db_session.scalar(
+        select(PendingAction).where(PendingAction.session_id == "onboarding-session")
+    ) is None
+    assert len(llm.calls) == 2
+
+
+def test_hr_admin_approves_onboarding_with_confirmation_and_credentials_are_redacted(db_session):
+    manager = actor(db_session, "manager")
+    created = OnboardingService(
+        SQLAlchemyOnboardingRepository(db_session)
+    ).create_onboarding(
+        manager,
+        OnboardingCandidate(
+            name="Priya Raman",
+            email="priya.raman@example.com",
+            designation="Backend Developer",
+            department="Engineering",
+            reporting_manager="Test Manager",
+            joining_date=date(2026, 10, 15),
+            location="Chennai",
+            employment_type="Permanent",
+        ),
+    )
+    llm = FakeLLM([route(domain="leave", intent="approve_leave_request", request_id=created.id)])
+    service = orchestrator(
+        db_session, llm, current_actor=actor(db_session, "hradmin")
+    )
+
+    proposal = service.chat(
+        "approve-onboarding-session", f"Approve onboarding request #{created.id}"
+    )
+    confirmed = service.chat("approve-onboarding-session", "yes")
+
+    assert "Reply yes to confirm" in proposal.message
+    assert "Temporary password:" in confirmed.message
+    assert "shown only once" in confirmed.message
+    stored = db_session.get(ConversationSession, "approve-onboarding-session")
+    history = json.loads(stored.state_json)["messages"]
+    assert "Temporary password:" not in history[-1]["content"]
+    assert "one-time credentials were shown" in history[-1]["content"]
+
+
+def test_onboarding_does_not_accept_model_invented_fields(db_session):
+    llm = FakeLLM([route(
+        domain="onboarding",
+        intent="start_onboarding",
+        employee_name="Invented Person",
+        employee_email="invented@example.com",
+        designation="Invented Developer",
+        department="Invented Department",
+        reporting_manager="Test Manager",
+        joining_date="2026-10-15",
+        location="Invented City",
+        employment_type="Permanent",
+    )])
+
+    result = orchestrator(
+        db_session, llm, current_actor=actor(db_session, "manager")
+    ).chat("onboarding-no-invention", "Start onboarding")
+
+    assert "employee name" in result.message
+    assert "email" in result.message
+    assert db_session.scalars(select(OnboardingRequest)).all() == []
+    assert db_session.scalars(select(PendingAction)).all() == []
+
+
+def test_employee_cannot_start_onboarding_through_chat(db_session):
+    llm = FakeLLM([route(domain="onboarding", intent="start_onboarding")])
+
+    with pytest.raises(AuthorizationError):
+        orchestrator(db_session, llm).chat("employee-onboarding", "Start onboarding")
+
+
+def test_manager_can_get_onboarding_status_by_name_in_chat(db_session):
+    manager = actor(db_session, "manager")
+    onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db_session))
+    onboarding.create_onboarding(
+        manager,
+        OnboardingCandidate(
+            name="Priya Raman",
+            email="priya.raman@example.com",
+            designation="Backend Developer",
+            department="Engineering",
+            reporting_manager="Test Manager",
+            joining_date=date(2026, 10, 15),
+            location="Chennai",
+            employment_type="Permanent",
+        ),
+    )
+    llm = FakeLLM([route(
+        domain="onboarding",
+        intent="onboarding_status",
+        employee_name="Priya",
+    )])
+
+    result = orchestrator(db_session, llm, current_actor=manager).chat(
+        "onboarding-status", "What's Priya's onboarding status?"
+    )
+
+    assert result.intent == "onboarding_status"
+    assert "Priya Raman — Backend Developer" in result.message
+    assert "0/4 completed" in result.message
+
+
+def test_cancelling_onboarding_confirmation_creates_nothing_and_clears_context(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([complete_onboarding_route()]),
+        current_actor=actor(db_session, "manager"),
+    )
+    service.chat("onboarding-cancel", complete_onboarding_message())
+
+    cancelled = service.chat("onboarding-cancel", "cancel")
+
+    assert "No changes were made" in cancelled.message
+    assert db_session.scalars(select(OnboardingRequest)).all() == []
+    session = db_session.get(ConversationSession, "onboarding-cancel")
+    assert json.loads(session.state_json)["onboarding_context"] == {}
+
+
+def test_onboarding_duplicate_is_revalidated_at_confirmation(db_session):
+    manager = actor(db_session, "manager")
+    service = orchestrator(
+        db_session, FakeLLM([complete_onboarding_route()]), current_actor=manager
+    )
+    service.chat("onboarding-revalidate", complete_onboarding_message())
+
+    OnboardingService(SQLAlchemyOnboardingRepository(db_session)).create_onboarding(
+        manager,
+        OnboardingCandidate(
+            name="Priya Raman",
+            email="priya.raman@example.com",
+            designation="Backend Developer",
+            department="Engineering",
+            reporting_manager="Test Manager",
+            joining_date=date(2026, 10, 15),
+            location="Chennai",
+            employment_type="Permanent",
+        ),
+    )
+
+    with pytest.raises(ConflictError, match="active onboarding request"):
+        service.chat("onboarding-revalidate", "yes")
+    assert len(db_session.scalars(select(OnboardingRequest)).all()) == 1
+    assert db_session.scalar(
+        select(PendingAction).where(PendingAction.session_id == "onboarding-revalidate")
+    ) is not None
 
 
 def test_leave_application_requires_confirmation_and_executes_on_yes(db_session):

@@ -305,8 +305,9 @@ The frontend renders server decisions; it is not an authorization boundary.
 
 ## 14. Quality strategy
 
-- **84 deterministic tests** cover authentication, security, leave rules, services, pending
-  actions, manager lifecycle, RAG, orchestration, evaluation contracts, and repeatable demo seed.
+- **110 deterministic tests** cover authentication, security, leave rules, onboarding approval and
+  account activation, pending actions, manager lifecycle, RAG, orchestration, evaluation contracts,
+  and repeatable demo seed.
 - **85 versioned golden scenarios** exercise the live API and configured models across policy,
   leave, safety, scope, manager workflow, and API safety categories.
 - The latest complete live release gate scored **98.9%**, above the configured 95% threshold.
@@ -335,9 +336,9 @@ docker compose exec -T backend python -m app.seed --reset-demo
 
 ## 16. Future extensions
 
-Onboarding and parking remain future phases. Their domain labels are recognized so the assistant
-can state that they are unavailable, but no onboarding or parking transaction is presented as
-implemented. New domains can reuse the existing pattern:
+Employee onboarding now uses the same validated, confirmed, atomic workflow pattern as leave.
+Parking remains a future phase and is reported transparently as unavailable. New domains can reuse
+the existing pattern:
 
 ```text
 validated route

@@ -5,4 +5,4 @@ class Role(StrEnum):
     EMPLOYEE = "EMPLOYEE"
     MANAGER = "MANAGER"
     HR = "HR"
-
+    HR_ADMIN = "HR_ADMIN"

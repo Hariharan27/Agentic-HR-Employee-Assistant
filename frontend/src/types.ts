@@ -4,7 +4,7 @@ export type Profile = {
   employee_code: string;
   name: string;
   email: string;
-  role: "EMPLOYEE" | "MANAGER" | "HR";
+  role: "EMPLOYEE" | "MANAGER" | "HR" | "HR_ADMIN";
 };
 
 export type Source = {
@@ -41,4 +41,40 @@ export type LeaveRequest = {
   working_days: string;
   reason?: string | null;
   status: string;
+};
+
+export type OnboardingTask = {
+  id: number;
+  task_type: string;
+  title: string;
+  status: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+  reviewed_by_user_id?: number | null;
+  review_comment?: string | null;
+  reviewed_at?: string | null;
+  activated_employee_id?: number | null;
+  activated_user_id?: number | null;
+};
+
+export type OnboardingStatus = {
+  id: number;
+  candidate: {
+    name: string;
+    email: string;
+    designation: string;
+    department: string;
+    reporting_manager: string;
+    joining_date: string;
+    location: string;
+    employment_type: string;
+  };
+  manager_employee_id: number;
+  created_by_user_id: number;
+  status: string;
+  completed_tasks: number;
+  total_tasks: number;
+  tasks: OnboardingTask[];
+  created_at?: string | null;
+  updated_at?: string | null;
 };

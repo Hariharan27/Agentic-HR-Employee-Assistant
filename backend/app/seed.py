@@ -13,6 +13,8 @@ from app.infrastructure.database.models import (
     LeaveBalance,
     LeaveRequest,
     LeaveRequestEvent,
+    OnboardingRequest,
+    OnboardingTask,
     PendingAction,
     User,
 )
@@ -68,12 +70,29 @@ DEMO_USERS = (
         "password": "hr12345",
         "role": "HR",
     },
+    {
+        "employee": {
+            "employee_code": "H1002",
+            "name": "Nandhini Kumar",
+            "email": "nandhini@example.test",
+            "designation": "HR Administrator",
+            "department": "People",
+            "manager_name": None,
+            "location": "Chennai",
+            "employment_type": "Permanent",
+            "joining_date": date(2020, 2, 10),
+        },
+        "username": "hradmin",
+        "password": "hradmin123",
+        "role": "HR_ADMIN",
+    },
 )
 
 DEMO_BALANCES = {
     "EMPLOYEE": (("CASUAL", 12, 8), ("PRIVILEGE", 18, 3), ("SICK", 10, 1)),
     "MANAGER": (("CASUAL", 12, 2), ("PRIVILEGE", 18, 4), ("SICK", 10, 0)),
     "HR": (("CASUAL", 12, 1), ("PRIVILEGE", 18, 2), ("SICK", 10, 0)),
+    "HR_ADMIN": (("CASUAL", 12, 1), ("PRIVILEGE", 18, 2), ("SICK", 10, 0)),
 }
 
 
@@ -85,6 +104,50 @@ def _next_demo_workday() -> date:
 
 
 def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[int]) -> None:
+    onboarding_rows = db.execute(
+        select(
+            OnboardingRequest.id,
+            OnboardingRequest.activated_user_id,
+            OnboardingRequest.activated_employee_id,
+        ).where(OnboardingRequest.created_by_user_id.in_(user_ids))
+    ).all()
+    onboarding_ids = [row.id for row in onboarding_rows]
+    activated_user_ids = [row.activated_user_id for row in onboarding_rows if row.activated_user_id]
+    activated_employee_ids = [
+        row.activated_employee_id for row in onboarding_rows if row.activated_employee_id
+    ]
+    if onboarding_ids:
+        db.execute(
+            delete(OnboardingTask).where(
+                OnboardingTask.onboarding_request_id.in_(onboarding_ids)
+            )
+        )
+        db.execute(delete(OnboardingRequest).where(OnboardingRequest.id.in_(onboarding_ids)))
+    if activated_employee_ids:
+        activated_leave_ids = select(LeaveRequest.id).where(
+            LeaveRequest.employee_id.in_(activated_employee_ids)
+        )
+        db.execute(
+            delete(LeaveRequestEvent).where(
+                LeaveRequestEvent.leave_request_id.in_(activated_leave_ids)
+            )
+        )
+        db.execute(
+            delete(LeaveRequest).where(LeaveRequest.employee_id.in_(activated_employee_ids))
+        )
+        db.execute(
+            delete(LeaveBalance).where(LeaveBalance.employee_id.in_(activated_employee_ids))
+        )
+    if activated_user_ids:
+        db.execute(delete(PendingAction).where(PendingAction.user_id.in_(activated_user_ids)))
+        db.execute(
+            delete(ConversationSession).where(
+                ConversationSession.user_id.in_(activated_user_ids)
+            )
+        )
+        db.execute(delete(User).where(User.id.in_(activated_user_ids)))
+    if activated_employee_ids:
+        db.execute(delete(Employee).where(Employee.id.in_(activated_employee_ids)))
     request_ids = select(LeaveRequest.id).where(LeaveRequest.employee_id.in_(employee_ids))
     db.execute(delete(LeaveRequestEvent).where(LeaveRequestEvent.leave_request_id.in_(request_ids)))
     db.execute(delete(LeaveRequest).where(LeaveRequest.employee_id.in_(employee_ids)))

@@ -1,4 +1,4 @@
-import type { ChatResponse, LeaveRequest, Profile } from "./types";
+import type { ChatResponse, LeaveRequest, OnboardingStatus, Profile } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
@@ -42,3 +42,14 @@ export const getLeaveRequests = (token: string, role: Profile["role"]) =>
     {},
     token,
   );
+
+export const getOnboardingStatus = (token: string, query: string) => {
+  const normalized = query.trim();
+  const path = /^\d+$/.test(normalized)
+    ? `/api/v1/manager/onboarding/${normalized}`
+    : `/api/v1/manager/onboarding/status/by-employee?employee=${encodeURIComponent(normalized)}`;
+  return request<OnboardingStatus>(path, {}, token);
+};
+
+export const getPendingOnboardingApprovals = (token: string) =>
+  request<OnboardingStatus[]>("/api/v1/hr-admin/onboarding/pending", {}, token);

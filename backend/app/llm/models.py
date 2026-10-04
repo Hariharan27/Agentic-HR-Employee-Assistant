@@ -19,7 +19,11 @@ Intent = Literal[
     "leave_request_history",
     "calculate_leave_days",
     "holidays",
-    "onboarding",
+    "start_onboarding",
+    "onboarding_status",
+    "onboarding_approvals",
+    "approve_onboarding",
+    "reject_onboarding",
     "parking",
     "general",
 ]
@@ -34,6 +38,14 @@ class RouteDecision(BaseModel):
     end_date: date | None = None
     reason: str | None = Field(default=None, max_length=1000)
     request_id: int | None = Field(default=None, gt=0)
+    employee_name: str | None = Field(default=None, max_length=160)
+    employee_email: str | None = Field(default=None, max_length=255)
+    designation: str | None = Field(default=None, max_length=120)
+    department: str | None = Field(default=None, max_length=120)
+    reporting_manager: str | None = Field(default=None, max_length=160)
+    joining_date: date | None = None
+    location: str | None = Field(default=None, max_length=120)
+    employment_type: str | None = Field(default=None, max_length=40)
 
     @model_validator(mode="after")
     def align_domain_with_intent(self):
@@ -50,7 +62,11 @@ class RouteDecision(BaseModel):
             "leave_request_history": "leave",
             "calculate_leave_days": "leave",
             "holidays": "leave",
-            "onboarding": "onboarding",
+            "start_onboarding": "onboarding",
+            "onboarding_status": "onboarding",
+            "onboarding_approvals": "onboarding",
+            "approve_onboarding": "onboarding",
+            "reject_onboarding": "onboarding",
             "parking": "parking",
             "general": "general",
         }

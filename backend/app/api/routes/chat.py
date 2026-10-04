@@ -8,6 +8,12 @@ from app.agent.orchestrator import HRAssistantOrchestrator
 from app.api.dependencies import AppSettings, CurrentUser, Database
 from app.api.schemas.chat import ChatRequest, ChatResponse
 from app.application.leave.service import LeaveService
+from app.application.onboarding.handler import (
+    ApproveOnboardingHandler,
+    CreateOnboardingHandler,
+    RejectOnboardingHandler,
+)
+from app.application.onboarding.service import OnboardingService
 from app.application.pending.handlers import (
     ApplyLeaveHandler,
     ApproveLeaveRequestHandler,
@@ -20,6 +26,7 @@ from app.infrastructure.embeddings.bge import BGEEmbeddingProvider
 from app.infrastructure.llm.mantle import MantleLLMGateway
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.infrastructure.repositories.leave import SQLAlchemyLeaveRepository
+from app.infrastructure.repositories.onboarding import SQLAlchemyOnboardingRepository
 from app.infrastructure.repositories.pending_action import SQLAlchemyPendingActionRepository
 from app.infrastructure.vector_store.qdrant import QdrantPolicyVectorStore
 from app.llm.ports import LLMGateway
@@ -62,6 +69,7 @@ def chat(
     policies: Policies,
 ) -> ChatResponse:
     leave = LeaveService(SQLAlchemyLeaveRepository(db))
+    onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db))
     pending = PendingActionCoordinator(
         SQLAlchemyPendingActionRepository(db),
         {
@@ -69,6 +77,9 @@ def chat(
             "approve_leave_request": ApproveLeaveRequestHandler(leave),
             "reject_leave_request": RejectLeaveRequestHandler(leave),
             "cancel_leave_request": CancelLeaveRequestHandler(leave),
+            "create_onboarding": CreateOnboardingHandler(onboarding),
+            "approve_onboarding": ApproveOnboardingHandler(onboarding),
+            "reject_onboarding": RejectOnboardingHandler(onboarding),
         },
     )
     service = HRAssistantOrchestrator(
@@ -76,6 +87,7 @@ def chat(
         actor=actor,
         conversations=SQLAlchemyConversationRepository(db),
         leave=leave,
+        onboarding=onboarding,
         pending=pending,
         policies=policies,
         llm=llm,

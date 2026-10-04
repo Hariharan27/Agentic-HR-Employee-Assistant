@@ -15,3 +15,5 @@ class AgentState(TypedDict, total=False):
     sources: list[dict[str, object]]
     pending_summary: str | None
     llm_calls: int
+    onboarding_context: dict[str, str]
+    sensitive_response: bool

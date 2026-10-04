@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 from app.api.routes.auth import router as auth_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.leave import router as leave_router
+from app.api.routes.onboarding import admin_router as onboarding_admin_router
+from app.api.routes.onboarding import router as onboarding_router
 from app.core.config import get_settings
 from app.core.exceptions import ApplicationError
 from app.core.logging import configure_logging
@@ -28,6 +30,8 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(leave_router)
+app.include_router(onboarding_router)
+app.include_router(onboarding_admin_router)
 
 
 @app.middleware("http")

@@ -10,10 +10,12 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.agent.state import AgentState
 from app.application.leave.service import LeaveService
+from app.application.onboarding.service import OnboardingService
 from app.application.pending.service import PendingActionCoordinator
 from app.core.config import Settings
 from app.core.exceptions import LLMServiceError
-from app.core.security import AuthenticatedUser
+from app.core.security import AuthenticatedUser, require_role
+from app.domain.onboarding.entities import TASK_TITLES, OnboardingCandidate
 from app.domain.pending.entities import ConfirmationDecision
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.llm.models import ModelTier, RouteDecision
@@ -26,13 +28,22 @@ Return exactly one JSON object with these fields:
 - domain: leave, policy, onboarding, parking, or general
 - intent: policy_question, leave_balance, leave_eligibility, apply_leave, leave_requests,
   manager_leave_requests, approve_leave_request, reject_leave_request, cancel_leave_request,
-  leave_request_history, calculate_leave_days, holidays, onboarding, parking, or general
+  leave_request_history, calculate_leave_days, holidays, start_onboarding, onboarding_status,
+  onboarding_approvals, approve_onboarding, reject_onboarding, parking, or general
 - confidence: number from 0 to 1
 - leave_type: CASUAL, SICK, PRIVILEGE, or null
 - start_date: YYYY-MM-DD or null
 - end_date: YYYY-MM-DD or null
 - reason: string or null
 - request_id: positive integer or null
+- employee_name: string or null
+- employee_email: string or null
+- designation: string or null
+- department: string or null
+- reporting_manager: string or null
+- joining_date: YYYY-MM-DD or null
+- location: string or null
+- employment_type: string or null
 
 Policy or rules questions use policy/policy_question. Personal balance, eligibility, calculation,
 application, holidays, and request history use leave. Never invent missing dates or fields.
@@ -48,6 +59,13 @@ holidays. If the employee does not explicitly name a leave type, leave_type must
 Questions about "my balance", days "available to me", or days "I have" use leave_balance, not
 policy_question. Company requirements, standards, security rules, and the code of conduct use
 policy/policy_question and must be answered from policy documents.
+Use onboarding/start_onboarding when a Manager or HR user wants to onboard a new employee or is
+answering missing onboarding questions. Use onboarding/onboarding_status for an onboarding status
+question. Use onboarding/onboarding_approvals for the HR administrator's pending onboarding queue,
+and the dedicated approve_onboarding or reject_onboarding intents for reviewing one onboarding
+request. Extract only onboarding values explicitly stated by the user; never guess a name, email,
+role, department, manager, date, location, or employment type. Existing values are supplied
+separately and should not be repeated as newly extracted fields.
 Return JSON only."""
 
 
@@ -69,6 +87,7 @@ class HRAssistantOrchestrator:
         actor: AuthenticatedUser,
         conversations: SQLAlchemyConversationRepository,
         leave: LeaveService,
+        onboarding: OnboardingService,
         pending: PendingActionCoordinator,
         policies: PolicyKnowledgeService,
         llm: LLMGateway,
@@ -77,6 +96,7 @@ class HRAssistantOrchestrator:
         self.actor = actor
         self.conversations = conversations
         self.leave = leave
+        self.onboarding = onboarding
         self.pending = pending
         self.policies = policies
         self.llm = llm
@@ -93,20 +113,32 @@ class HRAssistantOrchestrator:
             "user_message": message.strip(),
             "messages": history,
             "active_domain": self._safe_domain(stored.get("active_domain")),
+            "onboarding_context": self._safe_onboarding_context(
+                stored.get("onboarding_context")
+            ),
             "sources": [],
             "llm_calls": 0,
         }
         result = self.graph.invoke(state)
         response = result["response"]
+        stored_response = (
+            "Onboarding was approved and one-time credentials were shown to the HR administrator."
+            if result.get("sensitive_response")
+            else response
+        )
         updated_history = [
             *history,
             {"role": "user", "content": state["user_message"]},
-            {"role": "assistant", "content": response},
+            {"role": "assistant", "content": stored_response},
         ][-20:]
         self.conversations.save(
             session_id,
             self.actor.user_id,
-            {"messages": updated_history, "active_domain": result.get("active_domain")},
+            {
+                "messages": updated_history,
+                "active_domain": result.get("active_domain"),
+                "onboarding_context": result.get("onboarding_context", {}),
+            },
         )
         route = result.get("route")
         domain = route.domain if isinstance(route, RouteDecision) else result.get("active_domain") or "general"
@@ -126,6 +158,7 @@ class HRAssistantOrchestrator:
         graph.add_node("router", self._route)
         graph.add_node("policy", self._handle_policy)
         graph.add_node("leave", self._handle_leave)
+        graph.add_node("onboarding", self._handle_onboarding)
         graph.add_node("unsupported", self._handle_unsupported_domain)
         graph.add_node("general", self._handle_general)
         graph.add_edge(START, "resolve_pending_action")
@@ -140,11 +173,12 @@ class HRAssistantOrchestrator:
             {
                 "policy": "policy",
                 "leave": "leave",
+                "onboarding": "onboarding",
                 "unsupported": "unsupported",
                 "general": "general",
             },
         )
-        for node in ("confirmation", "policy", "leave", "unsupported", "general"):
+        for node in ("confirmation", "policy", "leave", "onboarding", "unsupported", "general"):
             graph.add_edge(node, END)
         return graph.compile()
 
@@ -158,14 +192,15 @@ class HRAssistantOrchestrator:
         if decision is ConfirmationDecision.UNKNOWN:
             return {
                 "response": f"An action is waiting for confirmation: {action.summary}. Reply yes to confirm or cancel.",
-                "active_domain": "leave",
+                "active_domain": self._action_domain(action.action_type),
             }
         if decision is ConfirmationDecision.CANCEL:
             self.pending.cancel(self.actor, state["session_id"])
             return {
                 "response": "The pending action has been cancelled. No changes were made.",
-                "active_domain": "leave",
+                "active_domain": self._action_domain(action.action_type),
                 "pending_summary": None,
+                "onboarding_context": {},
             }
         created = self.pending.confirm(self.actor, state["session_id"])
         action_type = action.action_type
@@ -175,17 +210,43 @@ class HRAssistantOrchestrator:
             response = f"Leave request #{created.id} was rejected successfully."
         elif action_type == "cancel_leave_request":
             response = f"Your leave request #{created.id} was cancelled successfully."
+        elif action_type == "create_onboarding":
+            response = (
+                f"Onboarding request #{created.id} for {created.candidate.name} was created "
+                f"successfully and is pending HR administrator approval. "
+                f"It includes {created.total_tasks} provisioning tasks."
+            )
+        elif action_type == "approve_onboarding":
+            response = (
+                f"Onboarding request #{created.request.id} was approved and the employee account is active.\n"
+                f"Employee code: {created.employee_code}\n"
+                f"Username: {created.username}\n"
+                f"Temporary password: {created.temporary_password}\n"
+                "Share these credentials securely. This password is shown only once."
+            )
+        elif action_type == "reject_onboarding":
+            response = f"Onboarding request #{created.id} was rejected successfully."
         else:
             response = (
                 f"Your {created.leave_type.value.title()} leave request for "
                 f"{self._number(created.working_days)} working day(s) was submitted successfully "
                 f"with request ID {created.id}."
             )
-        return {
+        result = {
             "response": response,
-            "active_domain": "leave",
+            "active_domain": self._action_domain(action_type),
             "pending_summary": None,
+            "onboarding_context": {},
         }
+        if action_type == "approve_onboarding":
+            result["sensitive_response"] = True
+        return result
+
+    @staticmethod
+    def _action_domain(action_type: str) -> str:
+        return "onboarding" if action_type in {
+            "create_onboarding", "approve_onboarding", "reject_onboarding"
+        } else "leave"
 
     def _route(self, state: AgentState) -> AgentState:
         security_route = self._security_route(state["user_message"])
@@ -209,6 +270,14 @@ class HRAssistantOrchestrator:
             )
             decision = self._parse_route(raw)
         decision = self._apply_routing_guards(decision, state["user_message"])
+        if (
+            state.get("active_domain") == "onboarding"
+            and state.get("onboarding_context")
+            and decision.domain == "general"
+        ):
+            decision = decision.model_copy(
+                update={"domain": "onboarding", "intent": "start_onboarding", "confidence": 0.99}
+            )
         return {"route": decision, "active_domain": decision.domain, "llm_calls": calls}
 
     @staticmethod
@@ -235,7 +304,7 @@ class HRAssistantOrchestrator:
     @staticmethod
     def _route_destination(state: AgentState) -> str:
         domain = state["route"].domain
-        if domain in {"policy", "leave", "general"}:
+        if domain in {"policy", "leave", "onboarding", "general"}:
             return domain
         return "unsupported"
 
@@ -407,6 +476,193 @@ class HRAssistantOrchestrator:
             "active_domain": "leave",
         }
 
+    def _handle_onboarding(self, state: AgentState) -> AgentState:
+        route: RouteDecision = state["route"]
+        if route.intent == "onboarding_approvals":
+            requests = self.onboarding.get_pending_approvals(self.actor)
+            if not requests:
+                return {
+                    "response": "There are no onboarding requests pending approval.",
+                    "active_domain": "onboarding",
+                }
+            lines = [
+                f"#{item.id}: {item.candidate.name} — {item.candidate.designation}, "
+                f"joining {item.candidate.joining_date}"
+                for item in requests[:20]
+            ]
+            return {
+                "response": "Pending onboarding approvals:\n" + "\n".join(lines),
+                "active_domain": "onboarding",
+            }
+        if route.intent in {"approve_onboarding", "reject_onboarding"}:
+            if route.request_id is None:
+                return {
+                    "response": "Please provide the onboarding request ID.",
+                    "active_domain": "onboarding",
+                }
+            if route.intent == "reject_onboarding" and not route.reason:
+                return {
+                    "response": "Please provide a reason for rejecting the onboarding request.",
+                    "active_domain": "onboarding",
+                }
+            request = self.onboarding.prepare_review(self.actor, route.request_id)
+            if route.intent == "approve_onboarding":
+                action_type = "approve_onboarding"
+                arguments = {"request_id": request.id, "comment": route.reason}
+                summary = f"Approve onboarding request #{request.id} for {request.candidate.name}"
+            else:
+                action_type = "reject_onboarding"
+                arguments = {"request_id": request.id, "reason": route.reason}
+                summary = f"Reject onboarding request #{request.id} for {request.candidate.name}: {route.reason}"
+            action = self.pending.propose(
+                self.actor, state["session_id"], action_type, arguments, summary
+            )
+            return {
+                "response": f"{action.summary}. Reply yes to confirm or cancel.",
+                "active_domain": "onboarding",
+                "pending_summary": action.summary,
+            }
+        if route.intent == "onboarding_status":
+            if route.request_id is not None:
+                request = self.onboarding.get_onboarding_status(self.actor, route.request_id)
+            else:
+                query = self._trusted_onboarding_lookup(route, state["user_message"])
+                if query is None:
+                    return {
+                        "response": "Please provide the employee name, email, or onboarding request ID.",
+                        "active_domain": "onboarding",
+                    }
+                request = self.onboarding.find_onboarding_status(self.actor, query)
+            task_lines = [
+                f"{task.title}: {task.status.value.replace('_', ' ').title()}"
+                for task in request.tasks
+            ]
+            return {
+                "response": (
+                    f"{request.candidate.name} — {request.candidate.designation}\n"
+                    f"Joining: {request.candidate.joining_date}\n"
+                    f"Status: {request.status.value.replace('_', ' ').title()} "
+                    f"({request.completed_tasks}/{request.total_tasks} completed)\n"
+                    + "\n".join(task_lines)
+                ),
+                "active_domain": "onboarding",
+            }
+
+        require_role(self.actor, "MANAGER", "HR")
+
+        context = self._merge_onboarding_context(
+            state.get("onboarding_context", {}), route, state["user_message"]
+        )
+        required = (
+            ("name", "employee name"),
+            ("email", "email"),
+            ("designation", "designation"),
+            ("department", "department"),
+            ("reporting_manager", "reporting manager"),
+            ("joining_date", "joining date"),
+            ("location", "location"),
+            ("employment_type", "employment type"),
+        )
+        missing = [label for field, label in required if not context.get(field)]
+        if missing:
+            return {
+                "response": "Please provide " + ", ".join(missing) + ".",
+                "active_domain": "onboarding",
+                "onboarding_context": context,
+            }
+
+        candidate = OnboardingCandidate(
+            name=context["name"],
+            email=context["email"],
+            designation=context["designation"],
+            department=context["department"],
+            reporting_manager=context["reporting_manager"],
+            joining_date=date.fromisoformat(context["joining_date"]),
+            location=context["location"],
+            employment_type=context["employment_type"],
+        )
+        plan = self.onboarding.prepare_plan(self.actor, candidate)
+        arguments = {
+            "name": plan.candidate.name,
+            "email": plan.candidate.email,
+            "designation": plan.candidate.designation,
+            "department": plan.candidate.department,
+            "reporting_manager": plan.candidate.reporting_manager,
+            "joining_date": plan.candidate.joining_date.isoformat(),
+            "location": plan.candidate.location,
+            "employment_type": plan.candidate.employment_type,
+        }
+        summary = (
+            f"Create onboarding for {plan.candidate.name} ({plan.candidate.designation}), "
+            f"joining {plan.candidate.joining_date}, with 4 provisioning requests"
+        )
+        action = self.pending.propose(
+            self.actor, state["session_id"], "create_onboarding", arguments, summary
+        )
+        task_lines = "\n".join(f"- {TASK_TITLES[item]}" for item in plan.task_types)
+        return {
+            "response": (
+                "New employee onboarding\n"
+                f"Name: {plan.candidate.name}\n"
+                f"Email: {plan.candidate.email}\n"
+                f"Role: {plan.candidate.designation}\n"
+                f"Department: {plan.candidate.department}\n"
+                f"Manager: {plan.candidate.reporting_manager}\n"
+                f"Joining date: {plan.candidate.joining_date}\n"
+                f"Location: {plan.candidate.location}\n"
+                f"Employment type: {plan.candidate.employment_type}\n\n"
+                f"Provisioning requests:\n{task_lines}\n\n"
+                "Reply yes to confirm or cancel."
+            ),
+            "active_domain": "onboarding",
+            "onboarding_context": context,
+            "pending_summary": action.summary,
+        }
+
+    @staticmethod
+    def _merge_onboarding_context(
+        existing: dict[str, str], route: RouteDecision, message: str
+    ) -> dict[str, str]:
+        context = dict(existing)
+        fields = {
+            "name": route.employee_name,
+            "designation": route.designation,
+            "department": route.department,
+            "reporting_manager": route.reporting_manager,
+            "location": route.location,
+            "employment_type": route.employment_type,
+        }
+        for field, value in fields.items():
+            if value and HRAssistantOrchestrator._value_is_explicit(value, message):
+                context[field] = value.strip()
+        email_match = re.search(
+            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", message, re.I
+        )
+        if email_match:
+            context["email"] = email_match.group(0).casefold()
+        if route.joining_date is not None and HRAssistantOrchestrator._contains_date_reference(message):
+            context["joining_date"] = route.joining_date.isoformat()
+        return context
+
+    @staticmethod
+    def _trusted_onboarding_lookup(route: RouteDecision, message: str) -> str | None:
+        email_match = re.search(
+            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", message, re.I
+        )
+        if email_match:
+            return email_match.group(0)
+        if route.employee_name and HRAssistantOrchestrator._value_is_explicit(
+            route.employee_name, message
+        ):
+            return route.employee_name.strip()
+        return None
+
+    @staticmethod
+    def _value_is_explicit(value: str, message: str) -> bool:
+        normalized_value = " ".join(re.sub(r"[^\w]+", " ", value.casefold()).split())
+        normalized_message = " ".join(re.sub(r"[^\w]+", " ", message.casefold()).split())
+        return bool(normalized_value) and normalized_value in normalized_message
+
     @staticmethod
     def _handle_unsupported_domain(state: AgentState) -> AgentState:
         domain = state["route"].domain
@@ -420,7 +676,9 @@ class HRAssistantOrchestrator:
         return {
             "response": (
                 "Hello! I can help with HR policy questions and leave workflows, including balances, "
-                "eligibility, applications, request history, and manager approvals."
+                "eligibility, applications, request history, and manager approvals. Managers and HR "
+                "can create and track employee onboarding, while HR administrators can approve or "
+                "reject onboarding requests and activate employee accounts."
             ),
             "active_domain": "general",
         }
@@ -440,7 +698,12 @@ class HRAssistantOrchestrator:
         return self.llm.complete(tier, system=system, user=user, json_mode=json_mode), calls + 1
 
     def _routing_input(self, state: AgentState, today: str) -> str:
-        return f"Today's date is {today}.\n{self._history_text(state)}"
+        onboarding_context = json.dumps(state.get("onboarding_context", {}), sort_keys=True)
+        return (
+            f"Today's date is {today}.\n"
+            f"Current onboarding context: {onboarding_context}\n"
+            f"{self._history_text(state)}"
+        )
 
     @staticmethod
     def _history_text(state: AgentState) -> str:
@@ -526,9 +789,67 @@ class HRAssistantOrchestrator:
             and "request" in normalized
             and (personal or "my" in normalized)
         )
+        onboarding_status_signal = (
+            "onboarding" in normalized
+            and bool(re.search(r"\b(status|progress|tracking|track)\b", normalized))
+        )
+        onboarding_queue_signal = (
+            "onboarding" in normalized
+            and any(phrase in normalized for phrase in (
+                "pending approvals", "approval queue", "requests to approve", "pending requests"
+            ))
+        )
+        onboarding_context_signal = "onboarding" in normalized or "new hire" in normalized
+        onboarding_approve_signal = (
+            onboarding_context_signal and bool(re.search(r"\bapprove\b", normalized))
+            and "request" in normalized
+        )
+        onboarding_reject_signal = (
+            onboarding_context_signal and bool(re.search(r"\b(reject|decline)\b", normalized))
+            and "request" in normalized
+        )
+        onboarding_start_signal = bool(
+            re.search(r"\bonboard\b", normalized)
+            or (
+                "onboarding" in normalized
+                and re.search(r"\b(start|create|begin|new employee|new hire)\b", normalized)
+            )
+        )
 
         updates: dict[str, object] = {}
-        if unsupported_action_signal:
+        if onboarding_queue_signal:
+            updates.update(
+                domain="onboarding", intent="onboarding_approvals",
+                confidence=max(decision.confidence, 0.98), request_id=None,
+                leave_type=None, start_date=None, end_date=None,
+            )
+        elif onboarding_approve_signal:
+            updates.update(
+                domain="onboarding", intent="approve_onboarding",
+                confidence=max(decision.confidence, 0.98), request_id=request_id,
+                reason=explicit_reason or decision.reason,
+                leave_type=None, start_date=None, end_date=None,
+            )
+        elif onboarding_reject_signal:
+            updates.update(
+                domain="onboarding", intent="reject_onboarding",
+                confidence=max(decision.confidence, 0.98), request_id=request_id,
+                reason=explicit_reason or decision.reason,
+                leave_type=None, start_date=None, end_date=None,
+            )
+        elif onboarding_status_signal:
+            updates.update(
+                domain="onboarding", intent="onboarding_status",
+                confidence=max(decision.confidence, 0.98), request_id=request_id,
+                leave_type=None, start_date=None, end_date=None,
+            )
+        elif onboarding_start_signal:
+            updates.update(
+                domain="onboarding", intent="start_onboarding",
+                confidence=max(decision.confidence, 0.98), request_id=None,
+                leave_type=None, start_date=None, end_date=None,
+            )
+        elif unsupported_action_signal:
             updates.update(
                 domain="general", intent="general", confidence=max(decision.confidence, 0.95),
                 leave_type=None, start_date=None, end_date=None,
@@ -644,3 +965,17 @@ class HRAssistantOrchestrator:
     @staticmethod
     def _safe_domain(value: object) -> str | None:
         return value if value in {"leave", "policy", "onboarding", "parking", "general"} else None
+
+    @staticmethod
+    def _safe_onboarding_context(value: object) -> dict[str, str]:
+        allowed = {
+            "name", "email", "designation", "department", "reporting_manager",
+            "joining_date", "location", "employment_type",
+        }
+        if not isinstance(value, dict):
+            return {}
+        return {
+            key: item
+            for key, item in value.items()
+            if key in allowed and isinstance(item, str) and item.strip()
+        }

@@ -1,19 +1,21 @@
 # Ideator PeopleDesk
 
 Ideator PeopleDesk is an authenticated Agentic HR help desk for ideas2it employees. It answers HR
-questions from company policy documents and executes leave workflows against trusted employee data
+questions from company policy documents and executes leave and onboarding workflows against trusted employee data
 with deterministic rules, role-based authorization, human confirmation, and an auditable lifecycle.
 
-The assessment release completes the HR policy and leave domain end to end. Onboarding and parking
-are intentionally reserved for later phases.
+The assessment release completes the HR policy, leave, and employee-onboarding domains end to end.
+Parking is intentionally reserved for a later phase.
 
 ## What it demonstrates
 
-- Authenticated employee, manager, and HR experiences
+- Authenticated employee, manager, HR, and HR administrator experiences
 - LangGraph intent routing and multi-turn conversation state
 - Grounded policy RAG over 32 PDFs with document/page attribution
 - Dynamic leave balances, eligibility, working-day calculation, and request history
 - Leave application, cancellation, manager approval, and rejection workflows
+- Manager/HR onboarding requests with independent HR administrator approval
+- Atomic employee account activation, default balances, and one-time temporary credentials
 - Explicit confirmation before every database mutation
 - Deterministic business rules and service-layer authorization outside the LLM
 - Cost-aware Amazon Bedrock Mantle model routing
@@ -51,11 +53,12 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
 | Policy questions | Qdrant retrieval and grounded GPT OSS 120B response with sources |
 | Dynamic employee information | PostgreSQL-backed balances and request lifecycle |
 | Calculations | Python working-day, holiday, overlap, and balance rules |
-| Tool usage | LangGraph invokes validated policy and leave application services |
+| Tool usage | LangGraph invokes validated policy, leave, and onboarding application services |
 | Agent workflow | Structured routing, conditional graph nodes, context, and escalation |
 | Safe actions | Expiring pending actions and explicit Confirm/Cancel step |
 | Manager workflow | Direct-report queue, approve/reject, balance update, audit history |
-| Quality evidence | 84 automated tests and 85 live golden scenarios |
+| Onboarding workflow | Four provisioning tasks, HR Admin approval, account activation, employee login |
+| Quality evidence | 110 automated tests and 85 live golden scenarios |
 
 ## Quick start with Docker
 
@@ -94,18 +97,20 @@ migrations and performs non-destructive, idempotent seeding.
 | Employee | `employee` | `employee123` |
 | Manager | `manager` | `manager123` |
 | HR | `hr` | `hr12345` |
+| HR Administrator | `hradmin` | `hradmin123` |
 
 These credentials are intentionally non-sensitive and exist only for local demonstration.
 
-Reset the three demo identities to a predictable state before recording:
+Reset the four demo identities to a predictable state before recording:
 
 ```bash
 docker compose exec -T backend python -m app.seed --reset-demo
 ```
 
-The reset clears only demo conversations, pending actions, and leave activity. It restores the
-documented passwords and balances and creates one pending Casual Leave request for the manager
-flow. Policy vectors, schema, and non-demo employees are not changed.
+The reset clears demo conversations, pending actions, leave activity, and onboarding requests
+created by demo identities—including any accounts activated from them. It restores the documented
+passwords and balances and creates one pending Casual Leave request for the manager flow. Policy
+vectors, schema, and unrelated employees are not changed.
 
 Follow [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the exact 6–8 minute assessment walkthrough.
 
@@ -119,8 +124,9 @@ POST /api/v1/chat
   → otherwise route the request
        ├─ policy  → retrieve Qdrant evidence → grounded response + sources
        ├─ leave   → deterministic application service
+       ├─ onboarding → deterministic request, review, and account activation services
        ├─ general → deterministic capability response
-       └─ future  → explicit not-yet-available response
+       └─ parking → explicit not-yet-available response
   → persist conversation state
   → return message, intent, sources, and pending-action summary
 ```
@@ -244,7 +250,7 @@ npm run build
 frontend/                   Ideator PeopleDesk React application
 backend/app/agent/          LangGraph orchestration and state
 backend/app/application/    Leave and pending-action use cases
-backend/app/domain/         Deterministic entities and business rules
+backend/app/domain/         Deterministic leave/onboarding entities and business rules
 backend/app/infrastructure/ Provider and persistence adapters
 backend/app/rag/            PDF ingestion and policy retrieval
 backend/tests/              Deterministic test suite
@@ -264,13 +270,12 @@ Completed:
 - Manager approval lifecycle and audit events
 - Ideator PeopleDesk assessment frontend
 - Golden behavior evaluation and demo reset
+- New-employee onboarding, HR Admin approval, and employee account activation
 
 Future phases:
 
-- New-employee onboarding workflow
 - Workplace parking workflow
 - Production identity provider and managed secret storage
 - Production observability and deployment hardening
 
-The future domain labels are recognized only to return a transparent unavailable response; no
-incomplete onboarding or parking operation is represented as working.
+The future parking domain label is recognized only to return a transparent unavailable response.
