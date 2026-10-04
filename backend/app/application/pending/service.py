@@ -72,6 +72,19 @@ class PendingActionCoordinator:
             result = handler.execute(actor, action.arguments)
             self.repository.delete_pending(action.id)
             self.repository.commit()
+
+            after_commit = getattr(handler, "after_commit", None)
+            if callable(after_commit):
+                try:
+                    after_commit(actor, action.arguments, result)
+                except Exception as exc:
+                    # Post-commit side effects must never roll back
+                    # an already-successful business transaction.
+                    print(
+                        f"Post-commit action failed for {action.action_type}: {exc}",
+                        flush=True,
+                    )
+
             return result
         except Exception:
             self.repository.rollback()

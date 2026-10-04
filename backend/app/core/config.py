@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     parking_no_show_lookback_days: int = Field(default=30, ge=1, le=365)
     parking_no_show_strike_limit: int = Field(default=3, ge=1, le=20)
     parking_suspension_days: int = Field(default=14, ge=1, le=365)
+    # Department notification recipients.
+    # These can be overridden through environment variables.
+    hr_notification_email: str = "hr@example.com"
+    it_notification_email: str = "it@example.com"
+    finance_notification_email: str = "finance@example.com"
+    facilities_notification_email: str = "facilities@example.com"
     cors_origins: str = "http://localhost:5173"
     log_level: str = "INFO"
 
