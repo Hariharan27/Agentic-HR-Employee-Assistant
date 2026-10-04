@@ -37,7 +37,7 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
         seed_database(db, reset_demo=True)
         db.commit()
 
-        employee = db.scalar(select(Employee).where(Employee.employee_code == "E1001"))
+        employee = db.scalar(select(Employee).where(Employee.employee_code == "I26004"))
         employee_user = db.scalar(select(User).where(User.username == "employee"))
         casual = db.scalar(
             select(LeaveBalance).where(

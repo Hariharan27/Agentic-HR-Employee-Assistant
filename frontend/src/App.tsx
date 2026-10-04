@@ -1,12 +1,13 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { getLeaveRequests, getOnboardingStatus, getPendingOnboardingApprovals, getProfile, login, sendChat } from "./api";
-import type { ChatMessage, LeaveRequest, OnboardingStatus, Profile, Source } from "./types";
+import { getLeaveRequests, getOnboardingStatus, getParkingAdminReservations, getPendingOnboardingApprovals, getProfile, login, sendChat } from "./api";
+import type { ChatMessage, LeaveRequest, OnboardingStatus, ParkingReservation, Profile, Source } from "./types";
 
 const demoAccounts = {
   EMPLOYEE: { username: "employee", password: "employee123" },
   MANAGER: { username: "manager", password: "manager123" },
   HR: { username: "hr", password: "hr12345" },
   HR_ADMIN: { username: "hradmin", password: "hradmin123" },
+  PARKING_ADMIN: { username: "parkingadmin", password: "parkingadmin123" },
 } as const;
 
 const quickPrompts: Record<Profile["role"], string[]> = {
@@ -30,7 +31,17 @@ const quickPrompts: Record<Profile["role"], string[]> = {
     "What's Priya's onboarding status?",
     "What is the employee onboarding policy?",
   ],
+  PARKING_ADMIN: [
+    "Show parking admin queue for today",
+    "Check in parking reservation #",
+    "Mark parking reservation # as no-show",
+  ],
 };
+
+function localDateInputValue(date = new Date()) {
+  const copy = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return copy.toISOString().slice(0, 10);
+}
 
 function groupedSourceLabels(sources: Source[]) {
   const documents = new Map<string, Set<number>>();
@@ -54,12 +65,16 @@ function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [requests, setRequests] = useState<LeaveRequest[]>([]);
-  const [sidePanel, setSidePanel] = useState<"requests" | "onboarding">("requests");
+  const [sidePanel, setSidePanel] = useState<"requests" | "onboarding" | "parking">("requests");
   const [onboardingQuery, setOnboardingQuery] = useState("");
   const [onboardingStatus, setOnboardingStatus] = useState<OnboardingStatus | null>(null);
   const [onboardingLoading, setOnboardingLoading] = useState(false);
   const [onboardingError, setOnboardingError] = useState("");
   const [onboardingApprovals, setOnboardingApprovals] = useState<OnboardingStatus[]>([]);
+  const [parkingDate, setParkingDate] = useState(localDateInputValue);
+  const [parkingReservations, setParkingReservations] = useState<ParkingReservation[]>([]);
+  const [parkingLoading, setParkingLoading] = useState(false);
+  const [parkingError, setParkingError] = useState("");
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -69,6 +84,7 @@ function App() {
   const suggestions = useMemo(() => (profile ? quickPrompts[profile.role] : []), [profile]);
   const canCreateOnboarding = profile?.role === "MANAGER" || profile?.role === "HR";
   const canManageOnboarding = canCreateOnboarding || profile?.role === "HR_ADMIN";
+  const canManageParking = profile?.role === "PARKING_ADMIN";
 
   async function refreshOnboardingApprovals(currentToken = token, currentProfile = profile) {
     if (!currentToken || currentProfile?.role !== "HR_ADMIN") return;
@@ -81,10 +97,28 @@ function App() {
 
   async function refreshRequests(currentToken = token, currentProfile = profile) {
     if (!currentToken || !currentProfile) return;
+    if (currentProfile.role === "PARKING_ADMIN") {
+      setRequests([]);
+      return;
+    }
     try {
       setRequests(await getLeaveRequests(currentToken, currentProfile.role));
     } catch {
       setRequests([]);
+    }
+  }
+
+  async function refreshParkingReservations(currentToken = token, dateValue = parkingDate) {
+    if (!currentToken || !canManageParking) return;
+    setParkingLoading(true);
+    setParkingError("");
+    try {
+      setParkingReservations(await getParkingAdminReservations(currentToken, dateValue));
+    } catch (nextError) {
+      setParkingReservations([]);
+      setParkingError(nextError instanceof Error ? nextError.message : "Parking queue could not be loaded");
+    } finally {
+      setParkingLoading(false);
     }
   }
 
@@ -94,8 +128,12 @@ function App() {
       .then((nextProfile) => {
         setProfile(nextProfile);
         if (nextProfile.role === "HR_ADMIN") setSidePanel("onboarding");
+        if (nextProfile.role === "PARKING_ADMIN") setSidePanel("parking");
         void refreshRequests(token, nextProfile);
         void refreshOnboardingApprovals(token, nextProfile);
+        if (nextProfile.role === "PARKING_ADMIN") {
+          void getParkingAdminReservations(token, parkingDate).then(setParkingReservations).catch(() => setParkingReservations([]));
+        }
       })
       .catch(() => logout());
   }, [token]);
@@ -135,6 +173,9 @@ function App() {
     setOnboardingStatus(null);
     setOnboardingApprovals([]);
     setOnboardingError("");
+    setParkingDate(localDateInputValue());
+    setParkingReservations([]);
+    setParkingError("");
   }
 
   async function lookupOnboarding(query = onboardingQuery) {
@@ -188,6 +229,10 @@ function App() {
         const requestId = response.message.match(/Onboarding request #(\d+)/i)?.[1];
         if (requestId) void lookupOnboarding(requestId);
       }
+      if (response.domain === "parking" && canManageParking) {
+        setSidePanel("parking");
+        void refreshParkingReservations();
+      }
       await refreshRequests();
       await refreshOnboardingApprovals();
     } catch (nextError) {
@@ -214,7 +259,7 @@ function App() {
           <div className="role-switcher">
             {Object.entries(demoAccounts).map(([role, account]) => (
               <button key={role} type="button" className={loginForm.username === account.username ? "active" : ""}
-                onClick={() => setLoginForm(account)}>{role === "HR_ADMIN" ? "HR Admin" : role[0] + role.slice(1).toLowerCase()}</button>
+                onClick={() => setLoginForm(account)}>{role === "HR_ADMIN" ? "HR Admin" : role === "PARKING_ADMIN" ? "Parking Admin" : role[0] + role.slice(1).toLowerCase()}</button>
             ))}
           </div>
           <form onSubmit={handleLogin}>
@@ -234,17 +279,17 @@ function App() {
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark small">I</div><div><strong>Ideator PeopleDesk</strong><span>by ideas2it</span></div></div>
         <div className="profile-card"><div className="avatar">{profile.name.split(" ").map((part) => part[0]).slice(0, 2).join("")}</div><div><strong>{profile.name}</strong><span>{profile.employee_code} · {profile.role.replaceAll("_", " ")}</span></div></div>
-        <nav><button className="nav-active"><span>✦</span> Assistant</button><button onClick={() => { setSidePanel("requests"); void refreshRequests(); }}><span>◷</span> Requests</button>{canManageOnboarding && <button onClick={() => setSidePanel("onboarding")}><span>◇</span> Onboarding</button>}</nav>
+        <nav><button className="nav-active"><span>✦</span> Assistant</button>{!canManageParking && <button onClick={() => { setSidePanel("requests"); void refreshRequests(); }}><span>◷</span> Requests</button>}{canManageOnboarding && <button onClick={() => setSidePanel("onboarding")}><span>◇</span> Onboarding</button>}{canManageParking && <button onClick={() => { setSidePanel("parking"); void refreshParkingReservations(); }}><span>▦</span> Parking</button>}</nav>
         <div className="side-note"><span className="live-dot" />Connected to HR services</div>
         <button className="logout" onClick={logout}>Sign out</button>
       </aside>
 
       <section className="workspace">
-        <header><div><p className="eyebrow dark">IDEATOR HR HELP DESK</p><h2>How can PeopleDesk help today?</h2></div><div className="role-pill">{profile.role === "EMPLOYEE" ? "Employee self-service" : profile.role === "HR_ADMIN" ? "HR administration" : "Manager & HR workspace"}</div></header>
+        <header><div><p className="eyebrow dark">IDEATOR HR HELP DESK</p><h2>How can PeopleDesk help today?</h2></div><div className="role-pill">{profile.role === "EMPLOYEE" ? "Employee self-service" : profile.role === "HR_ADMIN" ? "HR administration" : profile.role === "PARKING_ADMIN" ? "Parking administration" : "Manager & HR workspace"}</div></header>
         <div className="content-grid">
           <section className="chat-panel">
             <div className="messages">
-              {messages.length === 0 && <div className="welcome"><div className="spark">✦</div><h3>Hello, {profile.name.split(" ")[0]}</h3><p>Ask PeopleDesk about HR policies, balances, leave requests, or workplace parking.{profile.role === "HR_ADMIN" ? " You can also review onboarding requests and activate employee accounts." : canCreateOnboarding ? " You can also onboard and track new Ideators." : ""} I’ll show sources and confirm before changing anything.</p><div className="suggestions">{suggestions.map((prompt) => <button key={prompt} onClick={() => void submitMessage(prompt)}>{prompt}<span>→</span></button>)}</div></div>}
+              {messages.length === 0 && <div className="welcome"><div className="spark">✦</div><h3>Hello, {profile.name.split(" ")[0]}</h3><p>Ask PeopleDesk about HR policies, balances, leave requests, or workplace parking.{profile.role === "HR_ADMIN" ? " You can also review onboarding requests and activate employee accounts." : canManageParking ? " You can monitor parking arrivals and confirm admin actions before anything changes." : canCreateOnboarding ? " You can also onboard and track new Ideators." : ""} I’ll show sources and confirm before changing anything.</p><div className="suggestions">{suggestions.map((prompt) => <button key={prompt} onClick={() => void submitMessage(prompt)}>{prompt}<span>→</span></button>)}</div></div>}
               {messages.map((message) => <article key={message.id} className={`message ${message.role}${message.intent?.includes("onboarding") ? " onboarding-message" : ""}`}><div className="message-label">{message.role === "assistant" ? "Ideator PeopleDesk" : "You"}{message.intent && <span>{message.intent.replaceAll("_", " ")}</span>}</div><p>{message.text}</p>{message.sources && message.sources.length > 0 && <div className="sources"><strong>Based on</strong>{groupedSourceLabels(message.sources).map((label) => <span key={label}>{label}</span>)}</div>}</article>)}
               {loading && <article className="message assistant typing"><span /><span /><span /></article>}
               <div ref={messageEnd} />
@@ -255,7 +300,16 @@ function App() {
             <p className="disclaimer">Responses are grounded in company policy. Confirm important decisions with HR.</p>
           </section>
 
-          {sidePanel === "onboarding" && canManageOnboarding ? (
+          {sidePanel === "parking" && canManageParking ? (
+            <aside className="request-panel parking-panel">
+              <div className="panel-heading"><div><p className="eyebrow dark">WORKPLACE OPS</p><h3>Parking queue</h3></div><button onClick={() => void refreshParkingReservations()} aria-label="Refresh parking">↻</button></div>
+              <div className="parking-content">
+                <label className="parking-date">Reservation date<input type="date" value={parkingDate} onChange={(event) => { setParkingDate(event.target.value); void refreshParkingReservations(token, event.target.value); }} /></label>
+                {parkingError && <p className="panel-error">{parkingError}</p>}
+                {parkingLoading ? <div className="empty-state compact"><p>Loading parking reservations…</p></div> : parkingReservations.length === 0 ? <div className="empty-state compact"><span>✓</span><p>No parking reservations for this date.</p></div> : <div className="parking-list">{parkingReservations.map((reservation) => <article key={reservation.id}><div className="parking-card-head"><strong>#{reservation.id} · {reservation.slot_code}</strong><span className={`status ${reservation.status.toLowerCase()}`}>{reservation.status.replaceAll("_", " ")}</span></div><p>{reservation.employee_name || reservation.employee_code || "Employee"} · {reservation.vehicle_registration || "Vehicle unavailable"}</p><small>{reservation.slot_location}</small><div className="parking-actions">{reservation.status === "RESERVED" && <><button onClick={() => void submitMessage(`Check in parking reservation #${reservation.id}`)}>Check in</button><button onClick={() => void submitMessage(`Mark parking reservation #${reservation.id} as no-show`)}>No-show</button><button className="reject" onClick={() => setInput(`Admin late cancel parking reservation #${reservation.id} because `)}>Cancel</button></>}{reservation.status === "CHECKED_IN" && <button onClick={() => void submitMessage(`Complete parking reservation #${reservation.id}`)}>Complete</button>}{reservation.status === "NO_SHOW" && <button onClick={() => setInput(`Override no-show for parking reservation #${reservation.id} because `)}>Correct</button>}</div></article>)}</div>}
+              </div>
+            </aside>
+          ) : sidePanel === "onboarding" && canManageOnboarding ? (
             <aside className="request-panel onboarding-panel">
               <div className="panel-heading"><div><p className="eyebrow dark">EMPLOYEE JOURNEY</p><h3>{profile.role === "HR_ADMIN" ? "Approval queue" : "Onboarding"}</h3></div><button onClick={() => profile.role === "HR_ADMIN" ? void refreshOnboardingApprovals() : onboardingQuery && void lookupOnboarding()} aria-label="Refresh onboarding">↻</button></div>
               <div className="onboarding-content">

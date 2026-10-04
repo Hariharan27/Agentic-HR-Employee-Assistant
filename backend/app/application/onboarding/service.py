@@ -1,6 +1,8 @@
 import re
 import secrets
 
+from datetime import datetime
+
 from app.application.onboarding.ports import OnboardingRepository
 from app.core.exceptions import AuthorizationError, ConflictError, NotFoundError, ValidationError
 from app.core.security import AuthenticatedUser, hash_password, require_role
@@ -152,8 +154,8 @@ class OnboardingService:
         normalized_comment = comment.strip() if comment and comment.strip() else None
         if normalized_comment and len(normalized_comment) > 1000:
             raise ValidationError("Review comment must be 1000 characters or fewer")
-        employee_code = f"EON{request.id:05d}"
-        username = employee_code.casefold()
+        employee_code = self.repository.next_employee_code()
+        username = employee_code
         temporary_password = secrets.token_urlsafe(12)
         activated = self.repository.activate_request(
             request_id,

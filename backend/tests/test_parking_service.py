@@ -5,7 +5,7 @@ from sqlalchemy import func, select
 
 from app.application.parking.service import ParkingService
 from app.core.config import Settings
-from app.core.exceptions import AuthorizationError, ConflictError, ParkingUnavailableError
+from app.core.exceptions import AuthorizationError, ConflictError, ParkingUnavailableError, ValidationError
 from app.core.security import AuthenticatedUser
 from app.infrastructure.database.models import (
     Employee,
@@ -184,3 +184,92 @@ def test_waitlist_requires_full_parking_and_prevents_duplicates(db_session):
     assert db_session.scalar(select(func.count()).select_from(ParkingWaitlistEntry)) == 1
     with pytest.raises(ConflictError, match="already on"):
         service.prepare_waitlist(employee, BOOKING_DATE)
+
+
+def test_parking_admin_can_check_in_complete_and_audit_arrival(db_session):
+    _, _, slots = _setup_parking(db_session, slot_count=1)
+    employee = _actor(db_session)
+    parking_admin = _actor(db_session, "parkingadmin")
+    reservation = _service(db_session).reserve_parking(employee, BOOKING_DATE, slots[0].id)
+    service = _service(db_session, now=datetime(2026, 10, 8, 4, 0, tzinfo=UTC))
+
+    with pytest.raises(AuthorizationError):
+        service.prepare_check_in(employee, reservation.id)
+
+    checked_in = service.stage_check_in(parking_admin, reservation.id)
+    completed = service.stage_completion(parking_admin, reservation.id)
+
+    assert checked_in.status.value == "CHECKED_IN"
+    assert completed.status.value == "COMPLETED"
+    events = db_session.scalars(
+        select(ParkingReservationEvent).order_by(ParkingReservationEvent.id)
+    ).all()
+    assert [event.to_status for event in events] == ["RESERVED", "CHECKED_IN", "COMPLETED"]
+
+
+def test_parking_admin_late_cancel_requires_reason(db_session):
+    _, _, slots = _setup_parking(db_session, slot_count=1)
+    employee = _actor(db_session)
+    parking_admin = _actor(db_session, "parkingadmin")
+    reservation = _service(db_session).reserve_parking(employee, BOOKING_DATE, slots[0].id)
+    service = _service(db_session, now=datetime(2026, 10, 7, 15, 30, tzinfo=UTC))
+
+    with pytest.raises(ValidationError, match="reason"):
+        service.prepare_admin_cancellation(parking_admin, reservation.id, "")
+
+    cancelled = service.stage_admin_cancellation(
+        parking_admin, reservation.id, "Employee called workplace team after cutoff"
+    )
+
+    assert cancelled.status.value == "CANCELLED"
+    assert db_session.scalars(
+        select(ParkingReservationEvent).order_by(ParkingReservationEvent.id)
+    ).all()[-1].reason == "Employee called workplace team after cutoff"
+
+
+def test_no_show_cutoff_override_and_suspension(db_session):
+    employee_vehicle, _, slots = _setup_parking(db_session, slot_count=3)
+    employee = _actor(db_session)
+    parking_admin = _actor(db_session, "parkingadmin")
+    today = date(2026, 10, 8)
+    db_session.add_all(
+        [
+            ParkingReservation(
+                employee_id=employee.employee_id,
+                vehicle_id=employee_vehicle.id,
+                slot_id=slots[index].id,
+                reservation_date=today.replace(day=6 + index),
+                status="NO_SHOW",
+            )
+            for index in range(2)
+        ]
+    )
+    reservation = ParkingReservation(
+        employee_id=employee.employee_id,
+        vehicle_id=employee_vehicle.id,
+        slot_id=slots[2].id,
+        reservation_date=today,
+        status="RESERVED",
+    )
+    db_session.add(reservation)
+    db_session.commit()
+
+    early = _service(db_session, now=datetime(2026, 10, 8, 5, 40, tzinfo=UTC))
+    with pytest.raises(ConflictError, match="before"):
+        early.prepare_no_show(parking_admin, reservation.id)
+
+    after_cutoff = _service(db_session, now=datetime(2026, 10, 8, 5, 46, tzinfo=UTC))
+    no_show = after_cutoff.stage_no_show(parking_admin, reservation.id)
+    assert no_show.status.value == "NO_SHOW"
+    suspension = after_cutoff.get_suspension(employee)
+    assert suspension.active is True
+    assert suspension.no_show_count == 3
+
+    with pytest.raises(ConflictError, match="suspended"):
+        after_cutoff.prepare_reservation(employee, date(2026, 10, 9))
+
+    corrected = after_cutoff.stage_no_show_override(
+        parking_admin, reservation.id, "Employee was present; scan missed"
+    )
+    assert corrected.status.value == "CANCELLED"
+    assert after_cutoff.get_suspension(employee).active is False

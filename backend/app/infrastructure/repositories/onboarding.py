@@ -32,6 +32,27 @@ class SQLAlchemyOnboardingRepository:
         statement = select(Employee.id).where(func.lower(Employee.email) == email.casefold()).limit(1)
         return self.db.scalar(statement) is not None
 
+    def next_employee_code(self) -> str:
+        year = datetime.now(UTC).strftime("%y")
+        prefix = f"I{year}"
+
+        employee_codes = self.db.scalars(
+            select(Employee.employee_code)
+            .where(Employee.employee_code.like(f"{prefix}%"))
+        ).all()
+
+        max_sequence = 0
+
+        for code in employee_codes:
+            sequence_part = code[len(prefix):]
+
+            if sequence_part.isdigit():
+                max_sequence = max(max_sequence, int(sequence_part))
+
+        next_sequence = max_sequence + 1
+
+        return f"{prefix}{next_sequence:03d}"
+
     def active_onboarding_email_exists(self, email: str) -> bool:
         statement = select(OnboardingRequest.id).where(
             func.lower(OnboardingRequest.email) == email.casefold(),

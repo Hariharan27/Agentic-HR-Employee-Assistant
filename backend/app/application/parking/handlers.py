@@ -22,6 +22,11 @@ class JoinParkingWaitlistArguments(BaseModel):
     requested_date: date
 
 
+class ParkingAdminActionArguments(BaseModel):
+    reservation_id: int = Field(gt=0)
+    reason: str | None = Field(default=None, max_length=1000)
+
+
 class ReserveParkingHandler:
     action_type = "reserve_parking"
 
@@ -75,3 +80,86 @@ class JoinParkingWaitlistHandler:
     def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
         validated = JoinParkingWaitlistArguments.model_validate(arguments)
         return self.parking_service.stage_join_waitlist(actor, validated.requested_date)
+
+
+class CheckInParkingHandler:
+    action_type = "check_in_parking"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return _admin_arguments(arguments, "parking check-in")
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = ParkingAdminActionArguments.model_validate(arguments)
+        return self.parking_service.stage_check_in(
+            actor, validated.reservation_id, validated.reason
+        )
+
+
+class AdminCancelParkingHandler:
+    action_type = "admin_cancel_parking"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return _admin_arguments(arguments, "administrator parking cancellation")
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = ParkingAdminActionArguments.model_validate(arguments)
+        return self.parking_service.stage_admin_cancellation(
+            actor, validated.reservation_id, validated.reason or ""
+        )
+
+
+class MarkParkingNoShowHandler:
+    action_type = "mark_parking_no_show"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return _admin_arguments(arguments, "parking no-show")
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = ParkingAdminActionArguments.model_validate(arguments)
+        return self.parking_service.stage_no_show(actor, validated.reservation_id)
+
+
+class OverrideParkingNoShowHandler:
+    action_type = "override_parking_no_show"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return _admin_arguments(arguments, "parking no-show correction")
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = ParkingAdminActionArguments.model_validate(arguments)
+        return self.parking_service.stage_no_show_override(
+            actor, validated.reservation_id, validated.reason or ""
+        )
+
+
+class CompleteParkingHandler:
+    action_type = "complete_parking"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return _admin_arguments(arguments, "parking completion")
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = ParkingAdminActionArguments.model_validate(arguments)
+        return self.parking_service.stage_completion(actor, validated.reservation_id)
+
+
+def _admin_arguments(arguments: dict[str, Any], action: str) -> dict[str, Any]:
+    try:
+        return ParkingAdminActionArguments.model_validate(arguments).model_dump(mode="json")
+    except PydanticValidationError as exc:
+        raise ValidationError(f"Invalid arguments for {action}") from exc

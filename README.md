@@ -4,12 +4,12 @@ Ideator PeopleDesk is an authenticated Agentic HR help desk for ideas2it employe
 questions from company policy documents and executes leave, onboarding, and workplace parking workflows against trusted employee data
 with deterministic rules, role-based authorization, human confirmation, and an auditable lifecycle.
 
-The assessment release completes the HR policy, leave, employee-onboarding, and employee parking
-workflows end to end. Parking Administrator attendance enforcement is the next phase.
+The assessment release completes the HR policy, leave, employee-onboarding, employee parking,
+and Parking Administrator attendance workflows end to end.
 
 ## What it demonstrates
 
-- Authenticated employee, manager, HR, and HR administrator experiences
+- Authenticated employee, manager, HR, HR administrator, and Parking Administrator experiences
 - LangGraph intent routing and multi-turn conversation state
 - Grounded policy RAG over 32 PDFs with document/page attribution
 - Dynamic leave balances, eligibility, working-day calculation, and request history
@@ -17,6 +17,7 @@ workflows end to end. Parking Administrator attendance enforcement is the next p
 - Manager/HR onboarding requests with independent HR administrator approval
 - Atomic employee account activation, default balances, and one-time temporary credentials
 - Database-backed parking availability, reservation, lookup, cancellation, and waitlist workflows
+- Parking Admin queue, check-in, late cancellation, no-show, completion, and override workflows
 - Explicit confirmation before every database mutation
 - Deterministic business rules and service-layer authorization outside the LLM
 - Cost-aware Amazon Bedrock Mantle model routing
@@ -61,8 +62,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
 | Safe actions | Expiring pending actions and explicit Confirm/Cancel step |
 | Manager workflow | Direct-report queue, approve/reject, balance update, audit history |
 | Onboarding workflow | Four provisioning tasks, HR Admin approval, account activation, employee login |
-| Parking workflow | Availability, confirmed reservation/cancellation, own bookings, and waitlist |
-| Quality evidence | 131 automated tests and 96 live golden scenarios |
+| Parking workflow | Availability, reservation/cancellation, waitlist, admin attendance, and three-strike suspension |
+| Quality evidence | 141 automated tests and 99 live golden scenarios |
 
 ## Quick start with Docker
 
@@ -156,6 +157,7 @@ or native provider function calls.
 | Employee leave | Balance, holidays, calculation, eligibility, apply, list, cancel |
 | Manager/HR | Approval queue, approve, reject, request audit history |
 | Employee parking | Vehicle, availability, reserve, list, cancel, and waitlist |
+| Parking Admin | Daily queue, check-in, late cancellation, no-show, completion, and override |
 | Confirmation | Propose, inspect, cancel, expire, and atomically execute pending actions |
 
 Every self-service operation derives employee identity from the JWT. Manager scope is derived from
@@ -200,6 +202,9 @@ document, page, section, and category.
 - `GET /api/v1/manager/leave-requests`
 - `POST /api/v1/manager/leave-requests/{id}/approve`
 - `POST /api/v1/manager/leave-requests/{id}/reject`
+- `GET /api/v1/parking/me/suspension`
+- `GET /api/v1/parking/reservations/{id}/history`
+- `GET /api/v1/parking-admin/reservations`
 
 All endpoints other than health and login require a bearer token.
 
@@ -226,7 +231,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Current deterministic result: **131 passed**.
+Current deterministic result: **141 passed**.
 
 Validate or run the live golden dataset:
 
@@ -237,7 +242,7 @@ cd backend
 ./evals/run_quality_gate.sh
 ```
 
-The dataset contains **96 scenarios** covering policy grounding, routing, leave rules,
+The dataset contains **99 scenarios** covering policy grounding, routing, leave rules,
 confirmations, manager, onboarding, and parking workflows, authorization, prompt injection, scope, and API
 safety. The release gate requires at least 95% overall pass rate and consistency, plus 100% for
 safety, API-safety, onboarding, and parking categories. Mutating cases are skipped unless
@@ -283,12 +288,12 @@ Completed:
 - Workplace parking persistence foundation: vehicles, slots, reservations, waitlist, lifecycle audit,
   concurrency constraints, configuration, and repeatable demo data
 - Employee parking chat workflow with confirmation-time revalidation and conversation context
+- Parking Admin queue, check-in, late cancellation with reason, no-show enforcement, completion,
+  no-show override, and three-strike suspension
 
 Future phases:
 
-- Parking Admin check-in, late cancellation, no-show enforcement, and suspension overrides
 - Production identity provider and managed secret storage
 - Production observability and deployment hardening
 
-The employee parking workflow is complete. Attendance and three-strike enforcement remain isolated
-to the Parking Administrator phase.
+The employee parking and Parking Administrator workflows are complete for the assessment scope.

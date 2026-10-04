@@ -29,12 +29,12 @@ from app.infrastructure.database.session import SessionLocal
 DEMO_USERS = (
     {
         "employee": {
-            "employee_code": "E1001",
-            "name": "Asha Rao",
-            "email": "asha@example.test",
+            "employee_code": "I26004",
+            "name": "Advik",
+            "email": "advik@example.test",
             "designation": "Software Engineer",
             "department": "Engineering",
-            "manager_name": "Karthik Iyer",
+            "manager_name": "Saanvika Sree",
             "location": "Chennai",
             "employment_type": "Permanent",
             "joining_date": date(2023, 1, 9),
@@ -45,9 +45,9 @@ DEMO_USERS = (
     },
     {
         "employee": {
-            "employee_code": "M1001",
-            "name": "Karthik Iyer",
-            "email": "karthik@example.test",
+            "employee_code": "I26003",
+            "name": "Saanvika Sree",
+            "email": "saanvika@example.test",
             "designation": "Engineering Manager",
             "department": "Engineering",
             "manager_name": None,
@@ -61,9 +61,9 @@ DEMO_USERS = (
     },
     {
         "employee": {
-            "employee_code": "H1001",
-            "name": "Meera Nair",
-            "email": "meera@example.test",
+            "employee_code": "I26002",
+            "name": "Hariharan",
+            "email": "hariharan@example.test",
             "designation": "HR Partner",
             "department": "People",
             "manager_name": None,
@@ -77,9 +77,9 @@ DEMO_USERS = (
     },
     {
         "employee": {
-            "employee_code": "H1002",
-            "name": "Nandhini Kumar",
-            "email": "nandhini@example.test",
+            "employee_code": "I26001",
+            "name": "Alaguselvi",
+            "email": "alaguselvi@example.test",
             "designation": "HR Administrator",
             "department": "People",
             "manager_name": None,
@@ -93,9 +93,9 @@ DEMO_USERS = (
     },
     {
         "employee": {
-            "employee_code": "P1001",
-            "name": "Arun Prakash",
-            "email": "arun.parking@example.test",
+            "employee_code": "I26005",
+            "name": "Dhaswanth",
+            "email": "dhaswanth@example.test",
             "designation": "Workplace Operations Administrator",
             "department": "Workplace Operations",
             "manager_name": None,
@@ -239,6 +239,8 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
 
         user = db.scalar(select(User).where(User.username == item["username"]))
         if user is None:
+            user = db.scalar(select(User).where(User.employee_id == employee.id))
+        if user is None:
             user = User(
                 username=item["username"],
                 password_hash=hash_password(item["password"]),
@@ -248,6 +250,7 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
             db.add(user)
             db.flush()
         elif reset_demo:
+            user.username = item["username"]
             user.password_hash = hash_password(item["password"])
             user.role = item["role"]
             user.employee_id = employee.id

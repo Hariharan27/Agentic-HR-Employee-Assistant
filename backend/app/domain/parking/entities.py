@@ -67,6 +67,16 @@ class ParkingReservationData:
     no_show_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    employee_code: str | None = None
+    employee_name: str | None = None
+    vehicle_registration: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ParkingSuspensionData:
+    active: bool
+    no_show_count: int
+    suspended_until: date | None = None
 
 
 @dataclass(frozen=True, slots=True)

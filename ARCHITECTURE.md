@@ -1,9 +1,8 @@
 # Ideator PeopleDesk — As-Built Technical Architecture
 
 This document describes the implementation currently present in the repository. The assessment
-release implements authenticated HR policy, leave, employee-onboarding, and employee-parking
-lifecycles end to end. Parking Administrator attendance and no-show enforcement remains the next
-phased extension.
+release implements authenticated HR policy, leave, employee-onboarding, employee-parking, and
+Parking Administrator attendance lifecycles end to end.
 
 ## 1. Architecture goals
 
@@ -185,6 +184,8 @@ Python code directly.
 | Parking availability | `ParkingService.check_availability` | PostgreSQL slots/reservations |
 | Reserve/cancel | Pending handlers + `ParkingService` | Confirmed atomic transaction |
 | Parking waitlist | Pending handler + `ParkingService` | PostgreSQL waitlist |
+| Parking Admin queue | `ParkingService.get_daily_reservations` | `PARKING_ADMIN` role |
+| Parking attendance | Pending handlers + `ParkingService` | Check-in, no-show, completion, override |
 
 This separation prevents the LLM from performing arithmetic, generating authoritative employee
 IDs, changing statuses, or constructing SQL.
@@ -353,12 +354,12 @@ docker compose exec -T backend python -m app.seed --reset-demo
 
 ## 16. Future extensions
 
-Employee onboarding now uses the same validated, confirmed, atomic workflow pattern as leave.
-Parking Phases 3A and 3B provide persistence, demo data, database allocation constraints, employee
-availability, confirmed reservation and cancellation, own-booking lookup, waitlisting, and safe
-cross-domain conversation context. Phase 3C will add Parking Admin check-in, late-cancellation,
-no-show enforcement, three-strike suspension, and overrides. New domains can reuse
-the existing pattern:
+Employee onboarding and parking now use the same validated, confirmed, atomic workflow pattern
+as leave. Parking Phases 3A through 3C provide persistence, demo data, database allocation
+constraints, employee availability, confirmed reservation and cancellation, own-booking lookup,
+waitlisting, safe cross-domain conversation context, Parking Admin check-in, late cancellation,
+no-show enforcement, three-strike suspension, and overrides. New domains can reuse the existing
+pattern:
 
 ```text
 validated route

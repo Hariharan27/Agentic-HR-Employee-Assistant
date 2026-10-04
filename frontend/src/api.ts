@@ -1,4 +1,4 @@
-import type { ChatResponse, LeaveRequest, OnboardingStatus, Profile } from "./types";
+import type { ChatResponse, LeaveRequest, OnboardingStatus, ParkingReservation, Profile } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
@@ -39,6 +39,13 @@ export const sendChat = (token: string, message: string, sessionId?: string) =>
 export const getLeaveRequests = (token: string, role: Profile["role"]) =>
   request<LeaveRequest[]>(
     role === "EMPLOYEE" ? "/api/v1/leave/requests" : "/api/v1/manager/leave-requests",
+    {},
+    token,
+  );
+
+export const getParkingAdminReservations = (token: string, reservationDate: string) =>
+  request<ParkingReservation[]>(
+    `/api/v1/parking-admin/reservations?reservation_date=${encodeURIComponent(reservationDate)}`,
     {},
     token,
   );

@@ -32,7 +32,9 @@ Return exactly one JSON object with these fields:
   leave_request_history, calculate_leave_days, holidays, start_onboarding, onboarding_status,
   onboarding_approvals, approve_onboarding, reject_onboarding, parking_vehicle,
   parking_availability, reserve_parking, parking_reservations, cancel_parking,
-  join_parking_waitlist, parking, or general
+  join_parking_waitlist, parking_admin_reservations, check_in_parking,
+  admin_cancel_parking, mark_parking_no_show, override_parking_no_show,
+  complete_parking, parking, or general
 - confidence: number from 0 to 1
 - leave_type: CASUAL, SICK, PRIVILEGE, or null
 - start_date: YYYY-MM-DD or null
@@ -75,6 +77,10 @@ asks whether parking is available, reserve_parking when they ask to book, parkin
 view their booking, cancel_parking to cancel it, and join_parking_waitlist for a full-day waitlist.
 Parking operations apply only to the authenticated employee. Extract parking_date only when the
 user explicitly supplies a date or relative date such as tomorrow.
+Parking Administrator requests to view all reservations, verify arrival, perform a late
+cancellation, mark a no-show, correct a no-show, or complete a visit use the dedicated administrator
+intents. Put an explicitly supplied parking reservation ID in request_id and an audit explanation
+in reason. Never infer an administrator action from an ordinary employee request.
 Return JSON only."""
 
 
@@ -256,6 +262,19 @@ class HRAssistantOrchestrator:
             )
         elif action_type == "join_parking_waitlist":
             response = f"You were added to the parking waitlist for {created.requested_date}."
+        elif action_type == "check_in_parking":
+            response = (
+                f"Parking reservation #{created.id} for {created.employee_name or created.employee_code} "
+                "was checked in successfully."
+            )
+        elif action_type == "admin_cancel_parking":
+            response = f"Parking reservation #{created.id} was cancelled by the Parking Administrator."
+        elif action_type == "mark_parking_no_show":
+            response = f"Parking reservation #{created.id} was marked as a no-show."
+        elif action_type == "override_parking_no_show":
+            response = f"The no-show on parking reservation #{created.id} was corrected successfully."
+        elif action_type == "complete_parking":
+            response = f"Parking reservation #{created.id} was marked completed."
         else:
             response = (
                 f"Your {created.leave_type.value.title()} leave request for "
@@ -275,7 +294,16 @@ class HRAssistantOrchestrator:
 
     @staticmethod
     def _action_domain(action_type: str) -> str:
-        if action_type in {"reserve_parking", "cancel_parking", "join_parking_waitlist"}:
+        if action_type in {
+            "reserve_parking",
+            "cancel_parking",
+            "join_parking_waitlist",
+            "check_in_parking",
+            "admin_cancel_parking",
+            "mark_parking_no_show",
+            "override_parking_no_show",
+            "complete_parking",
+        }:
             return "parking"
         return "onboarding" if action_type in {
             "create_onboarding", "approve_onboarding", "reject_onboarding"
@@ -742,6 +770,99 @@ class HRAssistantOrchestrator:
                 "parking_context": context,
             }
 
+        if route.intent == "parking_admin_reservations":
+            if requested_date is None:
+                return {
+                    "response": "Please provide the reservation date for the Parking Admin queue.",
+                    "active_domain": "parking",
+                    "parking_context": context,
+                }
+            reservations = self.parking.get_daily_reservations(self.actor, requested_date)
+            if not reservations:
+                return {
+                    "response": f"There are no parking reservations for {requested_date}.",
+                    "active_domain": "parking",
+                    "parking_context": context,
+                }
+            lines = [
+                f"#{item.id}: slot {item.slot.code} — "
+                f"{item.employee_name or item.employee_code or item.employee_id}, "
+                f"{item.vehicle_registration or 'vehicle unavailable'}, "
+                f"{item.status.value.replace('_', ' ').title()}"
+                for item in reservations
+            ]
+            return {
+                "response": f"Parking reservations for {requested_date}:\n" + "\n".join(lines),
+                "active_domain": "parking",
+                "parking_context": context,
+            }
+
+        admin_intents = {
+            "check_in_parking",
+            "admin_cancel_parking",
+            "mark_parking_no_show",
+            "override_parking_no_show",
+            "complete_parking",
+        }
+        if route.intent in admin_intents:
+            if route.request_id is None:
+                return {
+                    "response": "Please provide the parking reservation ID.",
+                    "active_domain": "parking",
+                    "parking_context": context,
+                }
+            if route.intent in {"admin_cancel_parking", "override_parking_no_show"} and not route.reason:
+                return {
+                    "response": "Please provide a reason for this Parking Administrator action.",
+                    "active_domain": "parking",
+                    "parking_context": context,
+                }
+            if route.intent == "check_in_parking":
+                reservation = self.parking.prepare_check_in(
+                    self.actor, route.request_id, route.reason
+                )
+                action_type = "check_in_parking"
+                summary = (
+                    f"Check in parking reservation #{reservation.id} for "
+                    f"{reservation.employee_name or reservation.employee_code} at slot {reservation.slot.code}"
+                )
+            elif route.intent == "admin_cancel_parking":
+                reservation = self.parking.prepare_admin_cancellation(
+                    self.actor, route.request_id, route.reason
+                )
+                action_type = "admin_cancel_parking"
+                summary = f"Cancel parking reservation #{reservation.id}: {route.reason}"
+            elif route.intent == "mark_parking_no_show":
+                reservation = self.parking.prepare_no_show(self.actor, route.request_id)
+                action_type = "mark_parking_no_show"
+                summary = (
+                    f"Mark parking reservation #{reservation.id} for "
+                    f"{reservation.employee_name or reservation.employee_code} as a no-show"
+                )
+            elif route.intent == "override_parking_no_show":
+                reservation = self.parking.prepare_no_show_override(
+                    self.actor, route.request_id, route.reason
+                )
+                action_type = "override_parking_no_show"
+                summary = f"Correct the no-show on parking reservation #{reservation.id}: {route.reason}"
+            else:
+                reservation = self.parking.prepare_completion(self.actor, route.request_id)
+                action_type = "complete_parking"
+                summary = f"Complete parking reservation #{reservation.id}"
+            action = self.pending.propose(
+                self.actor,
+                state["session_id"],
+                action_type,
+                {"reservation_id": reservation.id, "reason": route.reason},
+                summary,
+            )
+            return {
+                "response": f"{action.summary}. Reply yes to confirm or cancel.",
+                "active_domain": "parking",
+                "parking_context": context,
+                "pending_summary": action.summary,
+            }
+
         if route.intent == "parking_reservations":
             reservations = self.parking.get_my_reservations(self.actor)
             if requested_date is not None:
@@ -1049,8 +1170,20 @@ class HRAssistantOrchestrator:
             )
         )
         parking_signal = bool(
-            re.search(r"\b(parking|park|slot|waitlist|waiting\s+list|registered\s+vehicle)\b", normalized)
+            re.search(
+                r"\b(parking|park|slot|reservation|booking|waitlist|waiting\s+list|registered\s+vehicle)\b",
+                normalized,
+            )
         ) or decision.domain == "parking"
+        parking_id_match = re.search(
+            r"\b(?:parking\s+)?reservation(?:\s+id)?\s*#?\s*(\d+)\b", normalized
+        ) or re.search(
+            r"\b(?:check\s*in|no[ -]?show|complete|late\s+cancel)\D{0,16}(\d+)\b",
+            normalized,
+        )
+        parking_reservation_id = (
+            int(parking_id_match.group(1)) if parking_id_match else decision.request_id
+        )
         parking_date: date | None = None
         parking_iso_dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", message)
         if parking_iso_dates:
@@ -1066,7 +1199,27 @@ class HRAssistantOrchestrator:
 
         parking_intent: str | None = None
         if parking_signal:
-            if re.search(r"\b(cancel|withdraw)\b", normalized):
+            if re.search(r"\b(correct|reverse|override)\b", normalized) and re.search(
+                r"\bno[ -]?show\b", normalized
+            ):
+                parking_intent = "override_parking_no_show"
+            elif re.search(r"\b(check\s*in|checked\s*in|arrived|arrival)\b", normalized) and not re.search(
+                r"\b(queue|list|show|view)\b", normalized
+            ):
+                parking_intent = "check_in_parking"
+            elif re.search(r"\b(mark|record)\b", normalized) and re.search(
+                r"\bno[ -]?show\b", normalized
+            ):
+                parking_intent = "mark_parking_no_show"
+            elif re.search(r"\bcomplete(?:d)?\b", normalized):
+                parking_intent = "complete_parking"
+            elif re.search(r"\b(admin|administrator|late)\b", normalized) and re.search(
+                r"\b(cancel|cancellation)\b", normalized
+            ):
+                parking_intent = "admin_cancel_parking"
+            elif re.search(r"\b(arrival\s+queue|parking\s+admin\s+queue|all\s+parking\s+reservations|today(?:'s)?\s+parking)\b", normalized):
+                parking_intent = "parking_admin_reservations"
+            elif re.search(r"\b(cancel|withdraw)\b", normalized):
                 parking_intent = "cancel_parking"
             elif re.search(r"\b(waitlist|waiting\s+list|queue)\b", normalized):
                 parking_intent = "join_parking_waitlist"
@@ -1090,6 +1243,8 @@ class HRAssistantOrchestrator:
                 intent=parking_intent,
                 confidence=max(decision.confidence, 0.98),
                 parking_date=parking_date,
+                request_id=parking_reservation_id,
+                reason=explicit_reason or decision.reason,
                 leave_type=None,
                 start_date=None,
                 end_date=None,

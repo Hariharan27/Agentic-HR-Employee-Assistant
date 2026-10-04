@@ -16,6 +16,7 @@ from app.domain.parking.entities import (
     VehicleType,
 )
 from app.infrastructure.database.models import (
+    Employee,
     ParkingReservation,
     ParkingReservationEvent,
     ParkingSlot,
@@ -114,6 +115,30 @@ class SQLAlchemyParkingRepository:
         ).all()
         return [self._reservation_data(row) for row in rows]
 
+    def list_reservations_for_date(
+        self, requested_date: date
+    ) -> list[ParkingReservationData]:
+        rows = self.db.scalars(
+            select(ParkingReservation)
+            .where(ParkingReservation.reservation_date == requested_date)
+            .order_by(ParkingReservation.slot_id, ParkingReservation.id)
+        ).all()
+        return [self._reservation_data(row) for row in rows]
+
+    def list_no_show_reservations(
+        self, employee_id: int, since: date
+    ) -> list[ParkingReservationData]:
+        rows = self.db.scalars(
+            select(ParkingReservation)
+            .where(
+                ParkingReservation.employee_id == employee_id,
+                ParkingReservation.status == ParkingReservationStatus.NO_SHOW.value,
+                ParkingReservation.reservation_date >= since,
+            )
+            .order_by(ParkingReservation.reservation_date.desc())
+        ).all()
+        return [self._reservation_data(row) for row in rows]
+
     def add_reservation(
         self, employee_id: int, vehicle_id: int, slot_id: int, requested_date: date
     ) -> ParkingReservationData:
@@ -169,6 +194,27 @@ class SQLAlchemyParkingRepository:
             row.created_at,
         )
 
+    def list_reservation_events(
+        self, reservation_id: int
+    ) -> list[ParkingReservationEventData]:
+        rows = self.db.scalars(
+            select(ParkingReservationEvent)
+            .where(ParkingReservationEvent.reservation_id == reservation_id)
+            .order_by(ParkingReservationEvent.created_at, ParkingReservationEvent.id)
+        ).all()
+        return [
+            ParkingReservationEventData(
+                row.id,
+                row.reservation_id,
+                row.actor_user_id,
+                ParkingReservationStatus(row.from_status) if row.from_status else None,
+                ParkingReservationStatus(row.to_status),
+                row.reason,
+                row.created_at,
+            )
+            for row in rows
+        ]
+
     def get_waitlist_entry(
         self, employee_id: int, requested_date: date, *, for_update: bool = False
     ) -> ParkingWaitlistData | None:
@@ -215,7 +261,9 @@ class SQLAlchemyParkingRepository:
         slot = self.db.get(ParkingSlot, row.slot_id)
         if slot is None:
             raise NotFoundError("The parking slot for this reservation no longer exists")
-        return self._to_reservation(row, slot)
+        employee = self.db.get(Employee, row.employee_id)
+        vehicle = self.db.get(Vehicle, row.vehicle_id)
+        return self._to_reservation(row, slot, employee, vehicle)
 
     @staticmethod
     def _to_vehicle(row: Vehicle) -> VehicleData:
@@ -240,7 +288,11 @@ class SQLAlchemyParkingRepository:
 
     @classmethod
     def _to_reservation(
-        cls, row: ParkingReservation, slot: ParkingSlot
+        cls,
+        row: ParkingReservation,
+        slot: ParkingSlot,
+        employee: Employee | None = None,
+        vehicle: Vehicle | None = None,
     ) -> ParkingReservationData:
         return ParkingReservationData(
             row.id,
@@ -255,6 +307,9 @@ class SQLAlchemyParkingRepository:
             row.no_show_at,
             row.created_at,
             row.updated_at,
+            employee.employee_code if employee else None,
+            employee.name if employee else None,
+            vehicle.registration_number if vehicle else None,
         )
 
     @staticmethod

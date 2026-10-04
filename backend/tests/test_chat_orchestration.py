@@ -15,8 +15,13 @@ from app.application.onboarding.handler import (
 )
 from app.application.onboarding.service import OnboardingService
 from app.application.parking.handlers import (
+    AdminCancelParkingHandler,
     CancelParkingHandler,
+    CheckInParkingHandler,
+    CompleteParkingHandler,
     JoinParkingWaitlistHandler,
+    MarkParkingNoShowHandler,
+    OverrideParkingNoShowHandler,
     ReserveParkingHandler,
 )
 from app.application.parking.service import ParkingService
@@ -164,7 +169,7 @@ def test_route_decision_normalizes_domain_from_intent():
     assert decision.domain == "policy"
 
 
-def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
+def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, parking_now=None):
     current_actor = current_actor or actor(db_session)
     settings = settings or Settings()
     leave = LeaveService(SQLAlchemyLeaveRepository(db_session))
@@ -172,7 +177,7 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
     parking = ParkingService(
         SQLAlchemyParkingRepository(db_session),
         settings,
-        now=lambda: datetime(2026, 10, 5, 4, 30, tzinfo=UTC),
+        now=lambda: parking_now or datetime(2026, 10, 5, 4, 30, tzinfo=UTC),
     )
     pending = PendingActionCoordinator(
         SQLAlchemyPendingActionRepository(db_session),
@@ -187,6 +192,11 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None):
             "reserve_parking": ReserveParkingHandler(parking),
             "cancel_parking": CancelParkingHandler(parking),
             "join_parking_waitlist": JoinParkingWaitlistHandler(parking),
+            "check_in_parking": CheckInParkingHandler(parking),
+            "admin_cancel_parking": AdminCancelParkingHandler(parking),
+            "mark_parking_no_show": MarkParkingNoShowHandler(parking),
+            "override_parking_no_show": OverrideParkingNoShowHandler(parking),
+            "complete_parking": CompleteParkingHandler(parking),
         },
     )
     return HRAssistantOrchestrator(
@@ -393,6 +403,80 @@ def test_parking_confirmation_revalidates_slot_and_preserves_pending_action(db_s
             ParkingReservation.employee_id == employee.employee_id
         )
     ) is None
+
+
+def test_parking_admin_queue_is_read_only_chat_workflow(db_session):
+    employee_vehicle, _, slots = setup_parking(db_session)
+    employee = actor(db_session)
+    db_session.add(
+        ParkingReservation(
+            employee_id=employee.employee_id,
+            vehicle_id=employee_vehicle.id,
+            slot_id=slots[0].id,
+            reservation_date=date(2026, 10, 8),
+            status="RESERVED",
+        )
+    )
+    db_session.commit()
+    service = orchestrator(
+        db_session,
+        FakeLLM([route(domain="parking", intent="parking")]),
+        current_actor=actor(db_session, "parkingadmin"),
+        parking_now=datetime(2026, 10, 8, 4, 0, tzinfo=UTC),
+    )
+
+    result = service.chat("parking-admin-queue", "Show parking admin queue for 2026-10-08")
+
+    assert result.domain == "parking"
+    assert result.intent == "parking_admin_reservations"
+    assert "Parking reservations for 2026-10-08" in result.message
+    assert "TN01AA1001" in result.message
+    assert result.pending_action is None
+
+
+def test_parking_admin_check_in_requires_confirmation(db_session):
+    employee_vehicle, _, slots = setup_parking(db_session)
+    employee = actor(db_session)
+    reservation = ParkingReservation(
+        employee_id=employee.employee_id,
+        vehicle_id=employee_vehicle.id,
+        slot_id=slots[0].id,
+        reservation_date=date(2026, 10, 8),
+        status="RESERVED",
+    )
+    db_session.add(reservation)
+    db_session.commit()
+    service = orchestrator(
+        db_session,
+        FakeLLM([route(domain="parking", intent="parking")]),
+        current_actor=actor(db_session, "parkingadmin"),
+        parking_now=datetime(2026, 10, 8, 4, 0, tzinfo=UTC),
+    )
+
+    proposal = service.chat(
+        "parking-admin-check-in", f"Check in parking reservation #{reservation.id}"
+    )
+    assert "Reply yes to confirm" in proposal.message
+    assert proposal.pending_action is not None
+    assert db_session.get(ParkingReservation, reservation.id).status == "RESERVED"
+
+    confirmed = service.chat("parking-admin-check-in", "yes")
+
+    assert "checked in" in confirmed.message
+    assert db_session.get(ParkingReservation, reservation.id).status == "CHECKED_IN"
+
+
+def test_employee_cannot_use_parking_admin_chat_action(db_session):
+    setup_parking(db_session)
+    service = orchestrator(
+        db_session,
+        FakeLLM([route(domain="parking", intent="parking")]),
+        current_actor=actor(db_session, "employee"),
+        parking_now=datetime(2026, 10, 8, 4, 0, tzinfo=UTC),
+    )
+
+    with pytest.raises(AuthorizationError):
+        service.chat("parking-employee-admin-action", "Check in parking reservation #999")
 
 
 def test_configured_holiday_range_is_guarded_to_leave_tool(db_session):

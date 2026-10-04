@@ -15,8 +15,13 @@ from app.application.onboarding.handler import (
 )
 from app.application.onboarding.service import OnboardingService
 from app.application.parking.handlers import (
+    AdminCancelParkingHandler,
     CancelParkingHandler,
+    CheckInParkingHandler,
+    CompleteParkingHandler,
     JoinParkingWaitlistHandler,
+    MarkParkingNoShowHandler,
+    OverrideParkingNoShowHandler,
     ReserveParkingHandler,
 )
 from app.application.parking.service import ParkingService
@@ -91,6 +96,11 @@ def chat(
             "reserve_parking": ReserveParkingHandler(parking),
             "cancel_parking": CancelParkingHandler(parking),
             "join_parking_waitlist": JoinParkingWaitlistHandler(parking),
+            "check_in_parking": CheckInParkingHandler(parking),
+            "admin_cancel_parking": AdminCancelParkingHandler(parking),
+            "mark_parking_no_show": MarkParkingNoShowHandler(parking),
+            "override_parking_no_show": OverrideParkingNoShowHandler(parking),
+            "complete_parking": CompleteParkingHandler(parking),
         },
     )
     service = HRAssistantOrchestrator(
