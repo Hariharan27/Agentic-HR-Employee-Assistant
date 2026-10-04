@@ -107,6 +107,7 @@ def test_qdrant_replaces_document_and_returns_source_metadata():
     assert results[0].text == "six casual leave days"
     assert results[0].source["document"] == "Leave.pdf"
     assert results[0].source["page"] == 2
+    client.close()
 
 
 def test_policy_service_builds_grounded_context_with_sources():
@@ -155,3 +156,4 @@ def test_policy_service_expands_resignation_notice_question_for_retrieval():
 
     assert "not eligible to avail Casual Leave" in embeddings.query
     assert "Work from Home (WFH)" in embeddings.query
+    assert service.vector_store.search_arguments[1] == 6

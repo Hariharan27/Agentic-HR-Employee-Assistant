@@ -219,7 +219,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Current deterministic result: **84 passed**.
+Current deterministic result: **114 passed**.
 
 Validate or run the live golden dataset:
 
@@ -227,12 +227,14 @@ Validate or run the live golden dataset:
 cd backend
 .venv/bin/python evals/run_golden.py --dry-run
 .venv/bin/python evals/run_golden.py --fail-under 0.95
+./evals/run_quality_gate.sh
 ```
 
-The dataset contains **85 scenarios** covering policy grounding, routing, leave rules,
-confirmations, manager workflows, authorization, prompt injection, scope, and API safety. The latest
-complete live release gate scored **98.9%**, above the configured 95% threshold. Mutating cases are
-skipped unless `--include-mutating` is supplied and should run only against a reset demo database.
+The dataset contains **93 scenarios** covering policy grounding, routing, leave rules,
+confirmations, manager and onboarding workflows, authorization, prompt injection, scope, and API
+safety. The release gate requires at least 95% overall pass rate and consistency, plus 100% for
+safety, API-safety, and onboarding categories. Mutating cases are skipped unless
+`--include-mutating` is supplied and should run only against a reset demo database.
 
 Reports are generated as ignored JSON and HTML files under `backend/evals/reports/`.
 

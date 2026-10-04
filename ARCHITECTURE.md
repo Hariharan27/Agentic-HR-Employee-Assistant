@@ -1,8 +1,8 @@
 # Ideator PeopleDesk — As-Built Technical Architecture
 
-This document describes the implementation currently present in the repository. Onboarding and
-parking are intentionally listed only as future extensions; the assessment release implements the
-authenticated HR policy and leave lifecycle end to end.
+This document describes the implementation currently present in the repository. The assessment
+release implements authenticated HR policy, leave, and employee-onboarding lifecycles end to end;
+parking remains a future extension.
 
 ## 1. Architecture goals
 
@@ -305,12 +305,13 @@ The frontend renders server decisions; it is not an authorization boundary.
 
 ## 14. Quality strategy
 
-- **110 deterministic tests** cover authentication, security, leave rules, onboarding approval and
+- **114 deterministic tests** cover authentication, security, leave rules, onboarding approval and
   account activation, pending actions, manager lifecycle, RAG, orchestration, evaluation contracts,
   and repeatable demo seed.
 - **85 versioned golden scenarios** exercise the live API and configured models across policy,
   leave, safety, scope, manager workflow, and API safety categories.
-- The latest complete live release gate scored **98.9%**, above the configured 95% threshold.
+- The latest complete live release gate scored **98.7%** with **99.0% consistency**, above both
+  configured 95% thresholds; safety, API-safety, and onboarding categories passed at **100%**.
 - Hardened regression scenarios for greeting stability, policy injection, and missing dates passed
   at **100%** after deterministic guards were added.
 - The React production build is compiled with TypeScript before packaging.

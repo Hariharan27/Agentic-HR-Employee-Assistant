@@ -635,12 +635,27 @@ class HRAssistantOrchestrator:
         for field, value in fields.items():
             if value and HRAssistantOrchestrator._value_is_explicit(value, message):
                 context[field] = value.strip()
+        labelled_patterns = {
+            "name": r"(?:employee\s+)?name\s*:\s*([^,;\n]+)",
+            "designation": r"(?:designation|role)\s*:\s*([^,;\n]+)",
+            "department": r"department\s*:\s*([^,;\n]+)",
+            "reporting_manager": r"(?:reporting\s+manager|manager)\s*:\s*([^,;\n]+)",
+            "location": r"location\s*:\s*([^,;\n]+)",
+            "employment_type": r"employment\s+type\s*:\s*([^,;\n]+)",
+        }
+        for field, pattern in labelled_patterns.items():
+            match = re.search(pattern, message, re.I)
+            if match:
+                context[field] = match.group(1).strip()
         email_match = re.search(
             r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", message, re.I
         )
         if email_match:
             context["email"] = email_match.group(0).casefold()
-        if route.joining_date is not None and HRAssistantOrchestrator._contains_date_reference(message):
+        iso_date_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", message)
+        if iso_date_match:
+            context["joining_date"] = iso_date_match.group(0)
+        elif route.joining_date is not None and HRAssistantOrchestrator._contains_date_reference(message):
             context["joining_date"] = route.joining_date.isoformat()
         return context
 
@@ -759,6 +774,15 @@ class HRAssistantOrchestrator:
                 "carry forward", "carried forward", "encash", "entitlement", "approved leave",
                 "notice period", "resignation notice", "serving notice",
             )
+        )
+        holiday_list_signal = (
+            "holiday" in normalized
+            and (
+                "configured" in normalized
+                or bool(re.search(r"\b(list|show|which|what)\b", normalized))
+                or len(re.findall(r"\b\d{4}-\d{2}-\d{2}\b", message)) >= 2
+            )
+            and not bool(re.search(r"\b(count|policy|approved leave)\b", normalized))
         )
         unsupported_action_signal = any(
             phrase in normalized
@@ -886,6 +910,11 @@ class HRAssistantOrchestrator:
             updates.update(
                 domain="leave", intent="manager_leave_requests", confidence=max(decision.confidence, 0.98),
                 request_id=None, leave_type=None, start_date=None, end_date=None,
+            )
+        elif holiday_list_signal:
+            updates.update(
+                domain="leave", intent="holidays", confidence=max(decision.confidence, 0.98),
+                request_id=None, leave_type=None,
             )
         elif apply_signal:
             updates.update(domain="leave", intent="apply_leave", confidence=max(decision.confidence, 0.95))

@@ -156,6 +156,18 @@ def test_chat_routes_balance_to_deterministic_leave_service(db_session):
     assert llm.calls == [("router", True)]
 
 
+def test_configured_holiday_range_is_guarded_to_leave_tool(db_session):
+    llm = FakeLLM([route(domain="policy", intent="policy_question")])
+
+    result = orchestrator(db_session, llm).chat(
+        "holiday-range", "List configured holidays between 2026-10-01 and 2026-10-10"
+    )
+
+    assert result.domain == "leave"
+    assert result.intent == "holidays"
+    assert "2026-10-07" in result.message
+
+
 def test_general_capabilities_response_is_stable_and_uses_no_answer_model(db_session):
     llm = FakeLLM([route(domain="general", intent="general")])
 
@@ -282,6 +294,24 @@ def test_onboarding_does_not_accept_model_invented_fields(db_session):
     assert "email" in result.message
     assert db_session.scalars(select(OnboardingRequest)).all() == []
     assert db_session.scalars(select(PendingAction)).all() == []
+
+
+def test_labelled_onboarding_details_are_extracted_deterministically(db_session):
+    llm = FakeLLM([route(domain="onboarding", intent="start_onboarding")])
+
+    result = orchestrator(
+        db_session, llm, current_actor=actor(db_session, "manager")
+    ).chat(
+        "labelled-onboarding",
+        "Onboard a new employee. Name: Priya Raman; email: priya.raman@example.com; "
+        "designation: Backend Developer; department: Engineering; reporting manager: "
+        "Test Manager; joining date: 2026-10-15; location: Chennai; employment type: Permanent",
+    )
+
+    assert "New employee onboarding" in result.message
+    assert "Priya Raman" in result.message
+    assert "Reply yes to confirm" in result.message
+    assert result.pending_action is not None
 
 
 def test_employee_cannot_start_onboarding_through_chat(db_session):

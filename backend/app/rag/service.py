@@ -35,7 +35,7 @@ class PolicyKnowledgeService:
         query_vector = self.embeddings.embed_query(self._expand_query(normalized))
         matches = self.vector_store.search(
             query_vector,
-            top_k=self.top_k,
+            top_k=self._retrieval_limit(normalized),
             score_threshold=self.score_threshold,
         )
         if not matches:
@@ -55,6 +55,15 @@ class PolicyKnowledgeService:
             sources=[match.source for match in matches],
             matches=matches,
         )
+
+    def _retrieval_limit(self, question: str) -> int:
+        """Use a small targeted recall increase for clauses known to span nearby sections."""
+        if re.search(
+            r"\b(resignation\s+notice|serving\s+notice|notice\s+period)\b",
+            question.casefold(),
+        ):
+            return max(self.top_k, 6)
+        return self.top_k
 
     @staticmethod
     def _expand_query(question: str) -> str:
