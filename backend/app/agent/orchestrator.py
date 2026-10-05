@@ -220,6 +220,7 @@ class HRAssistantOrchestrator:
             "user_message": message.strip(),
             "messages": history,
             "active_domain": self._safe_domain(stored.get("active_domain")),
+            "previous_domain": self._safe_domain(stored.get("active_domain")),
             "leave_plan": self._safe_leave_plan(stored.get("leave_plan")),
             "onboarding_context": self._safe_onboarding_context(
                 stored.get("onboarding_context")
@@ -349,7 +350,6 @@ class HRAssistantOrchestrator:
                 "leave_plan": None,
                 "onboarding_context": {},
                 "parking_context": {},
-            "parking_plan": None,
                 "parking_plan": None,
             }
         try:
@@ -362,7 +362,6 @@ class HRAssistantOrchestrator:
                 "leave_plan": None,
                 "onboarding_context": {},
                 "parking_context": {},
-            "parking_plan": None,
                 "parking_plan": None,
             }
         except ApplicationError as exc:
@@ -694,8 +693,12 @@ class HRAssistantOrchestrator:
             require_role(self.actor, "MANAGER", "HR", "HR_ADMIN")
         else:
             require_role(self.actor, "MANAGER", "HR")
-        draft = dict(state.get("onboarding_context", {}))
         form = state.get("onboarding_form")
+        draft = dict(state.get("onboarding_context", {}))
+        if not form and state.get("previous_domain") != "onboarding":
+            # A new onboarding conversation starts clean: a half-filled draft from an earlier,
+            # abandoned onboarding must not leak another candidate's details into this one.
+            draft = {}
         if form:
             return self._handle_onboarding_form(state, draft, form)
         tools: OnboardingToolExecutor = self.onboarding_agent.tools  # type: ignore[assignment]

@@ -91,14 +91,18 @@ class OnboardingAgent(ToolAgent):
                 state = self.execute_inline(state, "list_onboarding_approvals", {})
             rendered = self.render_from_results(state)
             return {**state, "response": rendered} if rendered else None
-        if intent != "start_onboarding" or not results:
+        if intent != "start_onboarding":
             return None
         if any(item.get("tool") == "prepare_onboarding" for item in results):
             return None
-        last = results[-1]
-        if last.get("status") != "success":
+        if any(item.get("status") != "success" for item in results):
             return None
         draft = state.get("active_plan") or {}
+        if missing_fields(draft):
+            return {**state, "response": self.missing_details_reply(draft, results)}
+        if not results:
+            return None
+        last = results[-1]
         complete = last.get("tool") in {"update_onboarding_draft", "build_onboarding_plan"} and not missing_fields(draft)
         if last.get("tool") == "update_onboarding_draft":
             complete = complete and not last["result"].get("invalid") and not last["result"].get("not_stated_by_user")
@@ -114,6 +118,29 @@ class OnboardingAgent(ToolAgent):
         if prepared.get("response"):
             return prepared
         return {**prepared, "response": self.render_from_results(prepared)}
+
+    @staticmethod
+    def missing_details_reply(draft: dict[str, Any], results: list[dict[str, Any]]) -> str:
+        """Always ask for every missing detail by label and point at the form, whatever the model wrote."""
+        missing = missing_fields(draft)
+        parts: list[str] = []
+        last_update = next(
+            (item for item in reversed(results) if item.get("tool") == "update_onboarding_draft"), None
+        )
+        invalid = (last_update or {}).get("result", {}).get("invalid") or {}
+        if invalid:
+            parts.append("Please check: " + "; ".join(f"{key}: {value}" for key, value in invalid.items()) + ".")
+        if len(missing) > 1:
+            needed = ", ".join(missing[:-1]) + " and " + missing[-1]
+        else:
+            needed = missing[0]
+        parts.append(
+            f"Please provide the {needed}. You can type them here or fill in the onboarding form below."
+        )
+        have = [f"{LABELS[name]}: {draft[name]}" for name in FIELDS if draft.get(name)]
+        if have:
+            parts.append("So far I have " + "; ".join(have) + ".")
+        return " ".join(parts)
 
     @staticmethod
     def friendly_failure(tool: str, data: dict[str, Any]) -> str:

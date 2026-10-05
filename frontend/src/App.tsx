@@ -317,9 +317,7 @@ function App() {
   function shouldRenderOnboardingForm(message: ChatMessage) {
     return (
       message.role === "assistant" &&
-      (message.showOnboardingForm ||
-        message.intent === "start_onboarding" ||
-        message.text.toLowerCase().includes("onboarding form below"))
+      (message.showOnboardingForm ?? message.text.toLowerCase().includes("onboarding form below"))
     );
   }
 
@@ -362,9 +360,7 @@ function App() {
   function shouldRenderVehicleForm(message: ChatMessage) {
     return (
       message.role === "assistant" &&
-      (message.showVehicleForm ||
-        message.intent === "register_vehicle" ||
-        message.text.toLowerCase().includes("vehicle registration form below"))
+      (message.showVehicleForm ?? message.text.toLowerCase().includes("vehicle registration form below"))
     );
   }
 
@@ -392,6 +388,11 @@ function App() {
       const response = await sendChatStream(token, normalized, onStep, sessionId, onboardingPayload);
       setSessionId(response.session_id);
       const draft = response.onboarding_draft;
+      const onboardingCreated = /Onboarding request #\d+ for .+ was created/i.test(response.message);
+      if (onboardingCreated || (!draft && !onboardingPayload && response.domain === "onboarding" && response.intent === "start_onboarding")) {
+        // A finished or brand-new onboarding starts from an empty form, never the last candidate's values.
+        setOnboardingForm({ ...emptyOnboardingForm, reportingManager: reportingManagers[0]?.name || "" });
+      }
       if (draft) {
         // Details given in chat pre-fill the form; anything the user already typed in the form wins.
         setOnboardingForm((current) => ({
@@ -563,8 +564,10 @@ function App() {
               {messages.length === 0 && <div className="welcome"><img className="brand-logo welcome-logo" src="/ideas2it-logo.svg" alt="" /><h3>Hello, {profile.name.split(" ")[0]}</h3><p>Ask PeopleDesk about HR policies, balances, leave requests, or workplace parking.{profile.role === "HR_ADMIN" ? " You can also review onboarding requests and activate employee accounts." : canManageParking ? " You can monitor parking arrivals and confirm admin actions before anything changes." : canCreateOnboarding ? " You can also onboard and track new Ideators." : ""} I’ll show sources and confirm before changing anything.</p><div className="suggestions">{suggestions.map((prompt) => <button key={prompt} onClick={() => void submitMessage(prompt)}>{prompt}<span>→</span></button>)}</div></div>}
               {messages.map((message) => {
                 const lastAssistantId = [...messages].reverse().find((item) => item.role === "assistant")?.id;
-                const renderInlineOnboardingForm = canCreateOnboarding && shouldRenderOnboardingForm(message);
-                const renderInlineVehicleForm = profile.role === "EMPLOYEE" && shouldRenderVehicleForm(message);
+                // One live form: only under the latest reply, and never while a confirmation is waiting.
+                const formSlot = message.id === lastAssistantId && !pendingAction && !loading;
+                const renderInlineOnboardingForm = formSlot && canCreateOnboarding && shouldRenderOnboardingForm(message);
+                const renderInlineVehicleForm = formSlot && profile.role === "EMPLOYEE" && shouldRenderVehicleForm(message);
                 return <article key={message.id} className={`message ${message.role}${message.intent?.includes("onboarding") ? " onboarding-message" : ""}${renderInlineOnboardingForm || renderInlineVehicleForm ? " with-form" : ""}`}><div className="message-label">{message.role === "assistant" ? "PeopleDesk" : "You"}{message.intent && <span>{message.intent.replaceAll("_", " ")}</span>}</div>{message.kind === "denied" ? <div className="denied-card" role="alert"><strong>Not allowed for your role</strong><span>{message.text}</span><small>Checked from your sign-in before any AI step ran; nothing was changed.</small></div> : message.role === "assistant" ? <RichText text={message.text} /> : <p>{message.text}</p>}{pendingAction && message.role === "assistant" && message.id === lastAssistantId && <div className="inline-confirm"><button onClick={() => void submitMessage("cancel")} disabled={loading}>Cancel</button><button className="confirm" onClick={() => void submitMessage("yes")} disabled={loading}>Confirm</button></div>}{message.agentActivity && message.agentActivity.length > 0 && <details className="agent-activity" open><summary>Agent activity <span>{message.agentActivity.length}</span></summary><ul>{message.agentActivity.map((activity, index) => <li key={`${activity.tool}-${index}`} className={activity.status}><span aria-hidden="true">{activity.status === "success" ? "✓" : "!"}</span>{activity.label}</li>)}</ul></details>}{renderInlineOnboardingForm && renderOnboardingForm()}{renderInlineVehicleForm && renderVehicleForm()}{message.sources && message.sources.length > 0 && <div className="sources"><strong>Based on</strong>{groupedSourceLabels(message.sources).map((label) => <span key={label}>{label}</span>)}</div>}</article>;
               })}
               {loading && (liveSteps.length > 0

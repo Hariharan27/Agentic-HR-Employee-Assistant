@@ -2705,3 +2705,71 @@ def test_parking_questions_reach_the_parking_agent_after_a_registration(db_sessi
 
     assert board.intent in {"parking_availability", "parking"}
     assert "- B-21: free" in board.message, board.message
+
+
+ALL_ONBOARDING_LABELS = (
+    "employee name", "email", "designation", "department",
+    "reporting manager", "joining date", "location", "employment type",
+)
+
+
+def test_onboarding_asks_for_every_missing_detail_and_points_at_the_form(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([route(domain="onboarding", intent="start_onboarding")]),
+        current_actor=actor(db_session, "manager"),
+    )
+
+    reply = service.chat("onboarding-ask-all", "I need to onboard a new employee")
+
+    assert reply.intent == "start_onboarding"
+    assert reply.pending_action is None
+    assert reply.onboarding_draft is None
+    assert "onboarding form below" in reply.message
+    for label in ALL_ONBOARDING_LABELS:
+        assert label in reply.message
+
+
+def test_new_onboarding_after_a_confirmed_one_starts_from_a_clean_draft(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([complete_onboarding_route(), route(domain="onboarding", intent="start_onboarding")]),
+        current_actor=actor(db_session, "manager"),
+    )
+    service.chat("onboarding-again", complete_onboarding_message())
+    assert "pending HR administrator approval" in service.chat("onboarding-again", "yes").message
+
+    again = service.chat("onboarding-again", "Onboard another new employee")
+
+    assert again.pending_action is None
+    assert again.onboarding_draft is None
+    assert "Priya" not in again.message
+    for label in ALL_ONBOARDING_LABELS:
+        assert label in again.message
+
+
+def test_abandoned_onboarding_draft_does_not_leak_into_a_later_onboarding(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(
+                domain="onboarding",
+                intent="start_onboarding",
+                employee_name="Priya Raman",
+                designation="Backend Developer",
+            ),
+            route(domain="leave", intent="leave_balance"),
+            route(domain="onboarding", intent="start_onboarding"),
+        ]),
+        current_actor=actor(db_session, "manager"),
+    )
+    partial = service.chat("onboarding-abandoned", "Onboard Priya Raman as a Backend Developer")
+    assert partial.onboarding_draft and partial.onboarding_draft.get("name") == "Priya Raman"
+    assert "So far I have" in partial.message
+    service.chat("onboarding-abandoned", "What is my leave balance?")
+
+    fresh = service.chat("onboarding-abandoned", "I need to onboard a new employee")
+
+    assert fresh.onboarding_draft is None
+    assert "Priya" not in fresh.message
+    assert "employee name" in fresh.message

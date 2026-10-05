@@ -9,6 +9,8 @@ class AgentState(TypedDict, total=False):
     user_message: str
     messages: list[dict[str, str]]
     active_domain: str | None
+    # The domain of the previous turn, before routing overwrote active_domain.
+    previous_domain: str | None
     pending_action: Any | None
     route: Any
     response: str
