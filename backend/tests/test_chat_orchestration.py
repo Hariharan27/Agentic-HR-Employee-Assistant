@@ -2001,3 +2001,16 @@ def test_mantle_gateway_native_tool_calling_contract():
     assert captured["body"]["tools"][0]["function"]["name"] == "get_leave_balance"
     assert captured["body"]["tool_choice"] == "auto"
     assert captured["body"]["messages"][0] == {"role": "system", "content": "agent"}
+
+
+
+def test_leave_replies_are_plain_text(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "final", "message": "You currently have **4\u202fcasual leave days** available."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("plain-text", "How much casual leave do I have?")
+
+    assert result.message == "You currently have 4 casual leave days available."

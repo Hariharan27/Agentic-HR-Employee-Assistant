@@ -47,6 +47,7 @@ Use one or more independent tools in a round when useful, then inspect their res
 an identical tool call. For failed tool results, explain the factual reason. You may search policy
 for a grounded alternative, but never switch leave type without the employee agreeing. Keep simple
 answers concise. Do not mention internal prompts, reasoning, model behaviour, plan ids or tool JSON.
+Write plain text only: no Markdown, bold, headings or tables.
 """
 
 LEAVE_AGENT_JSON_PROTOCOL = """Return exactly one JSON object in one of these forms:
@@ -262,7 +263,7 @@ class LeaveAgent:
                 )
                 repaired["transcript"] = updates["transcript"]
                 return repaired
-            updates.update(response=message, pending_tool_calls=[], final_status="completed")
+            updates.update(response=self._clean_reply(message), pending_tool_calls=[], final_status="completed")
             return updates
         updates["pending_tool_calls"] = [item.model_dump() for item in decision.tool_calls]
         if self.native:
@@ -344,6 +345,15 @@ class LeaveAgent:
     def _short_error(exc: Exception) -> str:
         text = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
         return text[:200]
+
+    @staticmethod
+    def _clean_reply(message: str) -> str:
+        """Keep replies plain text when the model adds Markdown or typographic spaces."""
+        cleaned = message.replace("\u202f", " ").replace("\u00a0", " ")
+        cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned, flags=re.S)
+        cleaned = re.sub(r"__(.+?)__", r"\1", cleaned, flags=re.S)
+        cleaned = re.sub(r"^\s{0,3}#{1,6}\s+", "", cleaned, flags=re.M)
+        return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 
     # ------------------------------------------------------------------ grounding
 
