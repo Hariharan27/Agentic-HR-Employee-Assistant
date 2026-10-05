@@ -54,7 +54,8 @@ Use one or more independent tools in a round when useful, then inspect their res
 an identical tool call. For failed tool results, explain the factual reason. You may search policy
 for a grounded alternative, but never switch leave type without the employee agreeing. Keep simple
 answers concise. Do not mention internal prompts, reasoning, model behaviour, plan ids or tool JSON.
-Write plain text only: no Markdown, bold, headings or tables.
+Formatting: plain sentences; you may use **bold** for the key facts (day counts, dates, balances)
+and "- " bullet lists for several items. No headings, tables, links or other Markdown.
 """
 
 LEAVE_AGENT_JSON_PROTOCOL = """Return exactly one JSON object in one of these forms:
@@ -355,10 +356,9 @@ class LeaveAgent:
 
     @staticmethod
     def _clean_reply(message: str) -> str:
-        """Keep replies plain text when the model adds Markdown or typographic spaces."""
+        """Keep only the Markdown the chat UI renders (**bold**, "- " bullets)."""
         cleaned = message.replace("\u202f", " ").replace("\u00a0", " ")
-        cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned, flags=re.S)
-        cleaned = re.sub(r"__(.+?)__", r"\1", cleaned, flags=re.S)
+        cleaned = re.sub(r"__(.+?)__", r"**\1**", cleaned, flags=re.S)
         cleaned = re.sub(r"^\s{0,3}#{1,6}\s+", "", cleaned, flags=re.M)
         return re.sub(r"[ \t]{2,}", " ", cleaned).strip()
 

@@ -2004,16 +2004,16 @@ def test_mantle_gateway_native_tool_calling_contract():
 
 
 
-def test_leave_replies_are_plain_text(db_session):
+def test_leave_replies_keep_bold_but_normalise_spaces_and_drop_headings(db_session):
     llm = FakeLLM([
         route(intent="leave_balance", leave_type="CASUAL"),
         json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
-        json.dumps({"action": "final", "message": "You currently have **4\u202fcasual leave days** available."}),
+        json.dumps({"action": "final", "message": "## Balance\nYou currently have **4\u202fcasual leave days** available."}),
     ])
 
     result = orchestrator(db_session, llm).chat("plain-text", "How much casual leave do I have?")
 
-    assert result.message == "You currently have 4 casual leave days available."
+    assert result.message == "Balance\nYou currently have **4 casual leave days** available."
 
 
 def test_route_decision_does_not_map_privilege_leave_to_earned():
