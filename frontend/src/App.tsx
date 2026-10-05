@@ -437,9 +437,13 @@ function App() {
           const wantsUpdate = /\b(update|edit|change)\b/i.test(normalized);
           const target = named || (wantsUpdate && vehicles.length === 1 ? vehicles[0] : undefined);
           const mentionsBike = /\b(bike|motorcycle|motorbike|scooter|two[- ]wheeler)\b/i.test(normalized);
-          setVehicleForm(target
+          // A registration number typed in chat (e.g. "TN84P2145, Zeta") pre-fills the new-vehicle form.
+          const plate = normalized.match(/\b([A-Z]{2})[\s-]?(\d{1,2})[\s-]?([A-Z]{0,3})[\s-]?(\d{3,4})\b/i);
+          setVehicleForm((current) => target
             ? { registrationNumber: target.registration_number, vehicleType: target.vehicle_type, makeModel: target.make_model || "" }
-            : { ...emptyVehicleForm, vehicleType: mentionsBike ? "MOTORCYCLE" : "CAR" });
+            : plate
+              ? { ...current, registrationNumber: plate.slice(1).join("").toUpperCase(), vehicleType: mentionsBike ? "MOTORCYCLE" : current.vehicleType }
+              : { ...emptyVehicleForm, vehicleType: mentionsBike ? "MOTORCYCLE" : "CAR" });
         }).catch(() => setMyVehicles([]));
       }
       if (response.domain === "onboarding") {

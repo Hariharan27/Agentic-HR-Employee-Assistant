@@ -530,7 +530,13 @@ class HRAssistantOrchestrator:
         decision = self._apply_routing_guards(
             decision, state["user_message"], date.fromisoformat(today)
         )
-        if (
+        if state.get("active_domain") == "parking" and self._is_vehicle_registration_follow_up(
+            state["user_message"], state.get("parking_context") or {}, decision
+        ):
+            decision = decision.model_copy(
+                update={"domain": "parking", "intent": "register_vehicle", "confidence": 0.99}
+            )
+        elif (
             state.get("active_domain") == "onboarding"
             and state.get("onboarding_context")
             and decision.domain == "general"
@@ -770,6 +776,8 @@ class HRAssistantOrchestrator:
     def _handle_parking(self, state: AgentState) -> AgentState:
         route: RouteDecision = state["route"]
         context = dict(state.get("parking_context", {}))
+        # The "register one?" offer only applies to the very next message.
+        context.pop("offer", None)
 
         if route.intent in self.PARKING_AGENT_INTENTS and context.get("mode") != "register_vehicle":
             tools: ParkingToolExecutor = self.parking_agent.tools  # type: ignore[assignment]
@@ -782,6 +790,14 @@ class HRAssistantOrchestrator:
                 llm_calls=state.get("llm_calls", 0),
                 intent=route.intent,
             )
+            if not result.get("pending_summary") and self._claims_vehicle_registered(result["response"]):
+                # Only the confirmed register_vehicle action can save a vehicle; never let a model
+                # reply claim it did. Send the user to the real registration flow instead.
+                redirected = route.model_copy(update={"intent": "register_vehicle"})
+                return {
+                    **self._handle_parking({**state, "route": redirected, "parking_context": context}),
+                    "route": redirected,
+                }
             return {
                 "response": result["response"],
                 "active_domain": "parking",
@@ -912,6 +928,8 @@ class HRAssistantOrchestrator:
                 ]
                 heading = "Your registered vehicle:" if len(vehicles) == 1 else "Your registered vehicles:"
                 response = heading + "\n" + "\n".join(lines) + f"\n\nYou can register up to {self.parking.MAX_VEHICLES}."
+            if len(vehicles) < self.parking.MAX_VEHICLES:
+                context["offer"] = "register_vehicle"
             return {
                 "response": response,
                 "active_domain": "parking",
@@ -1173,7 +1191,54 @@ class HRAssistantOrchestrator:
             match = re.search(pattern, message, re.I)
             if match:
                 context[field] = match.group(1).strip()
+        if not context.get("registration_number"):
+            plate = HRAssistantOrchestrator.PLATE_PATTERN.search(message)
+            if plate:
+                context["registration_number"] = "".join(plate.groups()).upper()
+        if not context.get("vehicle_type"):
+            if re.search(r"\b(bike|motorcycle|motorbike|scooter|two[- ]wheeler)\b", message, re.I):
+                context["vehicle_type"] = "motorcycle"
+            elif re.search(r"\bcar\b", message, re.I):
+                context["vehicle_type"] = "car"
         return context
+
+    PLATE_PATTERN = re.compile(r"\b([A-Z]{2})[\s-]?(\d{1,2})[\s-]?([A-Z]{0,3})[\s-]?(\d{3,4})\b", re.I)
+    _AFFIRMATIVE = re.compile(r"^\s*(yes|yeah|yep|ya|ok(ay)?|sure|please|go ahead|do it)\b", re.I)
+    _REGISTER_IT = re.compile(
+        r"\b(register|add)\s+(it|one|that|this|another|a\s+(new\s+)?one|mine|my\s+(new\s+)?(one|bike|car))\b", re.I
+    )
+    _BOOKING_WORDS = re.compile(r"\b(book|reserve|slot|slots|availability|available|cancel|waitlist|tomorrow|today)\b", re.I)
+
+    @classmethod
+    def _is_vehicle_registration_follow_up(
+        cls, message: str, context: dict[str, str], decision: RouteDecision
+    ) -> bool:
+        """Short follow-ups that only make sense as vehicle registration while in the parking domain."""
+        if decision.domain not in {"parking", "general"} or decision.intent in {"remove_vehicle", "register_vehicle"}:
+            return False
+        if context.get("offer") == "register_vehicle" and (
+            cls._AFFIRMATIVE.search(message) or re.search(r"\b(register|add)\b", message, re.I)
+        ):
+            return True
+        if cls._REGISTER_IT.search(message):
+            return True
+        if (
+            context.get("mode") == "register_vehicle"
+            and decision.intent in {"parking", "parking_vehicle", "general"}
+            and not cls._BOOKING_WORDS.search(message)
+        ):
+            return True  # still collecting registration details ("it is a car")
+        # A bare registration number (e.g. "TN84P2145, Zeta") with no booking words is a registration.
+        return bool(cls.PLATE_PATTERN.search(message)) and not cls._BOOKING_WORDS.search(message)
+
+    @staticmethod
+    def _claims_vehicle_registered(reply: str) -> bool:
+        return bool(re.search(
+            r"\b(has|have) been (successfully )?(registered|added|saved)\b"
+            r"|\b(is|was) now registered\b|\bsuccessfully registered\b|\bregistered (it|your vehicle)\b",
+            reply,
+            re.I,
+        ))
 
     @staticmethod
     def _handle_unsupported_domain(state: AgentState) -> AgentState:

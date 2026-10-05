@@ -2773,3 +2773,40 @@ def test_abandoned_onboarding_draft_does_not_leak_into_a_later_onboarding(db_ses
     assert fresh.onboarding_draft is None
     assert "Priya" not in fresh.message
     assert "employee name" in fresh.message
+
+
+def test_yes_after_an_empty_vehicle_list_starts_the_real_registration_flow(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(domain="parking", intent="parking_vehicle"),
+            route(domain="parking", intent="parking"),
+            route(domain="general", intent="general"),
+            route(domain="general", intent="general"),
+        ]),
+        current_actor=actor(db_session),
+    )
+    listed = service.chat("vehicle-offer", "can you get my vehicle list")
+    assert "do not have a registered vehicle" in listed.message
+
+    offer = service.chat("vehicle-offer", "yes please register it")
+    assert offer.intent == "register_vehicle"
+    assert "vehicle registration form below" in offer.message
+    assert offer.pending_action is None
+
+    details = service.chat("vehicle-offer", "TN84P2145 and the make is 2022 and then model Zeta")
+    assert details.pending_action is None
+    assert "registration number: TN84P2145" in details.message
+    assert "vehicle registration form below" in details.message
+
+    proposal = service.chat("vehicle-offer", "it is a car")
+    assert proposal.pending_action and "TN84P2145" in proposal.pending_action
+    assert service.parking.list_vehicles(service.actor) == []  # nothing saved before Confirm
+
+
+def test_model_replies_claiming_a_vehicle_was_registered_are_detected():
+    claims = HRAssistantOrchestrator._claims_vehicle_registered
+    assert claims("Your vehicle TN84P2145 (2022 Zeta) has been registered. You can now use it.")
+    assert claims("I've successfully registered your vehicle.")
+    assert not claims("You do not have a registered vehicle yet.")
+    assert not claims("Your registered vehicle: TN01AR1001, car")
