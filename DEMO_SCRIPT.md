@@ -239,17 +239,22 @@ explicitly after account activation.
    What is my registered vehicle?
    ```
 
-10. Check availability using the date chosen before the demo:
+10. Check availability using the date chosen before the demo. PeopleDesk lists all five slots
+    (B-21 to B-24 regular, B-25 accessible, offered last) with free or taken for that date:
 
    ```text
    Is parking available on <PARKING_DATE>?
    ```
 
-11. Reserve it:
+11. Choose a slot yourself; the assistant never picks one for you:
 
    ```text
-   Reserve parking on <PARKING_DATE>
+   B-22 please
    ```
+
+   Optional: show a multi-day booking with one slot, e.g. `Reserve B-23 from Monday to Wednesday`.
+   Any day where B-23 is taken is called out with the free slots, and you choose another slot or
+   the waitlist for that day before one confirmation books every day.
 
 12. Click **Confirm** and record `<PARKING_RESERVATION_ID>`.
 13. Ask:

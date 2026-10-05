@@ -26,6 +26,7 @@ from app.application.parking.handlers import (
     OverrideParkingNoShowHandler,
     RegisterVehicleHandler,
     ReserveParkingHandler,
+    ReserveParkingPlanHandler,
 )
 from app.application.parking.service import ParkingService
 from app.application.pending.handlers import (
@@ -82,6 +83,15 @@ class FakeLLM:
 
     def complete(self, tier, *, system, user, json_mode=False):
         self.calls.append((tier, json_mode))
+        if "tool-calling Parking Agent" in system:
+            if self.responses:
+                try:
+                    candidate = json.loads(self.responses[0])
+                except (TypeError, ValueError):
+                    candidate = {}
+                if candidate.get("action") in {"tool", "final"}:
+                    return self.responses.pop(0)
+            return self._simulated_parking_response(user)
         if "tool-calling Onboarding Agent" in system:
             if self.responses:
                 try:
@@ -251,6 +261,70 @@ class FakeLLM:
                 return json.dumps({"action": "final", "message": "Please provide a reason."})
             return self._tool("prepare_leave_rejection", request_id=arguments["request_id"], reason=reason)
         return json.dumps({"action": "final", "message": "Please clarify the Leave request."})
+
+    def _simulated_parking_response(self, prompt: str) -> str:
+        """Simulate a well-behaved Parking Agent: list slots, let the user choose, then prepare."""
+        from app.agent.parking_agent import ParkingAgent
+
+        results = []
+        marker = "Tool results so far:\n"
+        if marker in prompt:
+            try:
+                results = json.loads(prompt.split(marker, 1)[1])
+            except ValueError:
+                results = []
+        today_match = re.search(r"Current date: (\d{4}-\d{2}-\d{2})", prompt)
+        today = date.fromisoformat(today_match.group(1)) if today_match else date.today()
+        message = (re.search(r"Current user message: (.*)\n\nAvailable tools:", prompt, re.S) or [None, ""])[1].strip()
+        plan_match = re.search(r"Current parking dates or plan: (.*)\n", prompt)
+        try:
+            active = json.loads(plan_match.group(1)) if plan_match else None
+        except ValueError:
+            active = None
+        history = (re.search(r"Recent conversation:\n(.*)\nCurrent user message:", prompt, re.S) or [None, ""])[1]
+        earlier_user = [line[len("user: "):] for line in history.splitlines() if line.startswith("user: ")]
+        final = lambda text: json.dumps({"action": "final", "message": text})  # noqa: E731
+        normalized = message.casefold()
+        slot_match = re.search(r"\b([a-z]-?\d{2})\b", normalized)
+        slot = slot_match.group(1).upper() if slot_match else None
+        if slot and "-" not in slot:
+            slot = slot[0] + "-" + slot[1:]
+        wants_waitlist = bool(re.search(r"\b(wait\s*list|waiting list)\b", normalized))
+        cancelling = bool(re.search(r"\bcancel\b", normalized))
+        date_text = message if self._has_dates(message, today) else next(
+            (item for item in reversed(earlier_user) if self._has_dates(item, today)), None
+        )
+        if results:
+            latest = results[-1]
+            data = latest.get("result", {})
+            if latest.get("status") == "error":
+                return final(data.get("error", "The parking step failed."))
+            tool = latest.get("tool")
+            if tool == "resolve_dates":
+                dates = [item["date"] for item in data.get("dates", [])]
+                if not dates:
+                    return final("Please provide the parking date.")
+                if cancelling:
+                    return self._tool("prepare_parking_cancellation", date=dates[0])
+                if slot or wants_waitlist:
+                    return self._tool("build_parking_plan", slot=slot or "waitlist", dates=dates)
+                return self._tool("list_parking_slots", dates=dates)
+            if tool == "list_parking_slots":
+                return final(ParkingAgent.board_text(data))
+            if tool == "build_parking_plan":
+                if data.get("eligible"):
+                    return self._tool("prepare_parking", plan_id=data["plan_id"])
+                return final(data["summary"])
+            return final("Done.")
+        if not (slot or wants_waitlist or cancelling or re.search(r"\b(book|reserve|park|parking|slot)", normalized)):
+            return final("Please clarify the parking request.")
+        if date_text and self._has_dates(message, today):
+            return self._tool("resolve_dates", text=date_text)
+        if (slot or wants_waitlist) and active and active.get("dates"):
+            return self._tool("build_parking_plan", slot=slot or "waitlist")
+        if date_text:
+            return self._tool("resolve_dates", text=date_text)
+        return final("Please provide the parking date.")
 
     def _simulated_onboarding_response(self, prompt: str) -> str:
         """Simulate a well-behaved Onboarding Agent model over the onboarding tools."""
@@ -535,6 +609,7 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, par
             "reject_onboarding": RejectOnboardingHandler(onboarding),
             "register_vehicle": RegisterVehicleHandler(parking),
             "reserve_parking": ReserveParkingHandler(parking),
+            "reserve_parking_plan": ReserveParkingPlanHandler(parking),
             "cancel_parking": CancelParkingHandler(parking),
             "join_parking_waitlist": JoinParkingWaitlistHandler(parking),
             "check_in_parking": CheckInParkingHandler(parking),
@@ -576,21 +651,24 @@ def test_parking_reservation_requires_confirmation_and_reuses_single_chat(db_ses
                 intent="reserve_parking",
                 parking_date="2026-10-08",
             ),
+            route(domain="general", intent="general"),
             route(domain="leave", intent="leave_balance", leave_type="CASUAL"),
         ]
     )
     service = orchestrator(db_session, llm)
 
-    proposal = service.chat("parking-book", "Book parking on 2026-10-08")
+    listing = service.chat("parking-book", "Book parking on 2026-10-08")
+    assert "B-21: free" in listing.message and "B-22: free" in listing.message
+    assert listing.pending_action is None
+
+    proposal = service.chat("parking-book", "B-22 please")
 
     assert proposal.domain == "parking"
-    assert proposal.intent == "reserve_parking"
-    assert "Slot B-21 is available" in proposal.message
-    assert proposal.pending_action is not None
+    assert "slot B-22" in proposal.pending_action
     assert db_session.scalars(select(ParkingReservation)).all() == []
 
     confirmed = service.chat("parking-book", "yes")
-    assert "slot B-21 is reserved" in confirmed.message
+    assert "slot B-22 reserved" in confirmed.message
     assert len(db_session.scalars(select(ParkingReservation)).all()) == 1
 
     balance = service.chat("parking-book", "How many casual leaves do I have?")
@@ -654,7 +732,7 @@ def test_parking_booking_can_be_found_and_cancelled_with_confirmation(db_session
             ]
         ),
     )
-    service.chat("parking-lifecycle", "Reserve parking on 2026-10-08")
+    service.chat("parking-lifecycle", "Reserve B-21 on 2026-10-08")
     service.chat("parking-lifecycle", "yes")
 
     lookup = service.chat("parking-lifecycle", "Show my parking booking for 2026-10-08")
@@ -688,17 +766,19 @@ def test_full_parking_offers_confirmed_waitlist(db_session):
                     domain="parking",
                     intent="parking_availability",
                     parking_date="2026-10-08",
-                )
+                ),
+                route(domain="parking", intent="join_parking_waitlist"),
             ]
         ),
     )
 
-    proposal = service.chat("parking-full", "Can I get parking on 2026-10-08?")
-    assert "All regular parking slots are reserved" in proposal.message
+    listing = service.chat("parking-full", "Can I get parking on 2026-10-08?")
+    assert "B-21: taken" in listing.message
+    proposal = service.chat("parking-full", "Please add me to the waitlist")
     assert "waitlist" in proposal.pending_action
 
     confirmed = service.chat("parking-full", "yes")
-    assert "added to the parking waitlist" in confirmed.message
+    assert "added to the waitlist" in confirmed.message
 
 
 def test_parking_date_is_kept_for_follow_up_request(db_session):
@@ -721,7 +801,7 @@ def test_parking_date_is_kept_for_follow_up_request(db_session):
     assert "do not have" in first.message
     follow_up = service.chat("parking-context", "Book parking for that day")
     assert "2026-10-08" in follow_up.message
-    assert follow_up.pending_action is not None
+    assert follow_up.pending_action is None  # the employee chooses the slot next
 
 
 def test_parking_guard_does_not_allow_model_to_invent_date():
@@ -756,7 +836,7 @@ def test_parking_confirmation_revalidates_slot_and_preserves_pending_action(db_s
             ]
         ),
     )
-    service.chat("parking-revalidate", "Reserve parking on 2026-10-08")
+    service.chat("parking-revalidate", "Reserve B-21 on 2026-10-08")
     db_session.add(
         ParkingReservation(
             employee_id=manager.employee_id,
@@ -768,7 +848,7 @@ def test_parking_confirmation_revalidates_slot_and_preserves_pending_action(db_s
     )
     db_session.commit()
 
-    with pytest.raises(ParkingUnavailableError, match="no longer available"):
+    with pytest.raises(ConflictError, match="availability changed"):
         service.chat("parking-revalidate", "yes")
 
     assert db_session.scalar(
@@ -1964,7 +2044,7 @@ def test_authenticated_chat_endpoint_wires_parking_workflow(client, db_session):
         response = client.post(
             "/api/v1/chat",
             headers={"Authorization": f"Bearer {token}"},
-            json={"message": "Reserve parking on 2026-10-08"},
+            json={"message": "Reserve B-21 on 2026-10-08"},
         )
     finally:
         app.dependency_overrides.pop(get_llm_gateway, None)
@@ -2336,3 +2416,83 @@ def test_chat_endpoint_accepts_a_structured_onboarding_form(client, db_session):
     body = response.json()
     assert body["domain"] == "onboarding" and body["pending_action"]
     assert body["onboarding_draft"]["joining_date"] == "2099-01-15"
+
+
+
+def five_slots(db_session):
+    """B-21..B-24 regular plus B-25 accessible, as in the demo seed."""
+    employee_vehicle, manager_vehicle, slots = setup_parking(db_session, slots=4)
+    accessible = ParkingSlot(code="B-25", location="Chennai HQ", slot_type="ACCESSIBLE", active=True)
+    db_session.add(accessible)
+    db_session.commit()
+    return employee_vehicle, manager_vehicle, [*slots, accessible]
+
+
+def test_availability_lists_all_five_slots_with_accessible_last(db_session):
+    _, manager_vehicle, slots = five_slots(db_session)
+    db_session.add(ParkingReservation(employee_id=actor(db_session, "manager").employee_id, vehicle_id=manager_vehicle.id,
+                                      slot_id=slots[1].id, reservation_date=date(2026, 10, 8), status="RESERVED"))
+    db_session.commit()
+    llm = FakeLLM([route(domain="parking", intent="parking_availability", parking_date="2026-10-08")])
+
+    listing = orchestrator(db_session, llm).chat("five-slots", "Which parking slots are available on 2026-10-08?")
+
+    lines = [line for line in listing.message.splitlines() if line.startswith("- B-")]
+    assert lines == ["- B-21: free", "- B-22: taken", "- B-23: free", "- B-24: free", "- B-25 (accessible): free"]
+    assert listing.pending_action is None
+
+
+def test_one_slot_for_several_days_asks_about_days_where_it_is_taken(db_session):
+    _, manager_vehicle, slots = five_slots(db_session)
+    db_session.add(ParkingReservation(employee_id=actor(db_session, "manager").employee_id, vehicle_id=manager_vehicle.id,
+                                      slot_id=slots[1].id, reservation_date=date(2026, 10, 13), status="RESERVED"))
+    db_session.commit()
+    service = orchestrator(db_session, FakeLLM([
+        route(domain="parking", intent="reserve_parking"),
+        route(domain="general", intent="general"),
+    ]))
+    plan_dates = ["2026-10-12", "2026-10-13", "2026-10-14"]
+
+    taken = service.chat("multi-day", "Reserve B-22 from 12 Oct to 14 Oct")
+    assert "2026-10-13: slot B-22 is taken; free slots: B-21, B-23, B-24, B-25" in taken.message
+    assert taken.pending_action is None
+
+    service.llm.responses.extend([
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_parking_plan", "arguments": {
+            "slot": "B-22", "dates": plan_dates, "alternatives": {"2026-10-13": "B-23"}}}]}),
+    ])
+    proposal = service.chat("multi-day", "use B-23 on the 13th, B-22 otherwise")
+    assert "2026-10-12 (Mon): slot B-22" in proposal.pending_action
+    assert "2026-10-13 (Tue): slot B-23" in proposal.pending_action
+    assert "2026-10-14 (Wed): slot B-22" in proposal.pending_action
+
+    confirmed = service.chat("multi-day", "yes")
+    booked = sorted((item.reservation_date.isoformat(), item.slot_id) for item in db_session.scalars(
+        select(ParkingReservation).where(ParkingReservation.employee_id == actor(db_session).employee_id)))
+    assert [day for day, _ in booked] == plan_dates
+    assert "Parking booked" in confirmed.message
+
+
+def test_the_agent_cannot_choose_a_slot_the_employee_did_not_name(db_session):
+    five_slots(db_session)
+    service = orchestrator(db_session, FakeLLM([]))
+    tools = service.parking_agent.tools
+    tools.turn_text = "book parking tomorrow"
+
+    execution = tools.execute(
+        "build_parking_plan", {"slot": "B-21", "dates": ["2026-10-06"]}, session_id="s", active_plan=None
+    )
+
+    assert execution.ok is False
+    assert "must choose the slot themselves" in execution.data["error"]
+
+
+def test_waitlist_is_refused_while_slots_are_free(db_session):
+    five_slots(db_session)
+    parking = ParkingService(SQLAlchemyParkingRepository(db_session), Settings(),
+                             now=lambda: datetime(2026, 10, 5, 4, 30, tzinfo=UTC))
+
+    plan = parking.build_parking_plan(actor(db_session), [date(2026, 10, 8)], "waitlist")
+
+    assert not plan.eligible
+    assert "are free, so the waitlist is not needed" in plan.problems[0]

@@ -20,5 +20,6 @@ class AgentState(TypedDict, total=False):
     leave_plan: dict[str, Any] | None
     onboarding_context: dict[str, str]
     parking_context: dict[str, str]
+    parking_plan: dict[str, Any] | None
     onboarding_form: dict[str, str] | None
     sensitive_response: bool

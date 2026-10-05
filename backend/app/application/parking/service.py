@@ -1,4 +1,6 @@
 from collections.abc import Callable
+from dataclasses import replace
+from uuid import uuid4
 from datetime import UTC, date, datetime, time, timedelta
 import re
 from zoneinfo import ZoneInfo
@@ -15,6 +17,7 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.core.security import AuthenticatedUser, require_role
+from app.domain.parking.plan import ParkingPlan, ParkingPlanLine, parking_plan_ttl
 from app.domain.parking.entities import (
     ParkingAvailability,
     ParkingReservationData,
@@ -216,6 +219,150 @@ class ParkingService:
         if waiting is not None:
             self.repository.update_waitlist_status(waiting.id, ParkingWaitlistStatus.ALLOCATED)
         return created
+
+    MAX_PLAN_DAYS = 14
+
+    def slot_board(self, actor: AuthenticatedUser, dates: list[date] | tuple[date, ...]) -> dict[str, object]:
+        """All active slots with their status on each date (who holds a slot is never shown)."""
+        requested = sorted(set(dates))
+        if not requested:
+            raise ValidationError("Please provide the parking date.")
+        if len(requested) > self.MAX_PLAN_DAYS:
+            raise ValidationError(f"Parking can be planned for at most {self.MAX_PLAN_DAYS} days at once")
+        slots = self.repository.list_active_slots()
+        days = []
+        for day in requested:
+            entry: dict[str, object] = {"date": day.isoformat(), "weekday": day.strftime("%A")}
+            try:
+                self._validate_booking_date(day)
+            except ValidationError as exc:
+                entry["unavailable_reason"] = str(exc)
+            own = self.repository.get_active_reservation(actor.employee_id, day)
+            if own is not None:
+                entry["your_reservation"] = own.slot.code
+            if self.repository.get_waitlist_entry(actor.employee_id, day) is not None:
+                entry["you_are_waitlisted"] = True
+            taken = self.repository.list_taken_slot_ids(day)
+            entry["slots"] = [
+                {
+                    "slot": slot.code,
+                    "type": slot.slot_type.value,
+                    "location": slot.location,
+                    "status": "taken" if slot.id in taken else "free",
+                }
+                for slot in slots
+            ]
+            entry["free_slots"] = [slot.code for slot in slots if slot.id not in taken]
+            days.append(entry)
+        suspension = self.get_suspension(actor)
+        return {
+            "days": days,
+            "note": "Accessible slots are offered after the regular slots are taken, or when asked for.",
+            **({"suspended_until": suspension.suspended_until.isoformat()} if suspension.active else {}),
+        }
+
+    def build_parking_plan(
+        self,
+        actor: AuthenticatedUser,
+        dates: list[date] | tuple[date, ...],
+        slot_code: str,
+        alternatives: dict[date, str] | None = None,
+    ) -> ParkingPlan:
+        """One chosen slot for every date; taken dates need an agreed alternative slot or the waitlist."""
+        requested = tuple(sorted(set(dates)))
+        if not requested:
+            raise ValidationError("Please provide the parking date.")
+        if len(requested) > self.MAX_PLAN_DAYS:
+            raise ValidationError(f"Parking can be planned for at most {self.MAX_PLAN_DAYS} days at once")
+        slots = {slot.code.upper(): slot for slot in self.repository.list_active_slots()}
+        waitlist_only = slot_code.strip().upper() == "WAITLIST"
+        chosen = None if waitlist_only else slots.get(slot_code.strip().upper())
+        if chosen is None and not waitlist_only:
+            raise ValidationError(f"There is no parking slot {slot_code}. Slots: {', '.join(sorted(slots))}")
+        alternatives = {day: code.strip().upper() for day, code in (alternatives or {}).items()}
+        if waitlist_only:
+            alternatives = {day: "WAITLIST" for day in requested}
+        vehicle = self.get_vehicle(actor)
+        problems: list[str] = []
+        lines: list[ParkingPlanLine] = []
+        choices: list[tuple[date, tuple[str, ...]]] = []
+        try:
+            self._validate_booking_eligibility(actor)
+        except ConflictError as exc:
+            problems.append(str(exc))
+        for day in requested:
+            try:
+                self._validate_booking_date(day)
+            except ValidationError as exc:
+                problems.append(f"{day.isoformat()}: {exc}")
+                continue
+            own = self.repository.get_active_reservation(actor.employee_id, day)
+            if own is not None:
+                lines.append(ParkingPlanLine(day, "already_reserved", own.slot.code, own.slot.id))
+                continue
+            if self.repository.get_waitlist_entry(actor.employee_id, day) is not None:
+                lines.append(ParkingPlanLine(day, "already_waitlisted"))
+                continue
+            taken = self.repository.list_taken_slot_ids(day)
+            free = tuple(code for code, slot in slots.items() if slot.id not in taken)
+            wanted = alternatives.get(day, chosen.code.upper() if chosen else "WAITLIST")
+            if wanted == "WAITLIST":
+                if free:
+                    problems.append(f"{day.isoformat()}: slots {', '.join(free)} are free, so the waitlist is not needed")
+                else:
+                    lines.append(ParkingPlanLine(day, "waitlist"))
+                continue
+            slot = slots.get(wanted)
+            if slot is None:
+                problems.append(f"{day.isoformat()}: there is no parking slot {wanted}")
+            elif slot.id in taken:
+                choices.append((day, free))
+                problems.append(
+                    f"{day.isoformat()}: slot {slot.code} is taken; "
+                    + (f"free slots: {', '.join(free)}" if free else "all slots are taken, so only the waitlist is possible")
+                )
+            else:
+                lines.append(ParkingPlanLine(day, "reserve", slot.code, slot.id))
+        plan = ParkingPlan(
+            slot_code=chosen.code if chosen else "WAITLIST",
+            dates=requested,
+            alternatives=tuple(sorted(alternatives.items())),
+            lines=tuple(lines),
+            problems=tuple(problems),
+            choices=tuple(choices),
+            vehicle=vehicle.registration_number,
+        )
+        return replace(
+            plan,
+            plan_id=f"pp_{uuid4().hex[:10]}",
+            expires_at=self.now() + parking_plan_ttl(),
+            fingerprint=plan.compute_fingerprint(),
+        )
+
+    def stage_parking_plan(
+        self,
+        actor: AuthenticatedUser,
+        dates: list[date] | tuple[date, ...],
+        slot_code: str,
+        alternatives: dict[date, str] | None,
+        expected_fingerprint: str,
+    ) -> list[object]:
+        """Rebuild the confirmed plan, require it unchanged, then reserve or waitlist each date."""
+        plan = self.build_parking_plan(actor, dates, slot_code, alternatives)
+        if plan.fingerprint != expected_fingerprint:
+            raise ConflictError(
+                "Parking availability changed since this confirmation was prepared. "
+                "Cancel it and check the slots again"
+            )
+        if not plan.eligible:
+            raise ValidationError("; ".join(plan.problems) or "The parking plan has nothing to book")
+        results: list[object] = []
+        for line in plan.actionable:
+            if line.action == "reserve":
+                results.append(self.stage_reservation(actor, line.day, line.slot_id))
+            else:
+                results.append(self.stage_join_waitlist(actor, line.day))
+        return results
 
     def prepare_cancellation(
         self, actor: AuthenticatedUser, requested_date: date

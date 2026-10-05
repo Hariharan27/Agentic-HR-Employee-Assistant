@@ -1,6 +1,6 @@
 from datetime import UTC, date, datetime
 
-from sqlalchemy import exists, select
+from sqlalchemy import case, exists, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import NotFoundError
@@ -71,13 +71,27 @@ class SQLAlchemyParkingRepository:
         self.db.flush()
         return self._to_vehicle(row)
 
+    @staticmethod
+    def _slot_order():
+        # Regular slots first; accessible slots are offered last.
+        return (case((ParkingSlot.slot_type == ParkingSlotType.ACCESSIBLE.value, 1), else_=0), ParkingSlot.code)
+
     def list_active_slots(self) -> list[ParkingSlotData]:
         rows = self.db.scalars(
             select(ParkingSlot)
             .where(ParkingSlot.active.is_(True))
-            .order_by(ParkingSlot.code)
+            .order_by(*self._slot_order())
         ).all()
         return [self._to_slot(row) for row in rows]
+
+    def list_taken_slot_ids(self, requested_date: date) -> set[int]:
+        statement = select(ParkingReservation.slot_id).where(
+            ParkingReservation.reservation_date == requested_date,
+            ParkingReservation.status.in_(
+                (ParkingReservationStatus.RESERVED.value, ParkingReservationStatus.CHECKED_IN.value)
+            ),
+        )
+        return set(self.db.scalars(statement).all())
 
     def list_available_slots(
         self, requested_date: date, *, for_update: bool = False
@@ -96,10 +110,9 @@ class SQLAlchemyParkingRepository:
             select(ParkingSlot)
             .where(
                 ParkingSlot.active.is_(True),
-                ParkingSlot.slot_type == ParkingSlotType.REGULAR.value,
                 ~occupied,
             )
-            .order_by(ParkingSlot.code)
+            .order_by(*self._slot_order())
         )
         if for_update:
             statement = statement.with_for_update(skip_locked=True)

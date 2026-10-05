@@ -277,6 +277,18 @@ typed tools (`app/agent/onboarding_tools.py`):
 - Department reply emails (`POST /api/v1/inbound/email`) require the `X-Inbound-Token` shared
   secret (`INBOUND_EMAIL_TOKEN`).
 
+### Parking Agent
+
+Employee booking conversations (availability, reserve, cancel, waitlist) run on the shared loop
+with `app/agent/parking_tools.py`: `resolve_dates`, `get_vehicle`, `list_parking_slots` (every
+active slot with free/taken per date; regular slots first, accessible B-25 last),
+`build_parking_plan` (one chosen slot for one or more dates; dates where it is taken return the
+free alternatives, and the employee picks another slot or the waitlist), `prepare_parking`
+(pending `reserve_parking_plan`, rebuilt and fingerprint-checked at confirmation) and
+`prepare_parking_cancellation`. A slot code or "waitlist" is accepted only when the employee wrote
+it, so the assistant never chooses a slot. Vehicle registration, the reservation list and Parking
+Admin actions keep their deterministic handlers.
+
 ## 9. Policy RAG
 
 ### Ingestion

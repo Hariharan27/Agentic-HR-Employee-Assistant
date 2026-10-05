@@ -74,6 +74,34 @@ class ReserveParkingHandler:
         )
 
 
+class ReserveParkingPlanArguments(BaseModel):
+    dates: list[date] = Field(min_length=1, max_length=14)
+    slot_code: str = Field(min_length=1, max_length=20)
+    alternatives: dict[date, str] = Field(default_factory=dict)
+    fingerprint: str = Field(min_length=8, max_length=64)
+
+
+class ReserveParkingPlanHandler:
+    """Confirm a parking plan: rebuild it, require it unchanged, reserve or waitlist each date."""
+
+    action_type = "reserve_parking_plan"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return ReserveParkingPlanArguments.model_validate(arguments).model_dump(mode="json")
+        except PydanticValidationError as exc:
+            raise ValidationError("Invalid arguments for parking reservation") from exc
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = ReserveParkingPlanArguments.model_validate(arguments)
+        return self.parking_service.stage_parking_plan(
+            actor, validated.dates, validated.slot_code, validated.alternatives, validated.fingerprint
+        )
+
+
 class CancelParkingHandler:
     action_type = "cancel_parking"
 

@@ -11,6 +11,8 @@ from pydantic import ValidationError as PydanticValidationError
 from app.agent.leave_agent import LeaveAgent
 from app.agent.onboarding_agent import OnboardingAgent
 from app.agent.onboarding_tools import OnboardingToolExecutor
+from app.agent.parking_agent import ParkingAgent
+from app.agent.parking_tools import ParkingToolExecutor
 from app.agent.leave_tools import LeaveToolExecutor
 from app.agent.state import AgentState
 from app.application.leave.service import LeaveService
@@ -149,6 +151,13 @@ class HRAssistantOrchestrator:
             llm=llm,
             tools=OnboardingToolExecutor(actor=actor, onboarding=onboarding, pending=pending),
         )
+        self.parking_agent = ParkingAgent(
+            settings=settings,
+            llm=llm,
+            tools=ParkingToolExecutor(
+                actor=actor, parking=parking, pending=pending, today=lambda: parking._local_now().date()
+            ),
+        )
         self.graph = self._build_graph()
 
     def chat(
@@ -169,6 +178,7 @@ class HRAssistantOrchestrator:
                 stored.get("onboarding_context")
             ),
             "parking_context": self._safe_parking_context(stored.get("parking_context")),
+            "parking_plan": self._safe_parking_plan(stored.get("parking_plan")),
             "onboarding_form": self._safe_onboarding_form(onboarding_form),
             "sources": [],
             "agent_activity": [],
@@ -195,6 +205,7 @@ class HRAssistantOrchestrator:
                 "leave_plan": result.get("leave_plan"),
                 "onboarding_context": result.get("onboarding_context", {}),
                 "parking_context": result.get("parking_context", state.get("parking_context", {})),
+                "parking_plan": result.get("parking_plan", state.get("parking_plan")),
             },
         )
         route = result.get("route")
@@ -270,6 +281,8 @@ class HRAssistantOrchestrator:
                 "leave_plan": None,
                 "onboarding_context": {},
                 "parking_context": {},
+            "parking_plan": None,
+                "parking_plan": None,
             }
         try:
             created = self.pending.confirm(self.actor, state["session_id"])
@@ -281,6 +294,8 @@ class HRAssistantOrchestrator:
                 "leave_plan": None,
                 "onboarding_context": {},
                 "parking_context": {},
+            "parking_plan": None,
+                "parking_plan": None,
             }
         except ApplicationError as exc:
             if action.action_type not in {
@@ -352,6 +367,14 @@ class HRAssistantOrchestrator:
                 f"Your parking reservation #{created.id} for {created.reservation_date} "
                 "was cancelled successfully."
             )
+        elif action_type == "reserve_parking_plan":
+            lines = []
+            for item in created:
+                if hasattr(item, "slot"):
+                    lines.append(f"{item.reservation_date}: slot {item.slot.code} reserved (reservation #{item.id})")
+                else:
+                    lines.append(f"{item.requested_date}: added to the waitlist")
+            response = "Parking booked:\n" + "\n".join(f"- {line}" for line in lines)
         elif action_type == "join_parking_waitlist":
             response = f"You were added to the parking waitlist for {created.requested_date}."
         elif action_type == "check_in_parking":
@@ -380,6 +403,7 @@ class HRAssistantOrchestrator:
             "leave_plan": None,
             "onboarding_context": {},
             "parking_context": {},
+            "parking_plan": None,
         }
         if action_type == "approve_onboarding":
             result["sensitive_response"] = True
@@ -390,6 +414,7 @@ class HRAssistantOrchestrator:
         if action_type in {
             "register_vehicle",
             "reserve_parking",
+            "reserve_parking_plan",
             "cancel_parking",
             "join_parking_waitlist",
             "check_in_parking",
@@ -440,12 +465,12 @@ class HRAssistantOrchestrator:
             )
         elif (
             state.get("active_domain") == "parking"
-            and state.get("parking_context")
+            and (state.get("parking_context") or state.get("parking_plan"))
             and decision.domain == "general"
         ):
             parking_intent = (
                 "register_vehicle"
-                if state["parking_context"].get("mode") == "register_vehicle"
+                if (state.get("parking_context") or {}).get("mode") == "register_vehicle"
                 else "parking"
             )
             decision = decision.model_copy(
@@ -635,9 +660,33 @@ class HRAssistantOrchestrator:
         normalized_message = " ".join(re.sub(r"[^\w]+", " ", message.casefold()).split())
         return bool(normalized_value) and normalized_value in normalized_message
 
+    PARKING_AGENT_INTENTS = {
+        "parking_availability", "reserve_parking", "cancel_parking", "join_parking_waitlist", "parking",
+    }
+
     def _handle_parking(self, state: AgentState) -> AgentState:
         route: RouteDecision = state["route"]
         context = dict(state.get("parking_context", {}))
+
+        if route.intent in self.PARKING_AGENT_INTENTS and context.get("mode") != "register_vehicle":
+            tools: ParkingToolExecutor = self.parking_agent.tools  # type: ignore[assignment]
+            tools.turn_text = state["user_message"]
+            result = self.parking_agent.invoke(
+                session_id=state["session_id"],
+                user_message=state["user_message"],
+                conversation=state.get("messages", []),
+                active_plan=state.get("parking_plan"),
+                llm_calls=state.get("llm_calls", 0),
+            )
+            return {
+                "response": result["response"],
+                "active_domain": "parking",
+                "parking_context": context,
+                "parking_plan": result.get("active_plan"),
+                "pending_summary": result.get("pending_summary"),
+                "agent_activity": result.get("agent_activity", []),
+                "llm_calls": result.get("llm_calls", state.get("llm_calls", 0)),
+            }
 
         if route.intent == "register_vehicle":
             context = self._merge_vehicle_context(
@@ -1453,6 +1502,22 @@ class HRAssistantOrchestrator:
             for key, item in value.items()
             if key in allowed and isinstance(item, str) and item.strip()
         }
+
+    @staticmethod
+    def _safe_parking_plan(value: object) -> dict[str, object] | None:
+        """Keep remembered parking dates and an unexpired parking plan."""
+        if not isinstance(value, dict) or not isinstance(value.get("dates"), list):
+            return None
+        try:
+            [date.fromisoformat(str(item)) for item in value["dates"]]
+            if value.get("expires_at"):
+                expires = datetime.fromisoformat(str(value["expires_at"]))
+                now = datetime.now(expires.tzinfo) if expires.tzinfo else datetime.now()
+                if expires <= now:
+                    return {"dates": value["dates"]}
+        except (TypeError, ValueError):
+            return None
+        return value
 
     @staticmethod
     def _safe_parking_context(value: object) -> dict[str, str]:
