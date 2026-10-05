@@ -12,6 +12,9 @@ services:
 
   backend:
     build: ./backend
+    # Lets the backend reach services on the host, e.g. a self-hosted Langfuse on :3000.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - path: .env
         required: false

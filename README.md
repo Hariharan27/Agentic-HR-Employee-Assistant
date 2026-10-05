@@ -215,6 +215,19 @@ execution.
 
 Configuration is available in `.env.example`. Keep the real `.env` untracked.
 
+## Observability (Langfuse)
+
+Every chat message can be traced in a self-hosted [Langfuse](https://langfuse.com): routing, each
+model call (prompt, reply, tokens, latency), each tool call, policy retrieval and confirmations,
+grouped by session and user. Tracing is off unless `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and
+`LANGFUSE_HOST` are set; secrets and one-time passwords are masked before export.
+
+```bash
+./observability/langfuse-up.sh        # Langfuse UI at http://localhost:3000
+```
+
+Setup, keys and login: [observability/README.md](observability/README.md).
+
 ## Policy ingestion
 
 Place PDFs in `backend/policy_docs`, then run:

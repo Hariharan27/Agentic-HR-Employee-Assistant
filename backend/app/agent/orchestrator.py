@@ -20,6 +20,7 @@ from app.application.leave.service import LeaveService
 from app.application.onboarding.service import OnboardingService
 from app.application.parking.service import ParkingService
 from app.application.pending.service import PendingActionCoordinator
+from app.core import tracing
 from app.core.config import Settings
 from app.core.exceptions import (
     ApplicationError,
@@ -181,7 +182,11 @@ class HRAssistantOrchestrator:
         self._emit(event["id"], event["label"], event["status"], commit=True)
 
     def _route_node(self, state: AgentState) -> AgentState:
-        result = self._route(state)
+        with tracing.observe("route", as_type="chain", input=state["user_message"]) as observation:
+            result = self._route(state)
+            route = result.get("route")
+            if isinstance(route, RouteDecision):
+                tracing.safe_update(observation, output=route.model_dump(exclude_none=True))
         route = result.get("route")
         if isinstance(route, RouteDecision):
             intent = (route.intent or route.domain).replace("_", " ")
@@ -190,7 +195,17 @@ class HRAssistantOrchestrator:
 
     def _confirmation_node(self, state: AgentState) -> AgentState:
         self._emit("route", "Checking your reply to the pending action", "success")
-        return self._handle_confirmation(state)
+        action = state.get("pending_action")
+        with tracing.observe(
+            "confirmation", as_type="guardrail", input=state["user_message"],
+            metadata={"action_type": getattr(action, "action_type", None), "summary": getattr(action, "summary", None)},
+        ) as observation:
+            result = self._handle_confirmation(state)
+            tracing.safe_update(
+                observation,
+                output="[sensitive response withheld]" if result.get("sensitive_response") else result.get("response"),
+            )
+            return result
 
     def chat(
         self, session_id: str, message: str, *, onboarding_form: dict[str, str] | None = None
@@ -216,7 +231,28 @@ class HRAssistantOrchestrator:
             "agent_activity": [],
             "llm_calls": 0,
         }
-        result = self.graph.invoke(state)
+        with tracing.trace(
+            "chat",
+            user_id=str(self.actor.user_id),
+            session_id=session_id,
+            tags=[self.actor.role.lower()],
+            input=message.strip(),
+            metadata={"role": self.actor.role, "form": bool(onboarding_form)},
+        ) as root:
+            result = self.graph.invoke(state)
+            route = result.get("route")
+            tracing.safe_update(
+                root,
+                output="[sensitive response withheld]" if result.get("sensitive_response") else result.get("response"),
+                metadata={
+                    "role": self.actor.role,
+                    "domain": route.domain if isinstance(route, RouteDecision) else result.get("active_domain"),
+                    "intent": route.intent if isinstance(route, RouteDecision) else None,
+                    "pending_action": result.get("pending_summary"),
+                    "llm_calls": result.get("llm_calls", 0),
+                    "tools": [item.get("tool") for item in result.get("agent_activity", [])],
+                },
+            )
         response = result["response"]
         stored_response = (
             "Onboarding was approved and one-time credentials were shown to the HR administrator."
@@ -572,7 +608,9 @@ class HRAssistantOrchestrator:
 
     def _handle_policy(self, state: AgentState) -> AgentState:
         self._emit("policy", "Searching policy documents", "running", commit=True)
-        context = self.policies.search(state["user_message"])
+        with tracing.observe("policy.search", as_type="retriever", input=state["user_message"]) as observation:
+            context = self.policies.search(state["user_message"])
+            tracing.safe_update(observation, output=context.sources)
         documents = {str(item.get("document")) for item in context.sources if isinstance(item, dict)}
         self._emit(
             "policy",

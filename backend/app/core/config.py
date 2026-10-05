@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     # Shared secret the email provider sends as X-Inbound-Token on /api/v1/inbound/email.
     # Empty disables the endpoint.
     inbound_email_token: str = ""
+    # Optional Langfuse tracing (self-hosted or cloud); off unless all three are set.
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = ""
     cors_origins: str = "http://localhost:5173"
     log_level: str = "INFO"
 

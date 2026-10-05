@@ -18,6 +18,7 @@ from typing import Any, Callable, Literal, Protocol, TypedDict
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError, model_validator
 
+from app.core import tracing
 from app.core.config import Settings
 from app.core.security import AuthenticatedUser
 from app.llm.ports import LLMGateway
@@ -270,7 +271,19 @@ class ToolAgent:
             "repeated_calls": 0,
             "transcript": [],
         }
-        result = self.graph.invoke(initial, {"recursion_limit": 60})
+        with tracing.observe(self.agent_name, as_type="agent", input=user_message, metadata={"intent": intent}) as observation:
+            result = self.graph.invoke(initial, {"recursion_limit": 60})
+            tracing.safe_update(
+                observation,
+                output=result.get("response"),
+                metadata={
+                    "intent": intent,
+                    "status": result.get("final_status"),
+                    "iterations": result.get("iterations", 0),
+                    "tool_calls": result.get("tool_call_count", 0),
+                    "pending": bool(result.get("pending_summary")),
+                },
+            )
         logger.info(
             "agent_completed",
             extra={
@@ -572,9 +585,19 @@ class ToolAgent:
             started = time.monotonic()
             tool_step = f"tool-{count + 1}"
             self.emit(tool_step, RUNNING_LABELS.get(call["name"], f"Running {call['name']}"), "running")
-            execution = self.tools.execute(
-                call["name"], call.get("arguments", {}), session_id=state["session_id"], active_plan=plan
-            )
+            with tracing.observe(
+                f"tool.{call['name']}", as_type="tool", input=call.get("arguments", {}),
+                metadata={"agent": self.agent_name},
+            ) as observation:
+                execution = self.tools.execute(
+                    call["name"], call.get("arguments", {}), session_id=state["session_id"], active_plan=plan
+                )
+                tracing.safe_update(
+                    observation,
+                    output=execution.data,
+                    level="DEFAULT" if execution.ok else "WARNING",
+                    status_message=None if execution.ok else str(execution.data.get("error") or execution.data.get("reason") or "")[:300],
+                )
             count += 1
             self.emit(tool_step, execution.label, "success" if execution.ok else "error")
             payload = self._result_payload(execution)

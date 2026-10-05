@@ -412,6 +412,15 @@ Cost and stability controls include:
 Alembic owns schema evolution. PostgreSQL constraints, foreign keys, indexes, row locking, and
 application transactions support integrity and concurrency safety.
 
+### Tracing (optional Langfuse)
+
+`app/core/tracing.py` wraps the Langfuse SDK and is a no-op unless the `LANGFUSE_*` settings are
+present. The orchestrator opens one `chat` trace per message (user ID, session ID, role tag); the
+router, each domain agent, every typed tool call, policy retrieval and confirmations are nested
+observations, and `MantleLLMGateway` records every model call as a generation with token usage.
+A mask removes one-time passwords, passwords and bearer tokens, and the credential-bearing
+onboarding-approval reply is withheld. Self-hosting: `observability/README.md`.
+
 ## 12. Security controls
 
 - Passwords use a modern one-way password hash.
