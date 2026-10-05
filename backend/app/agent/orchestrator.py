@@ -546,7 +546,10 @@ class HRAssistantOrchestrator:
             )
         elif (
             state.get("active_domain") == "parking"
-            and (state.get("parking_context") or state.get("parking_plan"))
+            and (
+                any(key != "offer" for key in (state.get("parking_context") or {}))
+                or state.get("parking_plan")
+            )
             and decision.domain == "general"
         ):
             parking_intent = (
@@ -778,6 +781,27 @@ class HRAssistantOrchestrator:
         context = dict(state.get("parking_context", {}))
         # The "register one?" offer only applies to the very next message.
         context.pop("offer", None)
+
+        if (
+            route.intent in self.PARKING_AGENT_INTENTS
+            and context.get("mode") != "register_vehicle"
+            and self.actor.employee_id is not None
+            and not self.parking.list_vehicles(self.actor)
+        ):
+            # Slots are only for employees with a registered vehicle: check the vehicle list first.
+            context["offer"] = "register_vehicle"
+            return {
+                "response": (
+                    "You need a registered vehicle before you can check or reserve a parking slot, "
+                    "and you do not have one yet. Say \"yes\" or \"Register my vehicle\" to add one "
+                    f"(up to {self.parking.MAX_VEHICLES}); then I can show the free slots."
+                ),
+                "active_domain": "parking",
+                "parking_context": context,
+                "agent_activity": [
+                    {"tool": "get_vehicle", "label": "Checked registered vehicles: none yet", "status": "success"}
+                ],
+            }
 
         if route.intent in self.PARKING_AGENT_INTENTS and context.get("mode") != "register_vehicle":
             tools: ParkingToolExecutor = self.parking_agent.tools  # type: ignore[assignment]
@@ -1756,6 +1780,7 @@ class HRAssistantOrchestrator:
             "registration_number",
             "vehicle_type",
             "make_model",
+            "offer",
         }
         result = {
             key: item.strip()

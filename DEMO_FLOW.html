@@ -139,7 +139,7 @@ const ACTS = [
     { t: "Onboarding tracking (optional)", p: ["How is Nila Raman's onboarding going?"] },
   ]},
   { id: "act4", title: "Act 4 · Nila: vehicles and parking", who: "Log back in as Nila (NILA_USERNAME / Nila!Desk-2026). Up to two vehicles; a vehicle can't be updated or removed while it has an upcoming booking.", steps: [
-    { t: "No vehicle yet", p: ["Do I have any vehicle registered?"], e: "You do not have a registered vehicle yet." },
+    { t: "No vehicle yet", p: ["Do I have any vehicle registered?", "Which parking slots are free today?"], e: "You do not have a registered vehicle yet. Then: you need a registered vehicle before you can check or reserve a parking slot." },
     { t: "Register the car", p: ["I want to register my car"], form: [["Registration number", "TN01NL2026"], ["Vehicle type", "Car"], ["Make and model", "Tata Nexon"]], n: "Form → <b>Continue to confirmation</b> → <b>Confirm</b>.", e: "(vehicle 1 of 2) → registered successfully." },
     { t: "Add the bike", p: ["I'd like to add my bike as well"], form: [["Registration number", "TN01NL7777"], ["Vehicle type", "Motorcycle"], ["Make and model", "Honda Activa"]], n: "Form → <b>Continue to confirmation</b> → <b>Confirm</b>.", e: "(vehicle 2 of 2)." },
     { t: "List vehicles", p: ["Which vehicles have I registered?"], e: "TN01NL2026 car (Tata Nexon); TN01NL7777 motorcycle (Honda Activa)." },

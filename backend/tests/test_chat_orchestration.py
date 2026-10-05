@@ -2810,3 +2810,22 @@ def test_model_replies_claiming_a_vehicle_was_registered_are_detected():
     assert claims("I've successfully registered your vehicle.")
     assert not claims("You do not have a registered vehicle yet.")
     assert not claims("Your registered vehicle: TN01AR1001, car")
+
+
+def test_free_slot_question_checks_the_vehicle_list_first(db_session):
+    llm = FakeLLM([
+        route(domain="parking", intent="parking_availability"),
+        route(domain="general", intent="general"),
+    ])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session))
+
+    reply = service.chat("slots-no-vehicle", "Which parking slot is free tomorrow?")
+
+    assert "need a registered vehicle" in reply.message
+    assert reply.pending_action is None
+    assert reply.agent_activity[0]["label"].startswith("Checked registered vehicles")
+    assert not any("Parking Agent" in str(call) for call in llm.calls)
+
+    follow_up = service.chat("slots-no-vehicle", "yes")
+    assert follow_up.intent == "register_vehicle"
+    assert "vehicle registration form below" in follow_up.message

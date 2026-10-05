@@ -490,6 +490,14 @@ Do I have any vehicle registered?
 
 > Expected: You do not have a registered vehicle yet.
 
+Then show that slots are gated on a vehicle:
+
+```text
+Which parking slots are free today?
+```
+
+> Expected: You need a registered vehicle before you can check or reserve a parking slot. (Agent activity: Checked registered vehicles.)
+
 ### 43. Register the car
 
 ```text
