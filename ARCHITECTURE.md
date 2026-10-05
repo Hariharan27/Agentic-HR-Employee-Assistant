@@ -8,6 +8,7 @@ Parking Administrator attendance lifecycles end to end.
 
 - Provide one authenticated conversational HR interface.
 - Ground policy answers in company documents with visible sources.
+- Let the model decide which tools to call and in what order; keep every fact in tool results.
 - Keep identity, authorization, calculations, and writes outside the LLM.
 - Use deterministic application services for business-critical operations.
 - Require explicit human confirmation before every mutation.
@@ -34,49 +35,48 @@ Parking Administrator attendance lifecycles end to end.
 
 ```mermaid
 flowchart TB
-    UI[Ideator PeopleDesk\nReact UI] -->|JWT + HTTPS/JSON| API[FastAPI API]
+    UI[Ideator PeopleDesk\nReact UI] -->|JWT · /chat · /chat/stream SSE| API[FastAPI API]
     API --> AUTH[JWT authentication\nand role checks]
     AUTH --> GRAPH[LangGraph orchestrator]
 
-    GRAPH --> ROUTER[Intent router\nGPT OSS 20B]
     GRAPH --> CONFIRM[Pending-action\nconfirmation]
+    GRAPH --> ROUTER[Intent router\nGPT OSS 20B + guards]
     ROUTER --> POLICY[Policy node]
-    ROUTER --> LEAVE[Leave Agent subgraph]
-    ROUTER --> PARKING[Parking node]
+    ROUTER --> LEAVE[Leave Agent]
+    ROUTER --> ONB[Onboarding Agent]
+    ROUTER --> PARK[Parking Agent]
+    ROUTER --> PADMIN[Parking Admin +\nvehicle registration\ndeterministic]
     ROUTER --> GENERAL[Deterministic general response]
-    ROUTER --> UNSUPPORTED[Future-domain response]
 
     POLICY --> RAG[Policy knowledge service]
-    RAG --> EMBED[BGE embeddings]
-    EMBED --> QDRANT[(Qdrant)]
-    POLICY --> ANSWER[Grounded response\nGPT OSS 120B]
+    RAG --> QDRANT[(Qdrant · BGE embeddings)]
+    POLICY --> ANSWER[Grounded answer\nGPT OSS 120B]
 
-    LEAVE --> LEAVE_MODEL[Bounded tool-calling loop\nGPT OSS 120B]
-    LEAVE_MODEL --> LEAVE_TOOLS[Typed Leave tools]
-    LEAVE_TOOLS --> SERVICE[Deterministic LeaveService]
-    PARKING --> PARKING_SERVICE[Deterministic ParkingService]
-    CONFIRM --> PENDING[PendingActionCoordinator]
-    PENDING --> SERVICE
-    SERVICE --> REPO[SQLAlchemy repositories]
-    PARKING_SERVICE --> REPO
+    LEAVE & ONB & PARK --> LOOP[Shared ToolAgent loop\nGPT OSS 120B · native tool calls\nrepair · grounding · finaliser]
+    LOOP --> TOOLS[Typed, role-filtered tools]
+    TOOLS --> SERVICES[LeaveService · OnboardingService · ParkingService]
+    PADMIN --> SERVICES
+    CONFIRM --> PENDING[PendingActionCoordinator\n+ handlers]
+    PENDING --> SERVICES
+    SERVICES --> REPO[SQLAlchemy repositories]
     REPO --> POSTGRES[(PostgreSQL)]
 
-    GRAPH --> CONVERSATION[Conversation repository]
+    GRAPH --> CONVERSATION[Conversation repository\nhistory · leave plan · onboarding draft · parking plan]
     CONVERSATION --> POSTGRES
 ```
 
-The low-cost model proposes the top-level domain. Leave then runs a bounded tool-calling subgraph
-where the model selects typed operations and consumes structured results. It does not receive
-authority to identify a different employee, bypass role checks, calculate final business values, or
-commit a transaction.
+The low-cost model proposes the top-level domain. Leave, onboarding and employee parking then run
+the same bounded tool-calling loop (`app/agent/runtime.py`), where the model selects typed
+operations and consumes their structured results. It does not receive authority to identify a
+different employee, bypass role checks, calculate business values, or commit a transaction.
 
 ## 4. Repository layers
 
 ```text
 frontend/                         React presentation
 backend/app/api/                  HTTP routes, schemas, dependencies
-backend/app/agent/                LangGraph state and orchestration
-backend/app/application/          Leave and pending-action use cases
+backend/app/agent/                Orchestrator, shared ToolAgent loop, Leave/Onboarding/Parking agents and tools
+backend/app/application/          Leave, onboarding, parking, notification and pending-action use cases
 backend/app/domain/               Entities, enums, and deterministic rules
 backend/app/rag/                  Policy extraction, chunking, ingestion, retrieval
 backend/app/infrastructure/       Database, repositories, embeddings, Qdrant, LLM adapter
@@ -107,8 +107,8 @@ sequenceDiagram
         S->>D: Atomic transaction
     else Normal request
         G->>G: Route and apply deterministic guards
-        G->>G: Leave Agent selects typed tools and consumes results
-        G->>S: Invoke LeaveService or policy retrieval
+        G->>G: Domain agent selects typed tools and consumes results
+        G->>S: Invoke application services or policy retrieval
         S->>D: Read operational data or policy chunks
     end
     G->>D: Persist conversation state
@@ -155,16 +155,22 @@ flowchart LR
     RESOLVE -->|none| ROUTER[router]
     ROUTER --> POLICY[policy]
     ROUTER --> LEAVE[leave]
+    ROUTER --> ONB[onboarding]
     ROUTER --> PARKING[parking]
     ROUTER --> GENERAL[general]
     ROUTER --> UNSUPPORTED[unsupported]
+    LEAVE --> AGENT
+    ONB --> AGENT
+    PARKING -->|employee booking| AGENT
+    subgraph AGENT[ToolAgent subgraph, one per domain]
+        direction LR
+        A[agent: model turn] -->|tool calls| T[tools: typed executor]
+        T -->|results / errors| A
+    end
+    AGENT --> END
+    PARKING -->|admin, vehicle, list| END
     CONFIRM --> END
     POLICY --> END
-    LEAVE --> LEAVE_AGENT[Leave Agent]
-    LEAVE_AGENT -->|tool calls| LEAVE_TOOLS[Leave tool executor]
-    LEAVE_TOOLS -->|results| LEAVE_AGENT
-    LEAVE_AGENT --> END
-    PARKING --> END
     GENERAL --> END
     UNSUPPORTED --> END
 ```
@@ -179,8 +185,9 @@ The graph carries:
 - Validated `RouteDecision`
 - Pending action and user-facing summary
 - Response and policy sources
-- Safe factual Leave agent activity events
+- Agent activity events (tool label and status only)
 - Per-request LLM call count
+- The active leave plan, onboarding draft and parking plan (persisted per session)
 - Validated parking date context for safe follow-up turns
 
 ### Routing
@@ -197,16 +204,18 @@ dates, reason, and request ID. Post-model guards enforce important invariants:
 
 ## 7. Application tools and deterministic boundaries
 
-The Leave Agent uses a structured tool-call protocol inside the LangGraph subgraph. Its typed tool
-executor validates each call and invokes trusted Python code directly; the model never receives a
-repository or employee identity argument.
+Each agent uses native tool calling (or a JSON decision protocol when the provider lacks it) inside
+its LangGraph subgraph. Its typed tool executor validates each call with Pydantic, filters tools by
+role and invokes trusted Python code directly; the model never receives a repository or employee
+identity argument.
 
 | Capability | Implementation | Source of truth |
 |---|---|---|
 | Policy search | `PolicyKnowledgeService.search` | Qdrant policy chunks |
 | Leave balance | `LeaveService.get_leave_balance` | PostgreSQL |
-| Working days | `LeaveService.calculate_leave_days` | Python rules + holidays |
-| Eligibility | `LeaveService.check_leave_eligibility` | Rules, balance, overlaps |
+| Date words → dates | `resolve_leave_dates` | Python calendar rules |
+| Working days | `LeaveService.calculate_leave_days` | Python rules + regional holidays |
+| Eligibility / leave plan | `LeaveService.build_leave_plan` | Rules, balance, overlaps, split options |
 | Leave application | Pending handler + `LeaveService` | Confirmed transaction |
 | Employee requests | `LeaveService.get_my_leave_requests` | Authenticated employee |
 | Manager queue | `LeaveService.get_managed_leave_requests` | Reporting hierarchy |
@@ -236,6 +245,11 @@ segments, weekends and holidays not counted, balance before and after, past-date
 leave up to 7 days back, other types from today), overlaps, and a fingerprint. The newest plan is
 the conversation's active plan, persisted on the session and valid for 30 minutes.
 
+When the balance is short, the plan lists `split_options` (other types with enough balance); only
+after the employee agrees does the agent rebuild it with `split_with`, so the remaining days are
+covered by the second type. `shift_leave_plan` moves the active plan by whole days ("same leave next
+week"). Privilege Leave (PL) is a separate legacy balance handled in iAssistant, not Earned Leave.
+
 "Apply it" means `prepare_leave_application(plan_id)`: the executor rebuilds the plan, requires
 the same fingerprint, and stores an `apply_leave_plan` pending action. On confirmation the
 handler rebuilds the plan again inside the transaction and creates one request per segment, so
@@ -244,7 +258,8 @@ the days the employee was shown are exactly the days submitted.
 ### Read operations
 
 - Balance responses combine total, used, and pending days.
-- Eligibility excludes weekends and seeded holidays.
+- Eligibility excludes weekends and the employee's regional holidays (Tamil Nadu for Chennai,
+  Karnataka for Bengaluru, from the 2026 holiday list PDFs).
 - Active overlapping requests prevent duplicate leave applications.
 - Employees can read only their own requests.
 - Managers see direct-report requests; HR can see the authorized broader queue.
@@ -269,7 +284,7 @@ Pending actions are owned by both session and authenticated user, expire automat
 consumed atomically. Approval consumes balance only after confirmation. Replay attempts cannot
 execute the same action twice.
 
-### Leave Agent loop safeguards
+### Shared agent loop safeguards (all three agents)
 
 - Tool errors and repeated calls are returned to the model as results, so it can correct its
   arguments or explain the factual reason; a second identical repeat ends the turn.
@@ -279,6 +294,13 @@ execute the same action twice.
   the active plan, the conversation or today's date; otherwise the model regenerates once.
 - If repair fails, the reply is rendered only from tool results already returned (plan summary,
   balance, request list or the tool error); the user's words are never pattern-matched to guess.
+- Domain finaliser (`finalize` hook, deterministic, never writes): presents tool results in fixed
+  wording when the model's answer omits key facts (balances, day counts, plan summary), asks for
+  exactly the missing detail ("Please provide the leave type…"), and finishes a workflow the model
+  stopped short of — an eligible plan on an "apply" request, a complete onboarding draft or a
+  ready parking plan goes straight to the confirmation step.
+- Limits per message: 6 model rounds, 8 tool calls, 8 LLM calls in total (configurable).
+- Every model turn and tool call is reported to the optional live-activity sink (section 5).
 - Native provider tool calling is used when `LEAVE_AGENT_NATIVE_TOOLS=true`; check support first
   with `python -m app.llm.probe`. Otherwise the JSON decision protocol is used.
 
@@ -352,7 +374,7 @@ hallucinated answer.
 | Tier | Model | Use |
 |---|---|---|
 | Router | `openai.gpt-oss-20b` | Normal structured routing with low reasoning effort |
-| Standard | `openai.gpt-oss-120b` | Grounded policy response generation |
+| Standard | `openai.gpt-oss-120b` | Domain agents (tool calling) and grounded policy answers |
 | Complex | `openai.gpt-oss-120b` | Low-confidence or invalid routing fallback with medium effort |
 
 Cost and stability controls include:
@@ -377,7 +399,8 @@ Cost and stability controls include:
 | `leave_balances` | Total and used days by employee and leave type |
 | `leave_requests` | Dates, working days, status, manager, decision metadata |
 | `leave_request_events` | Immutable lifecycle/audit entries |
-| `holidays` | Dates excluded from working-day calculations |
+| `holidays` | Regional holiday calendars excluded from working-day calculations |
+| `onboarding_requests`, `onboarding_tasks` | Onboarding request, approval state and provisioning tasks |
 | `vehicles` | One registered active vehicle per employee for the parking MVP |
 | `parking_slots` | Database-backed workplace parking inventory |
 | `parking_reservations` | Reservation and attendance lifecycle state |
@@ -416,15 +439,14 @@ The frontend renders server decisions; it is not an authorization boundary.
 
 ## 14. Quality strategy
 
-- **131 deterministic tests** cover authentication, security, leave rules, onboarding approval and
-  account activation, parking persistence, employee workflows, allocation constraints, pending actions, manager
-  lifecycle, RAG, orchestration, evaluation contracts, and repeatable demo seed.
-- **96 versioned golden scenarios** exercise the live API and configured models across policy,
-  leave, parking, safety, scope, manager workflow, and API safety categories.
-- The latest complete live release gate scored **98.7%** with **99.0% consistency**, above both
-  configured 95% thresholds; safety, API-safety, and onboarding categories passed at **100%**.
-- Hardened regression scenarios for greeting stability, policy injection, and missing dates passed
-  at **100%** after deterministic guards were added.
+- **282 deterministic tests** cover authentication, security, date resolution, leave plans and
+  rules, the shared agent loop (repair, grounding, finaliser), onboarding approval and account
+  activation, parking, pending actions, manager lifecycle, RAG, orchestration, live streaming,
+  evaluation contracts, and the repeatable demo seed. Agent tests use scripted model simulators.
+- **117 versioned golden scenarios** exercise the live API and configured models across policy,
+  leave, onboarding, parking, manager workflow, safety, scope, and API safety, three times each.
+- Release gate: at least 95% overall pass rate and consistency, and 100% for safety, API safety,
+  onboarding and parking. Latest results are in `backend/evals/reports/` (ignored by Git).
 - The React production build is compiled with TypeScript before packaging.
 
 ## 15. Deployment and demo reset
@@ -439,8 +461,8 @@ qdrant   :6333  → policy vectors
 ```
 
 Backend startup applies Alembic migrations and performs non-destructive idempotent seeding. Before
-a recording, the explicit reset command clears only demo-identity activity and restores a known
-balance and approval scenario:
+a recording, the explicit reset command clears only demo-identity activity and restores known
+balances, the five parking slots and the employee account's vehicle:
 
 ```bash
 docker compose exec -T backend python -m app.seed --reset-demo
@@ -448,21 +470,15 @@ docker compose exec -T backend python -m app.seed --reset-demo
 
 ## 16. Future extensions
 
-Employee onboarding and parking now use the same validated, confirmed, atomic workflow pattern
-as leave. Parking Phases 3A through 3C provide persistence, demo data, database allocation
-constraints, employee availability, confirmed reservation and cancellation, own-booking lookup,
-waitlisting, safe cross-domain conversation context, Parking Admin check-in, late cancellation,
-no-show enforcement, three-strike suspension, and overrides. New domains can reuse the existing
-pattern:
+All three workflows now share one pattern, so a new domain needs a tool executor, a prompt and
+(optionally) a finaliser on top of the shared loop:
 
 ```text
 validated route
-  → domain application service
-  → repository port
+  → domain agent (shared ToolAgent loop) → typed tools → application service
   → pending action for mutations
-  → confirmation
-  → atomic execution and audit event
+  → confirmation → revalidation → atomic execution and audit event
 ```
 
-This keeps the assessment release focused on one complete, demonstrable HR workflow while leaving
-an intentional path for additional employee services.
+Planned next: half-day leave, a manager team-leave calendar, approver notifications, and the HR
+use cases recorded in the post-submission backlog.

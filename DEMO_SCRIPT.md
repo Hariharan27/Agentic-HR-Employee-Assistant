@@ -153,33 +153,49 @@ default leave-balance creation, and one-time credential delivery.
 
    Expected: no requests yet. This shows that data is isolated to the authenticated employee.
 
-## Part 4 — New employee applies for leave
+## Part 4 — New employee plans and applies for leave (the agentic part)
 
-Use a future working date that does not overlap another request. For the prepared demo baseline:
+Keep the live steps in view while each reply is prepared.
 
-```text
-Apply casual leave on 2026-10-13 for a personal appointment
-```
+1. Ask an eligibility question in natural language:
 
-1. Check the calculated date, leave type, and working-day count.
-2. Click **Confirm**.
-3. Record the returned leave request ID as `<LEAVE_REQUEST_ID>`.
+   ```text
+   Can I take casual leave next Tuesday and Sunday?
+   ```
+
+   Expected: the steps show the model choosing `resolve_dates` and then `build_leave_plan`. The
+   reply says **1 working day**: Sunday is a weekly off and is not counted. Point out that the two
+   days are treated as separate days, not as a Tuesday-to-Sunday range, and that Python resolved the
+   dates and counted the days, not the model.
+
+2. Ask:
+
+   ```text
+   can you apply for it
+   ```
+
+   Expected: `Apply for 1 working day(s) of Casual leave …` with **Confirm** and **Cancel**. Nothing
+   is written yet.
+
+3. Click **Confirm** and record the returned request ID as `<LEAVE_REQUEST_ID>`.
 4. Ask:
 
    ```text
-   Show my pending leave requests
+   Show my leave requests
    ```
 
-Expected: the card explicitly labels `Request ID #<LEAVE_REQUEST_ID>`, making it usable for cancel
-or manager approval commands.
+   Expected: the list labels `Request ID #<LEAVE_REQUEST_ID>`, usable for cancel or approval.
 
-Optional cancellation branch:
+Optional, if time allows:
 
-```text
-Cancel leave request #<LEAVE_REQUEST_ID>
-```
-
-Do not cancel it if you want to show manager approval next.
+- **Split leave:** `Can I take casual leave from 2026-11-02 to 2026-11-13?` is 10 working days
+  against the remaining casual balance. The plan is not eligible and offers the rest as Earned or
+  Sick leave; reply `yes, use earned leave for the rest` to see a split plan.
+- **Regional holiday:** `Can I take casual leave on 2026-10-19?` explains that Ayudha Poojai is a
+  Chennai holiday and is not counted.
+- **Move the plan:** after a plan, `same leave next week` shifts it by seven days.
+- **Cancellation:** `Cancel leave request #<LEAVE_REQUEST_ID>` (skip it if you show the manager
+  approval next).
 
 ## Part 5 — Reporting manager approves the new employee's leave
 
@@ -309,11 +325,12 @@ reject it.
 
 ## Suggested closing explanation
 
-> PeopleDesk uses the LLM to understand natural language and extract structured intent. LangGraph
-> routes the workflow, but deterministic services authorize the JWT identity, calculate leave,
-> validate policy rules, recheck parking availability, and write transactions. Sensitive mutations
-> require confirmation. Policy answers come from Qdrant with source citations, while employee,
-> onboarding, leave, and parking data come from PostgreSQL tools.
+> A small router model picks the domain. Inside leave, onboarding and parking, a larger model works
+> as an agent: it chooses typed tools, reads their results, recovers from tool errors and decides
+> the next step — you saw each step live. Every fact comes from a tool: Python resolves dates,
+> counts working days with regional holidays, checks balances and authorizes the JWT identity, and
+> the final answer is checked against the tool results. Nothing is written until you confirm, and
+> the plan is revalidated before the write. Policy answers come from Qdrant with source citations.
 
 ## Quick fallback demo
 
@@ -322,7 +339,7 @@ If time is limited, show these five outcomes:
 1. Manager creates Nila through the inline onboarding form.
 2. HR Admin approves and returns one-time credentials.
 3. Nila logs in and asks for leave balance plus one cited policy question.
-4. Nila submits leave and Saanvika approves it.
+4. Nila asks about "next Tuesday and Sunday", applies it, and Saanvika approves it.
 5. Nila registers a vehicle, reserves parking, and Parking Admin shows it in the dated queue.
 
 ## Demo cautions
