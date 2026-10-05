@@ -2579,3 +2579,24 @@ def test_balance_question_is_answered_even_when_the_model_asks_for_a_type(db_ses
 
     assert result.message.startswith("Your leave balance:")
     assert "only show your own" not in result.message
+
+
+def test_an_alternative_for_one_day_keeps_the_slot_the_employee_already_chose(db_session):
+    five_slots(db_session)
+    service = orchestrator(db_session, FakeLLM([]))
+    tools = service.parking_agent.tools
+    tools.turn_text = "use B-23 on the 13th"
+
+    execution = tools.execute(
+        "build_parking_plan",
+        {"slot": "B-22", "dates": ["2026-10-12", "2026-10-13"], "alternatives": {"2026-10-13": "B-23"}},
+        session_id="s",
+        active_plan={"slot_code": "B-22", "dates": ["2026-10-12", "2026-10-13"]},
+    )
+    unchosen = tools.execute(
+        "build_parking_plan", {"slot": "B-24", "dates": ["2026-10-12"]}, session_id="s",
+        active_plan={"slot_code": "B-22"},
+    )
+
+    assert "must choose the slot themselves" not in str(execution.data.get("error", ""))
+    assert unchosen.ok is False and "must choose the slot themselves" in unchosen.data["error"]

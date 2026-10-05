@@ -186,7 +186,14 @@ class ParkingToolExecutor:
         dates = arguments.dates or [date.fromisoformat(item) for item in active.get("dates", [])]
         if not dates:
             return self._error("build_parking_plan", "Please provide the parking date.")
-        unstated = [code for code in [arguments.slot, *arguments.alternatives.values()] if not _mentioned(code, self.turn_text)]
+        # The employee must have chosen every slot: in this message, or as the active plan's slot
+        # (so "use B-24 on Thursday" can adjust a B-23 plan without repeating B-23).
+        chosen_before = {str(active.get("slot_code") or "").upper()} - {""}
+        unstated = [
+            code
+            for code in [arguments.slot, *arguments.alternatives.values()]
+            if not _mentioned(code, self.turn_text) and str(code).upper() not in chosen_before
+        ]
         if unstated:
             return self._error(
                 "build_parking_plan",
