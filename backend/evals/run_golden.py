@@ -214,7 +214,17 @@ def run_cases(
                 if case.auth == "valid":
                     credentials = (case.username or username, case.password or password)
                     if credentials not in token_cache:
-                        token_cache[credentials] = login(client, *credentials)
+                        try:
+                            token_cache[credentials] = login(client, *credentials)
+                        except httpx.HTTPError as exc:
+                            # A backend restart must not abort the whole run: record and move on.
+                            results.append({
+                                "case_id": case.id, "category": case.category, "tags": case.tags,
+                                "repetition": repetition + 1, "turn": 1, "passed": False,
+                                "failures": [f"login failed: {exc}"], "latency_ms": 0,
+                            })
+                            print(f"[{run_number}/{total_runs}] FAIL {case.id} (login failed: {exc})", flush=True)
+                            continue
                     headers["Authorization"] = f"Bearer {token_cache[credentials]}"
                 elif case.auth == "invalid":
                     headers["Authorization"] = "Bearer invalid-evaluation-token"
