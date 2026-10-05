@@ -251,3 +251,12 @@ nav button.new-chat:hover { background: rgba(255,255,255,.1); }
 nav button.new-chat:disabled { opacity: .5; cursor: wait; }
 .onboarding-form .submit-onboarding, .submit-onboarding { border: 0; border-radius: 8px; padding: 11px; color: #fff; background: #18181a; font-size: 12px; font-weight: 600; }
 .submit-onboarding:disabled { opacity: .55; cursor: wait; }
+
+/* Form polish */
+::placeholder { color: #a3a3a0; opacity: 1; }
+.message.onboarding-message .message-text p { border-left: 0; background: transparent; }
+.onboarding-form label { font-size: 10px; color: #5e5e5e; }
+.onboarding-form input, .onboarding-form select { padding: 10px 11px; font-size: 13px; color: #18181a; }
+.chat-onboarding-form { border-color: #e5e5e0; background: #fbfbf9; }
+.composer:focus-within { border-color: #1d4ed8; box-shadow: 0 0 0 3px rgba(29,78,216,.12); }
+.composer textarea, .composer textarea:focus { border: 0; box-shadow: none; font-size: 14px; color: #18181a; }
