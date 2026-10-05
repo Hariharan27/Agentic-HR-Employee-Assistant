@@ -49,7 +49,10 @@ class BuildPlanArguments(ToolArguments):
     )
     vehicle: str | None = Field(
         default=None, max_length=32,
-        description="Registration number of the vehicle the user chose; only needed when they have two",
+        description=(
+            "The vehicle the user chose, as they said it: a registration number, or 'car' / 'bike'; "
+            "only needed when they have two"
+        ),
     )
 
 
@@ -185,7 +188,9 @@ class ParkingToolExecutor:
         ]})
 
     def _list_parking_slots(self, arguments: DatesArguments, *, active: dict[str, Any], **_: Any):
-        board = self.parking.slot_board(self.actor, arguments.dates)
+        # "Is a bike slot free?" shows only the slots for that vehicle (and says so if they have none).
+        named = self.parking.vehicle_type_in(self.turn_text)
+        board = self.parking.slot_board(self.actor, arguments.dates, self.parking.type_label(named) if named else None)
         remembered = {"dates": [item.isoformat() for item in sorted(set(arguments.dates))]}
         return self._ok("list_parking_slots", board, plan=remembered)
 
@@ -208,7 +213,11 @@ class ParkingToolExecutor:
                 + ", ".join(unstated) + ")",
             )
         vehicle = arguments.vehicle or active.get("vehicle") or None
-        if arguments.vehicle and not _mentioned(arguments.vehicle, self.turn_text) and (
+        named_type = self.parking.vehicle_type_in(self.turn_text)
+        if named_type is not None and (not arguments.vehicle or not _mentioned(arguments.vehicle, self.turn_text)):
+            # The user picked the vehicle by type ("car", "my bike"); the service resolves it.
+            vehicle = self.parking.type_label(named_type)
+        elif arguments.vehicle and not _mentioned(arguments.vehicle, self.turn_text) and (
             self.parking.normalize_registration(arguments.vehicle)
             != self.parking.normalize_registration(str(active.get("vehicle") or ""))
         ):
@@ -234,6 +243,15 @@ class ParkingToolExecutor:
         if not plan.eligible:
             return self._error("prepare_parking", "; ".join(plan.problems) or "Nothing to book in this plan")
         summary = plan.confirmation_summary()
+        vehicle = next(
+            (item for item in self.parking.list_vehicles(self.actor) if item.registration_number == plan.vehicle), None
+        )
+        if vehicle is not None:
+            label = self.parking.type_label(vehicle.vehicle_type)
+            model = f", {vehicle.make_model}" if vehicle.make_model else ""
+            summary = summary.replace(
+                f"Parking for {plan.vehicle}:", f"Parking for your {label} {plan.vehicle}{model}:", 1
+            )
         action = self.pending.propose(
             self.actor, session_id, "reserve_parking_plan",
             {

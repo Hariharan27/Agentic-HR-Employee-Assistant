@@ -25,8 +25,10 @@ The authenticated employee is injected by the application; never put identity in
   If the chosen slot is taken on some dates, tell them which dates and the free slots there, and
   ask whether to use another slot or the waitlist on those dates; rebuild with alternatives only
   after they choose.
-- If the plan says the employee has two registered vehicles, ask which one and pass the
-  registration number they give as vehicle when you rebuild the plan. Never pick a vehicle.
+- Car slots are only for cars and motorcycle slots only for motorcycles; the slot list already
+  shows only the slots the employee's vehicles may use. A car slot books their car and a bike
+  slot their motorcycle. If the plan still asks which vehicle, ask, and pass what they answer
+  ("car", "bike" or the registration number) as vehicle when you rebuild. Never pick a vehicle.
 - Cancelling: prepare_parking_cancellation for the date they name.
 Prepare tools only create a pending confirmation; never claim a booking was made. Keep replies
 short; you may use **bold** and "- " bullets; no headings or tables. Do not mention tools, plan
@@ -49,19 +51,30 @@ class ParkingAgent(ToolAgent):
 
     @staticmethod
     def board_text(data: dict[str, Any]) -> str:
+        """Slots grouped by the vehicle that may use them: car slots for the car, bike slots for the bike."""
+        labels = {"CAR": "Car", "MOTORCYCLE": "Motorcycle"}
+        owners = {item["vehicle_type"]: item["registration_number"] for item in data.get("vehicles", [])}
         blocks = []
         for day in data.get("days", []):
             heading = f"{day['date']} ({day['weekday']})"
             if day.get("unavailable_reason"):
                 blocks.append(f"{heading}: {day['unavailable_reason']}")
                 continue
-            lines = [
-                f"- {slot['slot']}{' (accessible)' if slot['type'] == 'ACCESSIBLE' else ''}: {slot['status']}"
-                for slot in day.get("slots", [])
-            ]
+            groups: dict[str, list[str]] = {}
+            for slot in day.get("slots", []):
+                groups.setdefault(slot.get("vehicle_type", "CAR"), []).append(
+                    f"- {slot['slot']}{' (accessible)' if slot['type'] == 'ACCESSIBLE' else ''}: {slot['status']}"
+                )
+            parts = []
+            for kind, lines in groups.items():
+                owner = f" for {owners[kind]}" if kind in owners else ""
+                parts.append(f"{labels.get(kind, kind.title())} slots{owner}:\n" + "\n".join(lines))
             mine = f"\nYou already have slot {day['your_reservation']}." if day.get("your_reservation") else ""
-            blocks.append(f"Parking slots on {heading}:\n" + "\n".join(lines) + mine)
-        return "\n\n".join(blocks) + "\n\nWhich slot would you like?"
+            blocks.append(f"Parking slots on {heading}:\n" + "\n\n".join(parts) + mine)
+        closing = "Which slot would you like?"
+        if len(owners) > 1:
+            closing = "Which slot would you like? A car slot books your car and a motorcycle slot books your bike."
+        return "\n\n".join(blocks) + "\n\n" + closing
 
     def render_from_results(self, state: AgentRunState) -> str | None:
         for item in reversed(state.get("tool_results", [])):
@@ -102,4 +115,4 @@ class ParkingAgent(ToolAgent):
     @staticmethod
     def friendly_failure(tool: str, data: dict[str, Any]) -> str:
         details = data.get("reason") or data.get("error")
-        return f"I could not complete that parking step: {details}." if details else "I could not complete that parking step."
+        return f"I could not complete that parking step: {str(details).rstrip('.')}." if details else "I could not complete that parking step."

@@ -54,7 +54,7 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
         assert verify_password("Dhaswanth!Desk-2026", parking_admin.password_hash)
         assert db.scalar(select(Vehicle.registration_number).where(Vehicle.employee_id == employee_user.employee_id)) == "TN01AR1001"
         assert db.scalar(select(func.count()).select_from(Vehicle)) == 1
-        assert db.scalar(select(func.count()).select_from(ParkingSlot)) == 5
+        assert db.scalar(select(func.count()).select_from(ParkingSlot)) == 9
         assert db.scalar(select(func.count()).select_from(ParkingReservation)) == 0
         assert db.scalar(select(func.count()).select_from(ParkingReservationEvent)) == 0
 
@@ -117,7 +117,7 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
         assert db.scalar(select(func.count()).select_from(ParkingReservation)) == 0
         assert db.scalar(select(func.count()).select_from(ParkingReservationEvent)) == 0
         assert db.scalar(select(func.count()).select_from(ParkingWaitlistEntry)) == 0
-        assert db.scalar(select(func.count()).select_from(ParkingSlot)) == 5
+        assert db.scalar(select(func.count()).select_from(ParkingSlot)) == 9
         assert db.scalar(select(Vehicle.registration_number).where(Vehicle.employee_id == employee_user.employee_id)) == "TN01AR1001"
         assert db.scalar(select(func.count()).select_from(Vehicle)) == 1
         assert casual.used_days == Decimal("2")

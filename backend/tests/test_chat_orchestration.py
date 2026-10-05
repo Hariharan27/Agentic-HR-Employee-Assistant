@@ -40,6 +40,7 @@ from app.application.pending.handlers import (
 from app.application.pending.service import PendingActionCoordinator
 from app.core.config import Settings
 from app.core.exceptions import (
+    NotFoundError,
     AuthorizationError,
     ConflictError,
     LLMServiceError,
@@ -2645,10 +2646,22 @@ def test_two_vehicles_are_listed_and_a_booking_asks_which_one(db_session):
     assert listing.message.startswith("Your registered vehicles:")
     assert employee_vehicle.registration_number in listing.message and "TN09ZZ4321" in listing.message
 
-    plan = service.parking.build_parking_plan(actor(db_session), [date(2026, 10, 8)], "B-21")
-    assert not plan.eligible and "Which one should I use" in plan.problems[0]
-    chosen = service.parking.build_parking_plan(actor(db_session), [date(2026, 10, 8)], "B-21", None, "tn09 zz 4321")
-    assert chosen.eligible and chosen.vehicle == "TN09ZZ4321"
+    db_session.add(ParkingSlot(code="M-01", location="Two-wheeler bay", slot_type="REGULAR",
+                               vehicle_type="MOTORCYCLE", active=True))
+    db_session.commit()
+    me = actor(db_session)
+    # A car slot books the only car; a bike slot books the only motorcycle.
+    car_plan = service.parking.build_parking_plan(me, [date(2026, 10, 8)], "B-21")
+    assert car_plan.eligible and car_plan.vehicle == employee_vehicle.registration_number
+    bike_plan = service.parking.build_parking_plan(me, [date(2026, 10, 8)], "M-01")
+    assert bike_plan.eligible and bike_plan.vehicle == "TN09ZZ4321"
+    # The vehicle can be named by type or registration; a mismatched slot is refused.
+    by_type = service.parking.build_parking_plan(me, [date(2026, 10, 8)], "M-01", None, "my bike")
+    assert by_type.eligible and by_type.vehicle == "TN09ZZ4321"
+    mismatch = service.parking.build_parking_plan(me, [date(2026, 10, 8)], "B-21", None, "tn09 zz 4321")
+    assert not mismatch.eligible and "is a car slot" in mismatch.problems[0]
+    board = service.parking.slot_board(me, [date(2026, 10, 8)], "bike")
+    assert [slot["slot"] for slot in board["days"][0]["slots"]] == ["M-01"]
 
 
 def test_a_reversed_range_is_reported_even_if_the_model_swapped_it(db_session):
@@ -2829,3 +2842,62 @@ def test_free_slot_question_checks_the_vehicle_list_first(db_session):
     follow_up = service.chat("slots-no-vehicle", "yes")
     assert follow_up.intent == "register_vehicle"
     assert "vehicle registration form below" in follow_up.message
+
+
+def _car_and_bike(db_session):
+    car, _, _ = five_slots(db_session)
+    db_session.add_all([
+        Vehicle(employee_id=actor(db_session).employee_id, registration_number="TN84P2145",
+                vehicle_type="MOTORCYCLE", make_model="Suzuki", active=True),
+        ParkingSlot(code="M-01", location="Two-wheeler bay", slot_type="REGULAR",
+                    vehicle_type="MOTORCYCLE", active=True),
+    ])
+    db_session.commit()
+    return car
+
+
+def test_slot_board_groups_car_and_bike_slots_and_a_named_type_filters_it(db_session):
+    car = _car_and_bike(db_session)
+    tools = orchestrator(db_session, FakeLLM([])).parking_agent.tools
+    agent = orchestrator(db_session, FakeLLM([])).parking_agent
+
+    tools.turn_text = "reserve a slot day after tomorrow"
+    both = tools.execute("list_parking_slots", {"dates": ["2026-10-07"]}, session_id="s", active_plan=None)
+    text = agent.board_text(both.data)
+    assert f"Car slots for {car.registration_number}:" in text
+    assert "Motorcycle slots for TN84P2145:\n- M-01: free" in text
+    assert "a motorcycle slot books your bike" in text
+
+    tools.turn_text = "is any bike slot free day after tomorrow"
+    bikes = tools.execute("list_parking_slots", {"dates": ["2026-10-07"]}, session_id="s", active_plan=None)
+    assert [slot["slot"] for slot in bikes.data["days"][0]["slots"]] == ["M-01"]
+
+
+def test_choosing_the_vehicle_by_saying_car_builds_the_plan(db_session):
+    car = _car_and_bike(db_session)
+    tools = orchestrator(db_session, FakeLLM([])).parking_agent.tools
+    active = {"dates": ["2026-10-07"], "slot_code": "B-21"}
+
+    tools.turn_text = "car"
+    execution = tools.execute(
+        "build_parking_plan", {"slot": "B-21", "vehicle": car.registration_number},
+        session_id="s", active_plan=active,
+    )
+
+    assert execution.ok, execution.data
+    assert execution.data["eligible"] and execution.data["vehicle"] == car.registration_number
+
+
+def test_a_bike_only_employee_cannot_ask_for_a_car_slot(db_session):
+    _car_and_bike(db_session)
+    parking = orchestrator(db_session, FakeLLM([])).parking
+    me = actor(db_session)
+    car = next(item for item in parking.list_vehicles(me) if item.vehicle_type.value == "CAR")
+    db_session.get(Vehicle, car.id).active = False
+    db_session.commit()
+
+    with pytest.raises(NotFoundError, match="You do not have a registered car"):
+        parking.slot_board(me, [date(2026, 10, 7)], "car")
+    plan = parking.build_parking_plan(me, [date(2026, 10, 7)], "B-21")
+    assert not plan.eligible and "is a car slot" in plan.problems[0]
+    assert parking.build_parking_plan(me, [date(2026, 10, 7)], "M-01").eligible

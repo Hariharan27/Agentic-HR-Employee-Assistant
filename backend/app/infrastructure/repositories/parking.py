@@ -91,7 +91,11 @@ class SQLAlchemyParkingRepository:
     @staticmethod
     def _slot_order():
         # Regular slots first; accessible slots are offered last.
-        return (case((ParkingSlot.slot_type == ParkingSlotType.ACCESSIBLE.value, 1), else_=0), ParkingSlot.code)
+        return (
+            ParkingSlot.vehicle_type,
+            case((ParkingSlot.slot_type == ParkingSlotType.ACCESSIBLE.value, 1), else_=0),
+            ParkingSlot.code,
+        )
 
     def list_active_slots(self) -> list[ParkingSlotData]:
         rows = self.db.scalars(
@@ -345,6 +349,7 @@ class SQLAlchemyParkingRepository:
             row.location,
             ParkingSlotType(row.slot_type),
             row.active,
+            VehicleType(row.vehicle_type or "CAR"),
         )
 
     @classmethod

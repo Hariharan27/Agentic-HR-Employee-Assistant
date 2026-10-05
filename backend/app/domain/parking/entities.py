@@ -51,6 +51,7 @@ class ParkingSlotData:
     location: str
     slot_type: ParkingSlotType
     active: bool
+    vehicle_type: VehicleType = VehicleType.CAR
 
 
 @dataclass(frozen=True, slots=True)

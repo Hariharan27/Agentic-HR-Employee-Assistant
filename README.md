@@ -20,7 +20,8 @@ and Parking Administrator attendance workflows end to end.
 - Onboarding in chat or by form (one shared draft) with independent HR administrator approval,
   atomic account activation and one-time credentials
 - Up to two vehicles per employee (list, update, remove; blocked while a booking uses the vehicle)
-- Parking with all five slots listed for the employee to choose, waitlist, and Parking Admin
+- Separate car slots (B-21 to B-25) and motorcycle slots (M-01 to M-04): each vehicle sees and books
+  only the slots for its type; the chosen slot's type picks the vehicle. Waitlist, and Parking Admin
   attendance workflows (check-in, late cancellation, no-show, completion, override)
 - Explicit confirmation before every database mutation, revalidated at confirmation time
 - **Live agent activity**: the UI shows each routing decision, model step and tool call while the

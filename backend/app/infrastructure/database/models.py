@@ -262,6 +262,8 @@ class ParkingSlot(Base):
     code: Mapped[str] = mapped_column(String(24), unique=True)
     location: Mapped[str] = mapped_column(String(120))
     slot_type: Mapped[str] = mapped_column(String(24), default="REGULAR")
+    # Cars park in car slots and motorcycles in bike slots.
+    vehicle_type: Mapped[str] = mapped_column(String(16), default="CAR", server_default="CAR")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -270,6 +272,9 @@ class ParkingSlot(Base):
     __table_args__ = (
         CheckConstraint(
             "slot_type IN ('REGULAR', 'ACCESSIBLE')", name="ck_parking_slots_type"
+        ),
+        CheckConstraint(
+            "vehicle_type IN ('CAR', 'MOTORCYCLE')", name="ck_parking_slots_vehicle_type"
         ),
         Index("ix_parking_slots_active_type", "active", "slot_type"),
     )

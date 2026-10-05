@@ -119,11 +119,15 @@ DEMO_BALANCES = {
 }
 
 DEMO_PARKING_SLOTS = (
-    ("B-21", "Chennai HQ - Basement B", "REGULAR"),
-    ("B-22", "Chennai HQ - Basement B", "REGULAR"),
-    ("B-23", "Chennai HQ - Basement B", "REGULAR"),
-    ("B-24", "Chennai HQ - Basement B", "REGULAR"),
-    ("B-25", "Chennai HQ - Basement B", "ACCESSIBLE"),
+    ("B-21", "Chennai HQ - Basement B", "REGULAR", "CAR"),
+    ("B-22", "Chennai HQ - Basement B", "REGULAR", "CAR"),
+    ("B-23", "Chennai HQ - Basement B", "REGULAR", "CAR"),
+    ("B-24", "Chennai HQ - Basement B", "REGULAR", "CAR"),
+    ("B-25", "Chennai HQ - Basement B", "ACCESSIBLE", "CAR"),
+    ("M-01", "Chennai HQ - Two-wheeler bay", "REGULAR", "MOTORCYCLE"),
+    ("M-02", "Chennai HQ - Two-wheeler bay", "REGULAR", "MOTORCYCLE"),
+    ("M-03", "Chennai HQ - Two-wheeler bay", "REGULAR", "MOTORCYCLE"),
+    ("M-04", "Chennai HQ - Two-wheeler bay", "REGULAR", "MOTORCYCLE"),
 )
 
 LEGACY_DEMO_EMPLOYEE_CODES = ("E1001", "M1001", "H1001", "H1002")
@@ -373,13 +377,17 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
                 balance.used_days = Decimal(used)
                 balance.carry_forward_limit_days = Decimal(carry_forward_limit)
 
-    for code, location, slot_type in DEMO_PARKING_SLOTS:
+    for code, location, slot_type, slot_vehicle_type in DEMO_PARKING_SLOTS:
         slot = db.scalar(select(ParkingSlot).where(ParkingSlot.code == code))
         if slot is None:
-            db.add(ParkingSlot(code=code, location=location, slot_type=slot_type, active=True))
-        elif reset_demo:
+            db.add(ParkingSlot(
+                code=code, location=location, slot_type=slot_type,
+                vehicle_type=slot_vehicle_type, active=True,
+            ))
+        elif reset_demo or slot.vehicle_type != slot_vehicle_type:
             slot.location = location
             slot.slot_type = slot_type
+            slot.vehicle_type = slot_vehicle_type
             slot.active = True
 
     # The fallback employee account keeps one registered vehicle so parking can be tried (and

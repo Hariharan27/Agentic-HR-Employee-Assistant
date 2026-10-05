@@ -557,21 +557,19 @@ Add one more car
 Which parking slots are free today?
 ```
 
-> Expected: All five slots; B-21 taken; B-25 accessible, listed last. It asks which slot you want.
+> Expected: Slots grouped by vehicle: **Car slots for TN01NL2026** (B-21 taken, B-25 accessible listed last) and **Motorcycle slots** for the bike (M-01 to M-04). It asks which slot you want: a car slot books the car, a bike slot books the bike.
 
-### 48. Pick a slot; it asks which vehicle
+Optional: `Is a bike slot free today?` shows only the motorcycle slots.
+
+### 48. Pick a slot; the slot type picks the vehicle
 
 ```text
 I'll take B-22
 ```
 
-```text
-Use my car, TN01NL2026
-```
-
 **Confirm** → **NILA_PARK_TODAY**.
 
-> Expected: Asks which of the two vehicles → booking summary for B-22 with TN01NL2026.
+> Expected: B-22 is a car slot, so it uses the car without asking: "Parking for your car TN01NL2026…". Asking for a car slot for the bike (or a car slot when you only have a bike) is refused with the slots that fit.
 
 ### 49. My bookings
 

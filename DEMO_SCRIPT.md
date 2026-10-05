@@ -554,17 +554,17 @@ vehicle removed, only while no upcoming booking uses it.
    ```text
    Which parking slots are available today?
    ```
-   Expected: all five slots. **B-21 taken** (Advik), B-22 to B-24 free, and B-25 accessible, listed
-   last. It asks which slot you want; it never picks one for you.
-8. **Book a slot; with two vehicles it asks which one.**
+   Expected: slots grouped by vehicle. **Car slots for TN01NL2026**: **B-21 taken** (Advik), B-22 to
+   B-24 free, B-25 accessible listed last. **Motorcycle slots for TN01NL7777**: M-01 to M-04 free.
+   It asks which slot you want; it never picks one for you. (`Is a bike slot free today?` shows only
+   the motorcycle slots.)
+8. **Book a slot; the slot type picks the vehicle.**
    ```text
    B-22 please
    ```
-   Expected: "You have two registered vehicles (TN01NL2026 and TN01NL7777). Which one should I use?"
-   ```text
-   use TN01NL2026
-   ```
-   Expected: the booking summary for B-22 with vehicle TN01NL2026. **Confirm** →
+   Expected: B-22 is a car slot, so no vehicle question: "Parking for your car TN01NL2026…".
+   A car slot can never be booked for the bike (it is refused with the bike slots instead).
+   **Confirm** →
    `<NILA_PARK_TODAY>`.
    ```text
    Show my parking reservations
