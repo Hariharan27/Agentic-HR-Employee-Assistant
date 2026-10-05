@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Any
 
@@ -79,6 +80,7 @@ class LeaveAgent(ToolAgent):
         conversation: list[dict[str, str]],
         leave_plan: dict[str, Any] | None,
         llm_calls: int,
+        intent: str | None = None,
     ) -> AgentRunState:
         result = super().invoke(
             session_id=session_id,
@@ -86,6 +88,7 @@ class LeaveAgent(ToolAgent):
             conversation=conversation,
             active_plan=leave_plan,
             llm_calls=llm_calls,
+            intent=intent,
         )
         result["leave_plan"] = result.get("active_plan")  # type: ignore[typeddict-unknown-key]
         return result
@@ -96,39 +99,286 @@ class LeaveAgent(ToolAgent):
     def describe_active_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
         return {key: plan.get(key) for key in ("plan_id", "leave_type", "requested_dates", "eligible", "summary")}
 
+    # ------------------------------------------------------------------ deterministic presentation
+
+    def fallback_message(self, state: AgentRunState) -> str:
+        return "Please provide the leave type and the start date and end date."
+
+    @staticmethod
+    def balance_text(data: dict[str, Any]) -> str | None:
+        balances = data.get("balances", [])
+        if not balances:
+            return None
+        lines = [
+            f"{entry['leave_type'].title()} {entry['available_days']} days available "
+            f"(total {entry['total_days']}, used {entry['used_days']}, pending {entry['pending_days']})"
+            for entry in balances
+        ]
+        if len(lines) == 1:
+            return f"Your leave balance: {lines[0]}."
+        return "Your leave balance:\n" + "\n".join(f"- {line}" for line in lines)
+
+    @staticmethod
+    def requests_text(tool: str, data: dict[str, Any]) -> str:
+        requests = data.get("requests", [])
+        managed = tool == "get_managed_leave_requests"
+        if not requests:
+            return "There are no pending leave requests." if managed else "You do not have any leave requests."
+        heading = "Pending leave approvals:" if managed else "Your recent leave requests:"
+        return heading + "\n" + "\n".join(
+            f"- Request ID #{entry['request_id']}: {entry['leave_type'].title()} {entry['start_date']} to "
+            f"{entry['end_date']}, {entry['working_days']} working day(s), {entry['status'].title()}"
+            + (f" ({entry['employee_name']})" if managed and entry.get("employee_name") else "")
+            for entry in requests
+        )
+
+    @staticmethod
+    def plan_text(data: dict[str, Any]) -> str:
+        return str(data["summary"]) + (" Would you like me to apply it?" if data.get("eligible") else "")
+
+    def present(self, item: dict[str, Any]) -> str | None:
+        """Fixed wording for a successful read-only result, or None if it has no fixed form."""
+        tool, data = item.get("tool"), item.get("result", {})
+        if tool in {"build_leave_plan", "shift_leave_plan"} and data.get("summary"):
+            return self.plan_text(data)
+        if tool == "get_leave_balance":
+            return self.balance_text(data)
+        if tool in {"get_my_leave_requests", "get_managed_leave_requests"}:
+            return self.requests_text(str(tool), data)
+        if tool == "calculate_leave_days":
+            return f"That range contains {data.get('working_days')} working leave day(s)."
+        if tool == "get_holidays":
+            names = data.get("names") or {}
+            if not names:
+                return "There are no configured holidays in that range."
+            return "Configured holidays in that range:\n" + "\n".join(
+                f"- {day} ({name})" for day, name in names.items()
+            )
+        return None
+
     def render_from_results(self, state: AgentRunState) -> str | None:
         """Build a reply only from tool results already returned in this turn."""
-        results = state.get("tool_results", [])
-        for item in reversed(results):
-            tool, data, ok = item.get("tool"), item.get("result", {}), item.get("status") == "success"
-            if tool in {"build_leave_plan", "shift_leave_plan"} and ok and data.get("summary"):
-                text = str(data["summary"])
-                return text + (" Would you like me to apply it?" if data.get("eligible") else "")
-            if not ok:
-                return self.friendly_failure(str(tool), data)
-            if tool == "get_leave_balance":
-                balances = data.get("balances", [])
-                if len(balances) == 1:
-                    entry = balances[0]
-                    return (
-                        f"You have {entry['available_days']} days of {entry['leave_type'].title()} leave available "
-                        f"(total {entry['total_days']}, used {entry['used_days']}, pending {entry['pending_days']})."
-                    )
-                if balances:
-                    return "Your leave balance:\n" + "\n".join(
-                        f"{entry['leave_type'].title()}: {entry['available_days']} available" for entry in balances
-                    )
-            if tool in {"get_my_leave_requests", "get_managed_leave_requests"}:
-                requests = data.get("requests", [])
-                heading = "Pending leave approvals:" if tool == "get_managed_leave_requests" else "Your recent leave requests:"
-                if not requests:
-                    return heading + " None."
-                return heading + "\n" + "\n".join(
-                    f"#{entry['request_id']}: {entry['leave_type'].title()} {entry['start_date']} to "
-                    f"{entry['end_date']}, {entry['working_days']} day(s), {entry['status'].title()}"
-                    for entry in requests
-                )
+        for item in reversed(state.get("tool_results", [])):
+            if item.get("status") != "success":
+                return self.friendly_failure(str(item.get("tool")), item.get("result", {}))
+            text = self.present(item)
+            if text:
+                return text
         return None
+
+    # ------------------------------------------------------------------ finalisation
+
+    ID_INTENTS = {"cancel_leave_request", "leave_request_history", "approve_leave_request", "reject_leave_request"}
+    PLAN_INTENTS = {"apply_leave", "leave_eligibility"}
+    _TYPES = (
+        (re.compile(r"\b(?:casual|casula|casaul|cl)\b", re.I), "CASUAL"),
+        (re.compile(r"\b(?:sick|sl)\b", re.I), "SICK"),
+        (re.compile(r"\b(?:earned|el)\b", re.I), "EARNED"),
+    )
+    _OTHER_TYPES = re.compile(r"\b(?:privilege|pl|maternity|paternity|adoption|lwp|comp[ -]?off)\b", re.I)
+    _BARE_CANCEL = re.compile(r"^\s*(?:cancel|stop|discard|never ?mind|no)\W*$", re.I)
+
+    @staticmethod
+    def covers(message: str, phrases: list[str]) -> bool:
+        """Whether the model's answer states every key fact (ignoring bold and dash variants)."""
+        normalized = re.sub(r"\s+", " ", message.replace("**", "").replace("\u2011", "-").replace("\u2010", "-")).casefold()
+        return bool(message.strip()) and all(phrase.casefold() in normalized for phrase in phrases)
+
+    def balance_stated(self, message: str, data: dict[str, Any]) -> bool:
+        balances = data.get("balances", [])
+        return bool(balances) and all(
+            self.covers(message, [entry["leave_type"].lower(), str(entry["available_days"]), "available"])
+            for entry in balances
+        )
+
+    def plan_stated(self, message: str, data: dict[str, Any]) -> bool:
+        if not data.get("eligible") or data.get("split_with"):
+            return False
+        days = str(data.get("total_working_days"))
+        phrases = [f"{days} working day", "eligible", *(item["date"] for item in data.get("excluded_days", []))]
+        return self.covers(message, phrases) and "not eligible" not in message.casefold()
+
+    @classmethod
+    def mentioned_type(cls, text: str) -> str | None:
+        found = [(match.start(), kind) for pattern, kind in cls._TYPES for match in pattern.finditer(text)]
+        return max(found)[1] if found else None
+
+    @staticmethod
+    def _latest(results: list[dict[str, Any]], *tools: str) -> dict[str, Any] | None:
+        for item in reversed(results):
+            if item.get("tool") in tools:
+                return item
+        return None
+
+    def finalize(self, state: AgentRunState, message: str) -> AgentRunState | None:
+        intent = state.get("intent")
+        text = state.get("user_message", "")
+        results = state.get("tool_results", [])
+        active = state.get("active_plan")
+
+        if intent == "cancel_leave_request" and self._BARE_CANCEL.match(text) and active:
+            return {"response": "Okay, I cancelled that leave plan. No changes were made.", "active_plan": None}
+
+        if intent in self.ID_INTENTS and not re.search(r"\d", text):
+            listing = self._latest(results, "get_my_leave_requests", "get_managed_leave_requests")
+            reply = "Please provide the request ID."
+            if listing and listing.get("status") == "success" and listing["result"].get("requests"):
+                reply += "\n\n" + self.requests_text(str(listing["tool"]), listing["result"])
+            return {"response": reply}
+
+        if intent == "leave_balance" and not self._OTHER_TYPES.search(text):
+            item = self._latest(results, "get_leave_balance")
+            prefix = ""
+            if item is None:
+                # The model declined (e.g. another employee's balance): show only the caller's own.
+                state = self.execute_inline(state, "get_leave_balance", {"leave_type": self.mentioned_type(text)})
+                item = self._latest(state.get("tool_results", []), "get_leave_balance")
+                prefix = "I can only show your own leave balance. "
+            if item and item.get("status") == "success":
+                if not prefix and self.repairable(state, message):
+                    return None  # let the model correct its own numbers first
+                if not prefix and self.balance_stated(message, item["result"]):
+                    return None  # the model's own wording states every balance; keep it
+                rendered = self.balance_text(item["result"])
+                if rendered:
+                    return {**state, "response": prefix + rendered}
+            return None
+
+        listing_tool = {"leave_requests": "get_my_leave_requests", "manager_leave_requests": "get_managed_leave_requests"}.get(
+            intent or ""
+        )
+        if listing_tool:
+            item = self._latest(results, listing_tool)
+            if item is None:
+                state = self.execute_inline(state, listing_tool, {})
+                item = self._latest(state.get("tool_results", []), listing_tool)
+            if item and item.get("status") == "success":
+                return {**state, "response": self.requests_text(listing_tool, item["result"])}
+            return None
+
+        if intent in self.PLAN_INTENTS and not self._OTHER_TYPES.search(text):
+            return self._finalize_plan(state, str(intent), message)
+
+        last = results[-1] if results else None
+        if last and last.get("status") == "success" and last.get("tool") in {"calculate_leave_days", "get_holidays"}:
+            return {"response": self.present(last)}
+        if last and last.get("status") != "success" and intent == "calculate_leave_days":
+            return {"response": self.friendly_failure(str(last.get("tool")), last.get("result", {}))}
+        return None
+
+    def _finalize_plan(self, state: AgentRunState, intent: str, message: str) -> AgentRunState | None:
+        results = state.get("tool_results", [])
+        if self._latest(results, "prepare_leave_application"):
+            # A prepare attempt already failed; its reason is the answer.
+            return None
+        plan_item = self._latest(results, "build_leave_plan", "shift_leave_plan")
+        if plan_item is not None and plan_item.get("status") != "success":
+            return None
+        if plan_item is None:
+            if re.search(r"\b(?:rest|remaining|split|cover|combine)\b", state.get("user_message", ""), re.I):
+                return None  # a split choice needs the model's build with split_with
+            state, plan_item, ask = self._complete_plan(state, intent)
+            if ask:
+                return {**state, "response": ask}
+            if plan_item is None or plan_item.get("status") != "success":
+                return None if plan_item is None else {**state, "response": self.render_from_results(state)}
+        data = plan_item["result"]
+        if (
+            intent == "apply_leave"
+            and data.get("eligible")
+            and data.get("plan_id")
+            and plan_item.get("tool") != "shift_leave_plan"
+        ):
+            prepared = self.execute_inline(state, "prepare_leave_application", {"plan_id": data["plan_id"]})
+            if prepared.get("response"):
+                return prepared
+            return {**prepared, "response": self.render_from_results(prepared) or self.plan_text(data)}
+        if plan_item in state.get("tool_results", []) and self.plan_stated(message, data):
+            return None  # the model's explanation states the plan's key facts; keep it
+        return {**state, "response": self.plan_text(data)}
+
+    def _complete_plan(
+        self, state: AgentRunState, intent: str
+    ) -> tuple[AgentRunState, dict[str, Any] | None, str | None]:
+        """Finish a plan the model stopped short of, or ask exactly for what is missing."""
+        text = state.get("user_message", "")
+        active = state.get("active_plan") if isinstance(state.get("active_plan"), dict) else None
+        resolved = self._latest(state.get("tool_results", []), "resolve_dates")
+        if resolved is None:
+            state = self.execute_inline(state, "resolve_dates", {"text": text[:300]})
+            resolved = self._latest(state.get("tool_results", []), "resolve_dates")
+        if resolved and resolved.get("status") != "success":
+            return state, None, self.friendly_failure("resolve_dates", resolved.get("result", {}))
+        data = resolved.get("result", {}) if resolved else {}
+        dates = [item["date"] for item in data.get("dates", [])]
+        question = data.get("question")
+        if question and not str(question).startswith("Which day or days in"):
+            question = None  # the generic "which dates" prompt; ask with the fixed wording instead
+        type_now = self.mentioned_type(text)
+
+        if not dates and not type_now and active and active.get("plan_id"):
+            # "apply it" / "go ahead": the active plan is the subject.
+            item = {"tool": "build_leave_plan", "status": "success", "result": active}
+            return state, item, None
+
+        leave_type = type_now or (active or {}).get("leave_type") or self._earlier_type(state)
+        if not dates and not question:
+            if type_now and active and active.get("requested_dates"):
+                dates = list(active["requested_dates"])
+            else:
+                dates = self._earlier_dates(state)
+        if leave_type and dates:
+            state = self.execute_inline(state, "build_leave_plan", {"leave_type": leave_type, "dates": dates})
+            return state, self._latest(state.get("tool_results", []), "build_leave_plan"), None
+        if question and not dates:
+            ask = str(question)
+            if not leave_type:
+                ask += " Please provide the leave type too: casual, sick or earned."
+            return state, None, ask
+        if not leave_type and not dates:
+            return state, None, "Please provide the leave type (casual, sick or earned) and the start date and end date."
+        if not leave_type:
+            span = dates[0] if len(dates) == 1 else f"{dates[0]} to {dates[-1]}"
+            return state, None, f"Please provide the leave type for {span}: casual, sick or earned."
+        return state, None, f"Please provide the start date and end date for your {str(leave_type).title()} leave."
+
+    _ASKING = re.compile(r"^(?:please provide|which day or days)", re.I)
+
+    def _earlier_user_messages(self, state: AgentRunState) -> list[str]:
+        """User messages that were answered with a request for missing leave details, newest first.
+
+        Only an unbroken chain of "Please provide ..." exchanges counts, so details from a finished
+        or cancelled request never leak into a new one.
+        """
+        current = state.get("user_message", "")
+        conversation = list(state.get("conversation", []))
+        if conversation and conversation[-1].get("role") == "user" and conversation[-1].get("content") == current:
+            conversation = conversation[:-1]
+        collected: list[str] = []
+        index = len(conversation) - 1
+        while index >= 1 and len(collected) < 3:
+            reply, asked = conversation[index], conversation[index - 1]
+            if reply.get("role") != "assistant" or asked.get("role") != "user":
+                break
+            if not self._ASKING.match(str(reply.get("content", "")).strip()):
+                break
+            collected.append(str(asked.get("content", "")))
+            index -= 2
+        return collected
+
+    def _earlier_type(self, state: AgentRunState) -> str | None:
+        for message in self._earlier_user_messages(state):
+            found = self.mentioned_type(message)
+            if found:
+                return found
+        return None
+
+    def _earlier_dates(self, state: AgentRunState) -> list[str]:
+        for message in self._earlier_user_messages(state):
+            execution = self.tools.execute("resolve_dates", {"text": message[:300]}, session_id=state["session_id"])
+            if execution.ok and execution.data.get("dates"):
+                return [item["date"] for item in execution.data["dates"]]
+        return []
 
     @staticmethod
     def friendly_failure(tool: str, data: dict[str, Any]) -> str:

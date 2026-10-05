@@ -81,6 +81,8 @@ class AgentDecision(BaseModel):
 class AgentRunState(TypedDict, total=False):
     session_id: str
     user_message: str
+    # Router intent for this turn (e.g. "apply_leave"), used by deterministic finalisers.
+    intent: str | None
     conversation: list[dict[str, str]]
     # The domain's active working object (a leave plan, an onboarding draft or plan).
     active_plan: dict[str, Any] | None
@@ -142,6 +144,36 @@ class ToolAgent:
                 return self.friendly_failure(str(item.get("tool")), item.get("result", {}))
         return None
 
+    def fallback_message(self, state: AgentRunState) -> str:
+        """Reply when the model failed and no tool result can be presented."""
+        return "I couldn't complete that request safely. Please tell me again what you need."
+
+    def finalize(self, state: AgentRunState, message: str) -> AgentRunState | None:
+        """Deterministic override of the model's final answer, or None to keep it.
+
+        Domains use this to present tool results in a fixed format and to finish a workflow the
+        model stopped short of (for example staging the confirmation after an eligible plan).
+        """
+        return None
+
+    def execute_inline(self, state: AgentRunState, name: str, arguments: dict[str, Any]) -> AgentRunState:
+        """Run one tool exactly like the tool node would and return the merged state."""
+        updates = self._tool_node({**state, "pending_tool_calls": [{"name": name, "arguments": arguments}]})
+        return {**state, **updates}
+
+    def repairable(self, state: AgentRunState, message: str) -> bool:
+        """The answer states ungrounded values and the model still has a repair turn."""
+        return bool(message) and bool(self._ungrounded_values(message, state)) and (
+            state.get("repairs", 0) < self.settings.leave_agent_max_repairs
+        )
+
+    @staticmethod
+    def last_success(state: AgentRunState) -> dict[str, Any] | None:
+        results = state.get("tool_results", [])
+        if results and results[-1].get("status") == "success":
+            return results[-1]
+        return None
+
     @staticmethod
     def friendly_failure(tool: str, data: dict[str, Any]) -> str:
         details = data.get("reason") or data.get("error")
@@ -174,10 +206,12 @@ class ToolAgent:
         conversation: list[dict[str, str]],
         active_plan: dict[str, Any] | None,
         llm_calls: int,
+        intent: str | None = None,
     ) -> AgentRunState:
         initial: AgentRunState = {
             "session_id": session_id,
             "user_message": user_message,
+            "intent": intent,
             "conversation": conversation[-8:],
             "active_plan": active_plan,
             "tool_results": [],
@@ -263,6 +297,12 @@ class ToolAgent:
         }
         if decision.action == "final":
             message = (decision.message or "").strip()
+            finalized = self.finalize({**state, **updates}, message)
+            if finalized is not None:
+                finalized["pending_tool_calls"] = []
+                if finalized.get("final_status") in (None, "running"):
+                    finalized["final_status"] = "completed"
+                return {**updates, **finalized}
             ungrounded = self._ungrounded_values(message, state)
             if ungrounded:
                 logger.warning(
@@ -348,10 +388,15 @@ class ToolAgent:
                 "feedback": [note],
                 "pending_tool_calls": [],
             }
+        finalized = self.finalize({**state, "iterations": iteration, "llm_calls": llm_calls}, "")
+        if finalized is not None and finalized.get("response"):
+            finalized["pending_tool_calls"] = []
+            if finalized.get("final_status") in (None, "running"):
+                finalized["final_status"] = "completed_fallback"
+            return {"iterations": iteration, "llm_calls": llm_calls, **finalized}
         rendered = self.render_from_results(state)
         return {
-            "response": rendered
-            or "I couldn't complete that request safely. Please tell me again what you need.",
+            "response": rendered or self.fallback_message(state),
             "pending_tool_calls": [],
             "iterations": iteration,
             "llm_calls": llm_calls,
@@ -367,6 +412,8 @@ class ToolAgent:
     def _clean_reply(message: str) -> str:
         """Keep only the Markdown the chat UI renders (**bold**, "- " bullets)."""
         cleaned = message.replace("\u202f", " ").replace("\u00a0", " ")
+        # Non-breaking hyphens and dashes in dates ("2026\u201110\u201106") become plain hyphens.
+        cleaned = re.sub(r"(?<=\d)[\u2010\u2011\u2012](?=\d)", "-", cleaned).replace("\u2011", "-")
         cleaned = re.sub(r"__(.+?)__", r"**\1**", cleaned, flags=re.S)
         cleaned = re.sub(r"^\s{0,3}#{1,6}\s+", "", cleaned, flags=re.M)
         return re.sub(r"[ \t]{2,}", " ", cleaned).strip()

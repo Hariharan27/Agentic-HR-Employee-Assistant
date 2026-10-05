@@ -154,3 +154,23 @@ def test_a_month_without_a_day_asks_which_day(text, question):
 
     assert result.ambiguous
     assert question in result.question
+
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Can I take casual leave on Saturday 2026-11-07?", ["2026-11-07"]),
+        ("on Wednesday, 18 Nov", ["2026-11-18"]),
+        ("12 Oct (Monday)", ["2026-10-12"]),
+    ],
+)
+def test_a_weekday_next_to_an_explicit_date_only_labels_it(text, expected):
+    assert iso(resolve_leave_dates(text, MONDAY)) == expected
+
+
+def test_weekday_labelled_range_stays_one_range():
+    result = resolve_leave_dates("Monday 12 Oct to Friday 16 Oct", MONDAY)
+
+    assert result.shape == "range"
+    assert (iso(result)[0], iso(result)[-1]) == ("2026-10-12", "2026-10-16")

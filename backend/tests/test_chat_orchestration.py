@@ -1295,12 +1295,11 @@ def test_employee_cannot_approve_a_leave_request_through_chat(db_session):
         actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
     )
 
-    result = orchestrator(db_session, FakeLLM([route(intent="leave_requests")])).chat(
-        "employee-approve", f"Approve leave request #{created.id}"
-    )
-
-    assert "authorized" in result.message
-    assert result.pending_action is None
+    # The role gate fails before any model call, so the API answers 403.
+    with pytest.raises(AuthorizationError):
+        orchestrator(db_session, FakeLLM([route(intent="approve_leave_request")])).chat(
+            "employee-approve", f"Approve leave request #{created.id}"
+        )
 
 
 def test_authorized_request_history_is_available_in_chat(db_session):
@@ -1412,7 +1411,7 @@ def test_apply_leave_remembers_type_then_accepts_date_follow_up(db_session):
     proposal = service.chat("leave-type-first", "5th october")
 
     assert "leave type" in missing_type.message
-    assert "start and end dates" in missing_dates.message
+    assert "start date and end date" in missing_dates.message
     assert proposal.intent == "apply_leave"
     assert "Casual leave from 2026-10-05 to 2026-10-05" in proposal.message
     assert proposal.pending_action is not None
@@ -1686,7 +1685,7 @@ def test_leave_agent_falls_back_to_tool_results_after_repeated_malformed_output(
         "agent-balance-recovery", "How much casual leave do I have?"
     )
 
-    assert "You have 4 days of Casual leave available" in result.message
+    assert "Casual 4 days available" in result.message
     assert result.intent == "leave_balance"
     assert [event["tool"] for event in result.agent_activity] == ["get_leave_balance"]
     assert result.pending_action is None
@@ -1710,7 +1709,7 @@ def test_leave_agent_repairs_one_malformed_output_with_the_validation_error(db_s
 def test_leave_agent_regenerates_an_answer_with_numbers_not_in_tool_results(db_session):
     llm = FakeLLM([
         route(intent="leave_balance"),
-        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {}}]}),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
         json.dumps({"action": "final", "message": "You have 7 casual leave days left."}),
         json.dumps({"action": "final", "message": "You have 4 casual leave days available."}),
     ])
@@ -1730,7 +1729,7 @@ def test_leave_agent_never_shows_an_answer_that_stays_ungrounded(db_session):
 
     result = orchestrator(db_session, llm).chat("agent-grounding-fallback", "How much casual leave do I have?")
 
-    assert "You have 4 days of Casual leave available" in result.message
+    assert "Casual 4 days available" in result.message
     assert "7" not in result.message and "6 casual" not in result.message
 
 
@@ -1739,7 +1738,7 @@ def test_leave_agent_feeds_tool_errors_back_so_the_model_can_correct_itself(db_s
         route(intent="leave_eligibility"),
         json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "VACATION", "dates": ["2026-10-12"]}}]}),
         json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": ["2026-10-12"]}}]}),
-        json.dumps({"action": "final", "message": "Yes, 1 working day of casual leave on 2026-10-12 is fine; 3 days remain."}),
+        json.dumps({"action": "final", "message": "Yes, you are eligible: 1 working day of casual leave on 2026-10-12; 3 days remain."}),
     ])
 
     result = orchestrator(db_session, llm).chat("agent-tool-error", "Can I take casual leave on 12 October?")
@@ -1841,7 +1840,7 @@ def test_leave_agent_context_then_apply_it_stays_behind_confirmation(db_session)
     first = service.chat("agent-context", "I want to take casual leave")
     proposal = service.chat("agent-context", "Apply it on October 12")
 
-    assert "start and end dates" in first.message
+    assert "start date and end date" in first.message
     assert "Reply yes to confirm" in proposal.message
     assert "2026-10-12 to 2026-10-12" in proposal.message
     assert [event["tool"] for event in proposal.agent_activity] == [
@@ -1897,12 +1896,9 @@ def test_leave_agent_rejects_unauthorized_manager_action_without_mutation(db_ses
         json.dumps({"action": "final", "message": "You are not authorized to approve that leave request."}),
     ])
 
-    result = orchestrator(db_session, llm).chat(
-        "agent-authorization", "Approve leave request #999"
-    )
-
-    assert "not authorized" in result.message
-    assert result.pending_action is None
+    with pytest.raises(AuthorizationError):
+        orchestrator(db_session, llm).chat("agent-authorization", "Approve leave request #999")
+    assert llm.calls.count(("standard", True)) == 0
 
 
 def test_leave_tools_reject_model_supplied_identity_fields(db_session):
@@ -1931,7 +1927,7 @@ def test_leave_agent_stops_at_configured_iteration_limit(db_session):
     ).chat("agent-limit", "How much casual leave do I have?")
 
     assert "stopped early" in result.message
-    assert "4 days of Casual leave" in result.message
+    assert "Casual 4 days available" in result.message
     assert result.pending_action is None
     assert result.agent_activity[0]["tool"] == "get_leave_balance"
 
@@ -2496,3 +2492,68 @@ def test_waitlist_is_refused_while_slots_are_free(db_session):
 
     assert not plan.eligible
     assert "are free, so the waitlist is not needed" in plan.problems[0]
+
+
+def test_apply_intent_stages_confirmation_when_the_model_stops_at_an_eligible_plan(db_session):
+    llm = FakeLLM([
+        route(intent="apply_leave", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": ["2026-10-12"]}}]}),
+        json.dumps({"action": "final", "message": "You are eligible. Shall I prepare it?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-apply", "Apply casual leave on 12 October")
+
+    assert result.pending_action is not None
+    assert result.message.startswith("Apply for 1 working day(s) of Casual leave from 2026-10-12 to 2026-10-12")
+    assert "Reply yes to confirm or cancel" in result.message
+
+
+def test_missing_leave_type_is_asked_then_the_follow_up_reuses_the_asked_dates(db_session):
+    service = orchestrator(db_session, FakeLLM([
+        route(intent="apply_leave"),
+        json.dumps({"action": "final", "message": "Which leave type?"}),
+        route(intent="apply_leave", leave_type="CASUAL"),
+        json.dumps({"action": "final", "message": "Okay."}),
+    ]))
+
+    asked = service.chat("finalize-follow-up", "Apply leave on 12 October")
+    proposal = service.chat("finalize-follow-up", "casual")
+
+    assert asked.message == "Please provide the leave type for 2026-10-12: casual, sick or earned."
+    assert asked.pending_action is None
+    assert proposal.pending_action is not None
+    assert "Casual leave from 2026-10-12 to 2026-10-12" in proposal.message
+
+
+def test_another_employees_balance_shows_only_the_callers_own(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance"),
+        json.dumps({"action": "final", "message": "I can't share that."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-identity", "Show employee E1002's casual leave balance")
+
+    assert result.message.startswith("I can only show your own leave balance. Your leave balance: Casual")
+    assert "E1002" not in result.message
+
+
+def test_request_id_is_asked_when_an_id_action_names_no_request(db_session):
+    llm = FakeLLM([
+        route(intent="cancel_leave_request"),
+        json.dumps({"action": "final", "message": "Which one?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-id", "Cancel my leave request")
+
+    assert result.message.startswith("Please provide the request ID.")
+    assert result.pending_action is None
+
+
+def test_plural_parking_reservations_route_to_the_reservation_list():
+    decision = RouteDecision.model_validate_json(route(domain="general", intent="general"))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Show my parking reservations", today=date(2026, 10, 4)
+    )
+
+    assert guarded.intent == "parking_reservations"

@@ -538,7 +538,9 @@ class HRAssistantOrchestrator:
             "Lead with the direct answer and use at most three short sentences unless the employee "
             "asks for steps or a detailed explanation. Use plain text only: no Markdown, headings, "
             "bullets, quotations, document names, page numbers, or inline citations. The interface "
-            "shows source documents separately. Use natural grammar and spacing, such as '12 days'."
+            "shows source documents separately. Use natural grammar and spacing, such as '12 days'. "
+            "Write leave types in full the first time (Earned Leave (EL), Privilege Leave (PL), "
+            "Casual Leave (CL), Sick Leave (SL))."
         )
         raw, calls = self._complete(
             state,
@@ -571,12 +573,18 @@ class HRAssistantOrchestrator:
         return cleaned.strip()
 
     def _handle_leave(self, state: AgentState) -> AgentState:
+        route: RouteDecision | None = state.get("route")
+        intent = route.intent if route else None
+        # Manager actions fail with 403 for employees before any model call.
+        if intent in {"approve_leave_request", "reject_leave_request", "manager_leave_requests"}:
+            require_role(self.actor, "MANAGER", "HR")
         result = self.leave_agent.invoke(
             session_id=state["session_id"],
             user_message=state["user_message"],
             conversation=state.get("messages", []),
             leave_plan=state.get("leave_plan"),
             llm_calls=state.get("llm_calls", 0),
+            intent=intent,
         )
         return {
             "response": result["response"],
@@ -609,6 +617,7 @@ class HRAssistantOrchestrator:
             conversation=state.get("messages", []),
             active_plan=draft,
             llm_calls=state.get("llm_calls", 0),
+            intent=route.intent,
         )
         return {
             "response": result["response"],
@@ -677,6 +686,7 @@ class HRAssistantOrchestrator:
                 conversation=state.get("messages", []),
                 active_plan=state.get("parking_plan"),
                 llm_calls=state.get("llm_calls", 0),
+                intent=route.intent,
             )
             return {
                 "response": result["response"],
@@ -1281,7 +1291,7 @@ class HRAssistantOrchestrator:
             elif re.search(r"\b(available|availability|can\s+i|get\s+parking)\b", normalized):
                 parking_intent = "parking_availability"
             elif re.search(r"\b(show|view|list|status|what(?:'s|\s+is))\b", normalized) and re.search(
-                r"\b(reservation|booking)\b", normalized
+                r"\b(reservations?|bookings?)\b", normalized
             ):
                 parking_intent = "parking_reservations"
             else:

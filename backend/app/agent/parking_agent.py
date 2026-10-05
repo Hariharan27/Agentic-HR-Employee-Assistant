@@ -73,6 +73,23 @@ class ParkingAgent(ToolAgent):
                 return str(data["question"])
         return None
 
+    def finalize(self, state: AgentRunState, message: str) -> AgentRunState | None:
+        results = state.get("tool_results", [])
+        if not results or any(item.get("tool") == "prepare_parking" for item in results):
+            return None
+        last = results[-1]
+        if last.get("status") != "success":
+            return None
+        if last.get("tool") == "build_parking_plan" and last["result"].get("eligible") and last["result"].get("plan_id"):
+            prepared = self.execute_inline(state, "prepare_parking", {"plan_id": last["result"]["plan_id"]})
+            if prepared.get("response"):
+                return prepared
+            return {**prepared, "response": self.render_from_results(prepared)}
+        if last.get("tool") == "list_parking_slots":
+            # Every slot is always listed exactly, so the employee can choose.
+            return {"response": self.board_text(last["result"])}
+        return None
+
     @staticmethod
     def friendly_failure(tool: str, data: dict[str, Any]) -> str:
         details = data.get("reason") or data.get("error")

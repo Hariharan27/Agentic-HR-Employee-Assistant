@@ -89,6 +89,8 @@ def resolve_leave_dates(
     between = bool(re.search(r"\bbetween\b", normalized[: mentions[0].start]))
     if len(mentions) == 2:
         gap = normalized[mentions[0].end : mentions[1].start]
+        # "Monday 12 Oct to Friday 16 Oct": weekday labels do not change the connector.
+        gap = re.sub(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[,]?", " ", gap)
         if _RANGE_CONNECTOR.match(gap) or (between and re.match(r"^\s*and\s*$", gap)):
             return _range(mentions[0].value, mentions[1].value)
 
@@ -283,8 +285,26 @@ def _mentions(normalized: str, today: date) -> list[_Mention]:
         week_start = today - timedelta(days=today.weekday()) + timedelta(days=7)
     elif re.search(r"\bthis week\b", normalized):
         week_start = today - timedelta(days=today.weekday())
+    explicit = list(found)
+
+    def labels_an_explicit_date(match: re.Match[str]) -> _Mention | None:
+        # "Saturday 2026-11-07", "Monday 12 Oct", "Wednesday, 18 Nov", "12 Oct (Monday)":
+        # the weekday only names the explicit date next to it.
+        for item in explicit:
+            after = normalized[match.end(): item.start]
+            before = normalized[item.end: match.start()]
+            if (item.start >= match.end() and re.fullmatch(r"[\s,(]{0,3}", after)) or (
+                item.end <= match.start() and re.fullmatch(r"[\s,(]{0,3}", before)
+            ):
+                return item
+        return None
+
     previous: date | None = None
     for match in weekday_matches:
+        labelled = labels_an_explicit_date(match)
+        if labelled is not None:
+            previous = labelled.value
+            continue
         target = _WEEKDAYS[match.group(2)]
         modifier = (match.group(1) or "").strip()
         if previous is None and week_start is not None:

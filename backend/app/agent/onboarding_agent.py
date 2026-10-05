@@ -82,6 +82,39 @@ class OnboardingAgent(ToolAgent):
                 )
         return None
 
+    def finalize(self, state: AgentRunState, message: str) -> AgentRunState | None:
+        intent = state.get("intent")
+        results = state.get("tool_results", [])
+        if intent == "onboarding_approvals":
+            listed = next((item for item in reversed(results) if item.get("tool") == "list_onboarding_approvals"), None)
+            if listed is None:
+                state = self.execute_inline(state, "list_onboarding_approvals", {})
+            rendered = self.render_from_results(state)
+            return {**state, "response": rendered} if rendered else None
+        if intent != "start_onboarding" or not results:
+            return None
+        if any(item.get("tool") == "prepare_onboarding" for item in results):
+            return None
+        last = results[-1]
+        if last.get("status") != "success":
+            return None
+        draft = state.get("active_plan") or {}
+        complete = last.get("tool") in {"update_onboarding_draft", "build_onboarding_plan"} and not missing_fields(draft)
+        if last.get("tool") == "update_onboarding_draft":
+            complete = complete and not last["result"].get("invalid") and not last["result"].get("not_stated_by_user")
+        if not complete:
+            return None
+        # The draft is complete: finish build and prepare so the user sees Confirm and Cancel.
+        if last.get("tool") != "build_onboarding_plan":
+            state = self.execute_inline(state, "build_onboarding_plan", {})
+            last = state["tool_results"][-1]
+            if last.get("status") != "success":
+                return {**state, "response": self.render_from_results(state)}
+        prepared = self.execute_inline(state, "prepare_onboarding", {"plan_id": last["result"]["plan_id"]})
+        if prepared.get("response"):
+            return prepared
+        return {**prepared, "response": self.render_from_results(prepared)}
+
     @staticmethod
     def friendly_failure(tool: str, data: dict[str, Any]) -> str:
         details = data.get("reason") or data.get("error")
