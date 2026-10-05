@@ -28,7 +28,8 @@ Parking Administrator attendance lifecycles end to end.
 | Policy retrieval | Qdrant, BAAI/bge-small-en-v1.5 |
 | PDF extraction | Native PDF text with 300-DPI OCR fallback |
 | Authentication | JWT bearer tokens |
-| Testing | Pytest and a versioned live-model golden dataset |
+| Testing | Pytest (308 tests) and a versioned live-model golden dataset |
+| Observability | Langfuse (self-hosted), optional |
 | Packaging | Docker and Docker Compose |
 
 ## 3. System overview
@@ -63,6 +64,7 @@ flowchart TB
 
     GRAPH --> CONVERSATION[Conversation repository\nhistory · leave plan · onboarding draft · parking plan]
     CONVERSATION --> POSTGRES
+    GRAPH -.->|trace per message| LANGFUSE[(Langfuse\nrouter · agents · tools · generations)]
 ```
 
 The low-cost model proposes the top-level domain. Leave, onboarding and employee parking then run
@@ -332,8 +334,13 @@ active slot with free/taken per date; regular slots first, accessible B-25 last)
 free alternatives, and the employee picks another slot or the waitlist), `prepare_parking`
 (pending `reserve_parking_plan`, rebuilt and fingerprint-checked at confirmation) and
 `prepare_parking_cancellation`. A slot code or "waitlist" is accepted only when the employee wrote
-it, so the assistant never chooses a slot. With two registered vehicles the plan asks which one,
-and the chosen registration travels through the plan, the confirmation and the reservation.
+it, so the assistant never chooses a slot. Slots belong to a vehicle type (car slots B-21 to B-25,
+motorcycle slots M-01 to M-04): the board shows only the slots the employee's vehicles may use,
+grouped by vehicle, and the chosen slot's type picks the vehicle. When it cannot (two vehicles of the
+same type) the plan asks, and "car", "bike" or a registration number is accepted. A slot of the other
+type, or a type the employee has no vehicle for, is refused. An employee with no registered vehicle
+is told to register one before any slot is shown. The chosen registration travels through the plan,
+the confirmation and the reservation.
 Vehicle registration, listing, update and removal (refused while an upcoming booking uses the
 vehicle), the reservation list and Parking Admin actions keep their deterministic handlers.
 
@@ -454,7 +461,7 @@ The frontend renders server decisions; it is not an authorization boundary.
 
 ## 14. Quality strategy
 
-- **289 deterministic tests** cover authentication, security, date resolution, leave plans and
+- **308 deterministic tests** cover authentication, security, date resolution, leave plans and
   rules, the shared agent loop (repair, grounding, finaliser), onboarding approval and account
   activation, parking, pending actions, manager lifecycle, RAG, orchestration, live streaming,
   evaluation contracts, and the repeatable demo seed. Agent tests use scripted model simulators.
@@ -462,6 +469,8 @@ The frontend renders server decisions; it is not an authorization boundary.
   leave, onboarding, parking, manager workflow, safety, scope, and API safety, three times each.
 - Release gate: at least 95% overall pass rate and consistency, and 100% for safety, API safety,
   onboarding and parking. Reports are written to `backend/evals/reports/` (ignored by Git).
+- The latest full report is committed in [docs/quality/QUALITY_REPORT.md](docs/quality/QUALITY_REPORT.md)
+  (summary, per-category table, misses and fixes, HTML and JSON results).
 - Latest full run (5 Oct 2026, 117 cases × 3, 438 turns): **99.1% pass rate, 99.3% consistency**;
   safety, API safety and onboarding 100%, parking 97% (one wording miss). The four misses (one
   provider 503, a model-corrected reversed range, a number written in words, a reworded date

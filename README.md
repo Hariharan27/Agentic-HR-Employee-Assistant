@@ -7,6 +7,18 @@ with deterministic rules, role-based authorization, human confirmation, and an a
 The assessment release completes the HR policy, leave, employee-onboarding, employee parking,
 and Parking Administrator attendance workflows end to end.
 
+## Submission at a glance
+
+| Item | Where |
+|---|---|
+| Demo video | `<demo video link>` |
+| Architecture | [ARCHITECTURE.md](ARCHITECTURE.md) (diagrams, LangGraph design, tools, security) and the summary below |
+| Quality gate report | [docs/quality/QUALITY_REPORT.md](docs/quality/QUALITY_REPORT.md): 308 automated tests; live golden set 117 cases × 3 runs, **99.1% pass, 99.3% consistency** |
+| Observability | Self-hosted **Langfuse** traces for every message: routing, model calls with tokens, tool calls, retrieval ([Observability](#observability-langfuse)) |
+| Demo walkthrough | [DEMO_FLOW.md](DEMO_FLOW.md) (step-by-step prompts with values) and [DEMO_SCRIPT.md](DEMO_SCRIPT.md) |
+| Features and agentic behaviour | [FEATURES.md](FEATURES.md): features per role, onboarding email in/out and status extraction, where the model decides |
+| Roles | [ROLES_AND_RESPONSIBILITIES.md](ROLES_AND_RESPONSIBILITIES.md) |
+
 ## What it demonstrates
 
 - Authenticated employee, manager, HR, HR administrator, and Parking Administrator experiences
@@ -28,6 +40,7 @@ and Parking Administrator attendance workflows end to end.
   reply is prepared, then keeps the list in an "Agent activity" panel
 - Self-correcting loop: tool errors and ungrounded numbers are fed back to the model for one repair
 - Versioned golden evaluation (117 cases, run three times) and a repeatable demo reset
+- Langfuse tracing of every conversation (self-hosted, optional, secrets masked)
 
 ## Architecture
 
@@ -47,6 +60,7 @@ flowchart LR
     POLICY --> QDRANT[(Qdrant)]
     TOOLS --> POSTGRES[(PostgreSQL)]
     CONFIRM --> POSTGRES
+    GRAPH -.->|traces · tokens · tool calls| LANGFUSE[(Langfuse)]
 ```
 
 The router picks the domain. Inside a domain agent the model chooses which typed tools to call,
@@ -74,7 +88,10 @@ explicit nodes, and the agent loop is an `agent ⇄ tools` cycle with conditiona
 limits. That gives inspectable, testable control flow around a model that only chooses tools, and
 lets three domain agents share one loop implementation.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design,
+[FEATURES.md](FEATURES.md) for every feature by role (including onboarding's outbound and inbound
+department emails and how task status is extracted from them) and where the system is agentic,
+[docs/quality/QUALITY_REPORT.md](docs/quality/QUALITY_REPORT.md) for the latest quality gate run, and
 [PROJECT_SPEC.md](PROJECT_SPEC.md) for the phased source requirements.
 
 ## Assessment coverage
@@ -92,7 +109,8 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
 | Manager workflow | Direct-report queue, approve/reject, balance update, audit history |
 | Onboarding workflow | Provisioning tasks, HR Admin approval, account activation, employee login |
 | Parking workflow | Slot board and choice, reservation/cancellation, waitlist, admin attendance, three-strike suspension |
-| Quality evidence | 289 automated tests; 117-case live golden set × 3: 99.1% pass, 99.3% consistency |
+| Quality evidence | 308 automated tests; 117-case live golden set × 3: 99.1% pass, 99.3% consistency ([report](docs/quality/QUALITY_REPORT.md)) |
+| Observability | Langfuse trace per message: router, agent, tool calls, model generations with token usage |
 
 ## Quick start with Docker
 
