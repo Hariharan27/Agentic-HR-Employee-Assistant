@@ -107,3 +107,50 @@ def test_reversed_range_is_rejected():
 )
 def test_weekdays_with_an_explicit_week(text, expected):
     assert iso(resolve_leave_dates(text, MONDAY)) == expected
+
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("15th next month", ["2026-11-15"]),
+        ("next month 15th", ["2026-11-15"]),
+        ("15th of next month", ["2026-11-15"]),
+        ("first monday of next month", ["2026-11-02"]),
+        ("next month first monday", ["2026-11-02"]),
+        ("last friday of november", ["2026-11-27"]),
+        ("after 2 weeks", ["2026-10-19"]),
+        ("two weeks from now", ["2026-10-19"]),
+        ("in a week", ["2026-10-12"]),
+        ("jan 5", ["2027-01-05"]),  # day/month already past this year -> next year
+        ("30th september", ["2026-09-30"]),  # within the 7-day back-dating window stays this year
+        ("2026-01-05", ["2026-01-05"]),  # an explicit year is never changed
+    ],
+)
+def test_month_relative_and_year_rollover_dates(text, expected):
+    assert iso(resolve_leave_dates(text, MONDAY)) == expected
+
+
+def test_range_across_the_new_year_rolls_the_end_date():
+    result = resolve_leave_dates("from 23 dec to 2 jan", MONDAY)
+
+    assert result.shape == "range"
+    assert (iso(result)[0], iso(result)[-1]) == ("2026-12-23", "2027-01-02")
+
+
+@pytest.mark.parametrize(
+    ("text", "question"),
+    [
+        ("leave next month", "November 2026"),
+        ("in november", "November 2026"),
+        ("after two months", "December 2026"),
+        ("first week of november", "November 2026"),
+        ("end of this month", "October 2026"),
+        ("sometime in march", "March 2027"),
+    ],
+)
+def test_a_month_without_a_day_asks_which_day(text, question):
+    result = resolve_leave_dates(text, MONDAY)
+
+    assert result.ambiguous
+    assert question in result.question
