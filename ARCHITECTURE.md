@@ -441,7 +441,7 @@ onboarding-approval reply is withheld. Self-hosting: `observability/README.md`.
 
 Ideator PeopleDesk provides:
 
-- Employee, manager, and HR demo login selection
+- A single username and password sign-in; the role comes from the account (no role picker)
 - JWT-authenticated session storage
 - Role-aware prompts and request/approval panels
 - Policy source display grouped by document and pages

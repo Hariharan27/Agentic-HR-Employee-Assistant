@@ -3,14 +3,6 @@ import { HttpError, changePassword, getMyVehicles, getOnboardingStatus, getParki
 import { RichText } from "./RichText";
 import type { Vehicle, ChatMessage, LiveStep, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager, Source } from "./types";
 
-const demoAccounts = {
-  EMPLOYEE: { username: "employee", password: "Advik!Desk-2026" },
-  MANAGER: { username: "manager", password: "Saanvika!Desk-2026" },
-  HR: { username: "hr", password: "Hariharan!Desk-2026" },
-  HR_ADMIN: { username: "hradmin", password: "Alaguselvi!Desk-2026" },
-  PARKING_ADMIN: { username: "parkingadmin", password: "Dhaswanth!Desk-2026" },
-} as const;
-
 const quickPrompts: Record<Profile["role"], string[]> = {
   EMPLOYEE: [
     "How many leaves do I have left?",
@@ -128,7 +120,7 @@ function App() {
   const [passwordForm, setPasswordForm] = useState({ current: "", next: "", confirm: "" });
   const [passwordError, setPasswordError] = useState("");
   const [error, setError] = useState("");
-  const [loginForm, setLoginForm] = useState({ username: "employee", password: "Advik!Desk-2026" });
+  const [loginForm, setLoginForm] = useState({ username: "", password: "" });
   const messageEnd = useRef<HTMLDivElement>(null);
 
   const suggestions = useMemo(() => (profile ? quickPrompts[profile.role] : []), [profile]);
@@ -223,6 +215,7 @@ function App() {
   function logout() {
     sessionStorage.removeItem("hr-token");
     sessionStorage.removeItem(CHAT_KEY);
+    setLoginForm({ username: "", password: "" });
     setToken("");
     setProfile(null);
     setSessionId(undefined);
@@ -491,20 +484,14 @@ function App() {
         <section className="login-card">
           <p className="eyebrow dark">WELCOME BACK</p>
           <h2>Sign in to your workspace</h2>
-          <p className="muted">Use a demo identity to explore role-aware HR workflows.</p>
-          <div className="role-switcher">
-            {Object.entries(demoAccounts).map(([role, account]) => (
-              <button key={role} type="button" className={loginForm.username === account.username ? "active" : ""}
-                onClick={() => setLoginForm(account)}>{role === "HR_ADMIN" ? "HR Admin" : role === "PARKING_ADMIN" ? "Parking" : role === "HR" ? "HR" : role[0] + role.slice(1).toLowerCase()}</button>
-            ))}
-          </div>
+          <p className="muted">Sign in with your PeopleDesk username and password.</p>
           <form onSubmit={handleLogin}>
-            <label>Username<input value={loginForm.username} onChange={(event) => setLoginForm({ ...loginForm, username: event.target.value })} /></label>
-            <label>Password<input type="password" value={loginForm.password} onChange={(event) => setLoginForm({ ...loginForm, password: event.target.value })} /></label>
+            <label>Username<input name="username" autoComplete="username" autoFocus value={loginForm.username} onChange={(event) => setLoginForm({ ...loginForm, username: event.target.value })} /></label>
+            <label>Password<input type="password" name="password" autoComplete="current-password" value={loginForm.password} onChange={(event) => setLoginForm({ ...loginForm, password: event.target.value })} /></label>
             {error && <p className="error">{error}</p>}
-            <button className="primary" disabled={loading}>{loading ? "Signing in…" : "Sign in"}</button>
+            <button className="primary" disabled={loading || !loginForm.username.trim() || !loginForm.password}>{loading ? "Signing in…" : "Sign in"}</button>
           </form>
-          <p className="security-note">Demo credentials only · JWT authenticated session</p>
+          <p className="security-note">Secured sign-in · role-based access</p>
         </section>
       </main>
     );
