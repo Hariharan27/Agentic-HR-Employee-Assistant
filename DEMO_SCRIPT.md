@@ -71,12 +71,13 @@ employee's job title; it is not an authorization role.
 
 4. Click **Create request for confirmation**.
 5. Point out that the response separates **Account role** from **Designation**, resolves the selected
-   reporting manager, and previews these four provisioning tasks:
+   reporting manager, and previews these five provisioning tasks:
 
    - Corporate email
    - Laptop
    - Permanent access card
    - Temporary access card
+   - Payroll and salary account setup
 
 6. Click **Confirm**. Record the returned onboarding request ID as `<ONBOARDING_ID>`.
 
