@@ -9,12 +9,15 @@ htmlcov/
 node_modules/
 dist/
 .DS_Store
-backend/tmp/
 backend/evals/reports/
 *.ses
+backend/tmp/
 
 # Files the Claude desktop app saves into this folder
 Claude outputs/
 
 # local style previews
 frontend/tmp-preview/
+
+# Demo videos (too large for GitHub; share the video by link instead)
+video_cleanup/
