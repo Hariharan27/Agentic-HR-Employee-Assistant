@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -63,7 +63,8 @@ class Settings(BaseSettings):
     # Optional Langfuse tracing (self-hosted or cloud); off unless all three are set.
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
-    langfuse_host: str = ""
+    # LANGFUSE_BASE_URL is the name the Langfuse SDK itself uses; either works.
+    langfuse_host: str = Field(default="", validation_alias=AliasChoices("LANGFUSE_HOST", "LANGFUSE_BASE_URL"))
     cors_origins: str = "http://localhost:5173"
     log_level: str = "INFO"
 
