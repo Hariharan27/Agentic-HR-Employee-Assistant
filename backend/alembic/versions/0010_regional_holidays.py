@@ -15,8 +15,15 @@ depends_on = None
 
 def upgrade() -> None:
     op.add_column("holidays", sa.Column("region", sa.String(40), nullable=True))
-    # 0002 created an unnamed UNIQUE(holiday_date); PostgreSQL named it holidays_holiday_date_key.
-    op.drop_constraint("holidays_holiday_date_key", "holidays", type_="unique")
+    # 0002 created an unnamed UNIQUE(holiday_date). Look its name up instead of assuming
+    # PostgreSQL's default (holidays_holiday_date_key), so startup migrations cannot fail on it.
+    inspector = sa.inspect(op.get_bind())
+    for constraint in inspector.get_unique_constraints("holidays"):
+        if constraint.get("column_names") == ["holiday_date"] and constraint.get("name"):
+            op.drop_constraint(constraint["name"], "holidays", type_="unique")
+    for index in inspector.get_indexes("holidays"):
+        if index.get("unique") and index.get("column_names") == ["holiday_date"] and index.get("name"):
+            op.drop_index(index["name"], table_name="holidays")
     op.create_unique_constraint("uq_holidays_date_region", "holidays", ["holiday_date", "region"])
 
 
