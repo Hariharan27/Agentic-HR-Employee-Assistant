@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -158,7 +159,36 @@ class HRAssistantOrchestrator:
                 actor=actor, parking=parking, pending=pending, today=lambda: parking._local_now().date()
             ),
         )
+        #: Optional live-activity sink (streamed chat). Events: {"id", "label", "status", "commit"}.
+        #: "commit" marks steps after every role gate, from which the HTTP stream may start.
+        self.on_event: Callable[[dict[str, object]], None] | None = None
+        for agent in (self.leave_agent, self.onboarding_agent, self.parking_agent):
+            agent.on_event = self._agent_event
         self.graph = self._build_graph()
+
+    def _emit(self, step_id: str, label: str, status: str, *, commit: bool = False) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event({"id": step_id, "label": label, "status": status, "commit": commit})
+        except Exception:  # noqa: BLE001 - live display must never break a chat
+            pass
+
+    def _agent_event(self, event: dict[str, str]) -> None:
+        # Agents only run after their domain's role gate, so their steps can start the stream.
+        self._emit(event["id"], event["label"], event["status"], commit=True)
+
+    def _route_node(self, state: AgentState) -> AgentState:
+        result = self._route(state)
+        route = result.get("route")
+        if isinstance(route, RouteDecision):
+            intent = (route.intent or route.domain).replace("_", " ")
+            self._emit("route", f"Understood: {route.domain.title()} · {intent}", "success")
+        return result
+
+    def _confirmation_node(self, state: AgentState) -> AgentState:
+        self._emit("route", "Checking your reply to the pending action", "success")
+        return self._handle_confirmation(state)
 
     def chat(
         self, session_id: str, message: str, *, onboarding_form: dict[str, str] | None = None
@@ -228,8 +258,8 @@ class HRAssistantOrchestrator:
     def _build_graph(self):
         graph = StateGraph(AgentState)
         graph.add_node("resolve_pending_action", self._resolve_pending_action)
-        graph.add_node("confirmation", self._handle_confirmation)
-        graph.add_node("router", self._route)
+        graph.add_node("confirmation", self._confirmation_node)
+        graph.add_node("router", self._route_node)
         graph.add_node("policy", self._handle_policy)
         graph.add_node("leave", self._handle_leave)
         graph.add_node("onboarding", self._handle_onboarding)
@@ -531,7 +561,17 @@ class HRAssistantOrchestrator:
         return "unsupported"
 
     def _handle_policy(self, state: AgentState) -> AgentState:
+        self._emit("policy", "Searching policy documents", "running", commit=True)
         context = self.policies.search(state["user_message"])
+        documents = {str(item.get("document")) for item in context.sources if isinstance(item, dict)}
+        self._emit(
+            "policy",
+            f"Found {len(context.sources)} passage(s) in {len(documents)} document(s)" if context.sources
+            else "No matching policy passages",
+            "success" if context.sources else "error",
+            commit=True,
+        )
+        self._emit("answer", "Writing the answer from the policy text", "running", commit=True)
         system = (
             "Answer the employee's HR policy question using only the supplied policy context. "
             "Do not add rules that are absent, and explicitly mention any conflict in the passages. "

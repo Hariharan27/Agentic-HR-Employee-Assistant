@@ -41,6 +41,12 @@ export type AgentActivity = {
   status: "success" | "error";
 };
 
+export type LiveStep = {
+  id: string;
+  label: string;
+  status: "running" | "success" | "error";
+};
+
 export type ChatMessage = {
   id: string;
   role: "user" | "assistant";

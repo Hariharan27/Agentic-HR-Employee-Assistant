@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from datetime import date
-from typing import Any, Literal, Protocol, TypedDict
+from typing import Any, Callable, Literal, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticValidationError, model_validator
@@ -49,6 +49,44 @@ class AgentTools(Protocol):
     def execute(
         self, tool: str, arguments: dict[str, Any], *, session_id: str, active_plan: dict[str, Any] | None = None
     ) -> ToolExecution: ...
+
+
+#: Progress callback for live activity: receives {"id", "label", "status"} step events.
+EventSink = Callable[[dict[str, str]], None]
+
+#: Present-tense labels shown while a tool runs (the past-tense label comes from the tool result).
+RUNNING_LABELS = {
+    "resolve_dates": "Resolving dates",
+    "get_leave_balance": "Checking leave balance",
+    "build_leave_plan": "Building leave plan",
+    "shift_leave_plan": "Moving leave plan",
+    "get_holidays": "Checking holidays",
+    "calculate_leave_days": "Counting working days",
+    "get_my_leave_requests": "Fetching your leave requests",
+    "get_leave_request_history": "Fetching request history",
+    "get_leave_rules": "Checking leave rules",
+    "search_leave_policy": "Searching leave policy",
+    "get_managed_leave_requests": "Fetching approval queue",
+    "prepare_leave_application": "Preparing leave application",
+    "prepare_leave_cancellation": "Preparing cancellation",
+    "prepare_leave_approval": "Preparing approval",
+    "prepare_leave_rejection": "Preparing rejection",
+    "update_onboarding_draft": "Updating onboarding details",
+    "list_reporting_managers": "Listing reporting managers",
+    "check_employee_exists": "Checking for duplicates",
+    "build_onboarding_plan": "Building onboarding plan",
+    "prepare_onboarding": "Preparing onboarding request",
+    "get_onboarding_status": "Checking onboarding status",
+    "list_onboarding_approvals": "Fetching onboarding approvals",
+    "prepare_onboarding_approval": "Preparing approval",
+    "prepare_onboarding_rejection": "Preparing rejection",
+    "get_vehicle": "Checking your vehicle",
+    "list_parking_slots": "Checking parking slots",
+    "build_parking_plan": "Building parking plan",
+    "prepare_parking": "Preparing reservation",
+    "get_my_parking_reservations": "Fetching your reservations",
+    "prepare_parking_cancellation": "Preparing cancellation",
+}
 
 
 _NUMBER = re.compile(r"(?<![\w.])\d+(?:\.\d+)?(?![\w])")
@@ -127,7 +165,18 @@ class ToolAgent:
         self.base_prompt = base_prompt
         self.system_prompt = base_prompt + "\n" + AGENT_JSON_PROTOCOL
         self.native = bool(settings.leave_agent_native_tools) and hasattr(llm, "complete_with_tools")
+        #: Optional live-activity sink; set by the orchestrator for streamed chats.
+        self.on_event: EventSink | None = None
         self.graph = self._build_graph()
+
+    def emit(self, step_id: str, label: str, status: str) -> None:
+        """Report a live step; never lets a display problem break the agent."""
+        if self.on_event is None:
+            return
+        try:
+            self.on_event({"id": f"{self.agent_name}:{step_id}", "label": label, "status": status})
+        except Exception:  # noqa: BLE001
+            logger.warning("agent_event_failed", exc_info=True)
 
     # ------------------------------------------------------------------ domain hooks
 
@@ -254,6 +303,8 @@ class ToolAgent:
         started = time.monotonic()
         llm_calls = state.get("llm_calls", 0) + 1
         transcript_add: list[dict[str, Any]] = []
+        step = f"model-{iteration}"
+        self.emit(step, "Correcting the answer" if state.get("feedback") else "Thinking", "running")
         try:
             if self.native:
                 decision, assistant_message = self._native_turn(state)
@@ -269,6 +320,7 @@ class ToolAgent:
                 extra={"session_id": state["session_id"], "iteration": iteration, "error_type": type(exc).__name__},
                 exc_info=True,
             )
+            self.emit(step, "Model reply was unusable; retrying", "error")
             return self._repair_or_fallback(
                 state,
                 iteration,
@@ -295,6 +347,12 @@ class ToolAgent:
             "feedback": [],
             "transcript": [*state.get("transcript", []), *transcript_add],
         }
+        self.emit(
+            step,
+            "Drafted the answer" if decision.action == "final"
+            else "Chose: " + ", ".join(RUNNING_LABELS.get(item.name, item.name).lower() for item in decision.tool_calls),
+            "success",
+        )
         if decision.action == "final":
             message = (decision.message or "").strip()
             finalized = self.finalize({**state, **updates}, message)
@@ -305,6 +363,7 @@ class ToolAgent:
                 return {**updates, **finalized}
             ungrounded = self._ungrounded_values(message, state)
             if ungrounded:
+                self.emit(f"{step}-grounding", "Answer had facts not in tool results; checking again", "error")
                 logger.warning(
                     "agent_ungrounded_answer",
                     extra={"session_id": state["session_id"], "values": ungrounded[:10]},
@@ -518,10 +577,13 @@ class ToolAgent:
                 continue
             seen.add(signature)
             started = time.monotonic()
+            tool_step = f"tool-{count + 1}"
+            self.emit(tool_step, RUNNING_LABELS.get(call["name"], f"Running {call['name']}"), "running")
             execution = self.tools.execute(
                 call["name"], call.get("arguments", {}), session_id=state["session_id"], active_plan=plan
             )
             count += 1
+            self.emit(tool_step, execution.label, "success" if execution.ok else "error")
             payload = self._result_payload(execution)
             results.append(payload)
             if call_id:

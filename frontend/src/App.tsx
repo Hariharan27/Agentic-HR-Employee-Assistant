@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { getOnboardingStatus, getParkingAdminReservations, getPendingOnboardingApprovals, getProfile, getReportingManagers, login, sendChat } from "./api";
+import { getOnboardingStatus, getParkingAdminReservations, getPendingOnboardingApprovals, getProfile, getReportingManagers, login, sendChatStream } from "./api";
 import { RichText } from "./RichText";
-import type { ChatMessage, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager, Source } from "./types";
+import type { ChatMessage, LiveStep, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager, Source } from "./types";
 
 const demoAccounts = {
   EMPLOYEE: { username: "employee", password: "employee123" },
@@ -101,6 +101,7 @@ function App() {
   const [parkingError, setParkingError] = useState("");
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [liveSteps, setLiveSteps] = useState<LiveStep[]>([]);
   const [error, setError] = useState("");
   const [loginForm, setLoginForm] = useState({ username: "employee", password: "employee123" });
   const messageEnd = useRef<HTMLDivElement>(null);
@@ -349,8 +350,18 @@ function App() {
       { id: crypto.randomUUID(), role: "user", text: normalized },
     ]);
     setLoading(true);
+    setLiveSteps([{ id: "route", label: "Understanding your request", status: "running" }]);
     try {
-      const response = await sendChat(token, normalized, sessionId, onboardingPayload);
+      // Live steps replace each other by id (running → success/error) as the agent works.
+      const onStep = (step: LiveStep) =>
+        setLiveSteps((current) => {
+          const index = current.findIndex((item) => item.id === step.id);
+          if (index < 0) return [...current, step];
+          const next = [...current];
+          next[index] = step;
+          return next;
+        });
+      const response = await sendChatStream(token, normalized, onStep, sessionId, onboardingPayload);
       setSessionId(response.session_id);
       const draft = response.onboarding_draft;
       if (draft) {
@@ -402,6 +413,7 @@ function App() {
       setError(nextError instanceof Error ? nextError.message : "The assistant could not respond");
     } finally {
       setLoading(false);
+      setLiveSteps([]);
     }
   }
 
@@ -458,7 +470,9 @@ function App() {
                 const renderInlineVehicleForm = profile.role === "EMPLOYEE" && shouldRenderVehicleForm(message);
                 return <article key={message.id} className={`message ${message.role}${message.intent?.includes("onboarding") ? " onboarding-message" : ""}${renderInlineOnboardingForm || renderInlineVehicleForm ? " with-form" : ""}`}><div className="message-label">{message.role === "assistant" ? "Ideator PeopleDesk" : "You"}{message.intent && <span>{message.intent.replaceAll("_", " ")}</span>}</div>{message.role === "assistant" ? <RichText text={message.text} /> : <p>{message.text}</p>}{message.agentActivity && message.agentActivity.length > 0 && <details className="agent-activity" open><summary>Agent activity <span>{message.agentActivity.length}</span></summary><ul>{message.agentActivity.map((activity, index) => <li key={`${activity.tool}-${index}`} className={activity.status}><span aria-hidden="true">{activity.status === "success" ? "✓" : "!"}</span>{activity.label}</li>)}</ul></details>}{renderInlineOnboardingForm && renderOnboardingForm()}{renderInlineVehicleForm && renderVehicleForm()}{message.sources && message.sources.length > 0 && <div className="sources"><strong>Based on</strong>{groupedSourceLabels(message.sources).map((label) => <span key={label}>{label}</span>)}</div>}</article>;
               })}
-              {loading && <article className="message assistant typing"><span /><span /><span /></article>}
+              {loading && (liveSteps.length > 0
+                ? <article className="message assistant live-activity" aria-live="polite"><div className="message-label">Ideator PeopleDesk<span>working</span></div><ul>{liveSteps.map((step) => <li key={step.id} className={step.status}><span aria-hidden="true">{step.status === "running" ? "" : step.status === "success" ? "✓" : "!"}</span>{step.label}{step.status === "running" ? "…" : ""}</li>)}</ul></article>
+                : <article className="message assistant typing"><span /><span /><span /></article>)}
               <div ref={messageEnd} />
             </div>
             {pendingAction && <div className="pending-banner"><div><strong>Confirmation required</strong><span>{pendingAction}</span></div><div><button onClick={() => void submitMessage("cancel")}>Cancel</button><button className="confirm" onClick={() => void submitMessage("yes")}>Confirm</button></div></div>}

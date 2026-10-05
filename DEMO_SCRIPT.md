@@ -24,6 +24,14 @@ workflow. The backend also enforces `EMPLOYEE` when it activates the account, so
 create a Manager, HR, HR Admin, or Parking Admin account through chat. **Designation** is the
 employee's job title; it is not an authorization role.
 
+## Point out the live agent steps
+
+While each reply is prepared, the reply bubble lists the agent's steps as they happen: routing,
+each model decision ("Chose: resolving dates, building leave plan"), each tool call and any
+self-correction. Say this once early on (for example on the "Tuesday and Sunday" leave question): the
+model chooses the tools, Python executes them, and the final answer is checked against the tool
+results. After the reply, the same tools stay listed in the **Agent activity** panel.
+
 ## Before the demo
 
 1. Make sure the Bedrock Mantle key is configured in `.env`. Do not display the file or key.

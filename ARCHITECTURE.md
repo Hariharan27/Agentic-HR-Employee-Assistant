@@ -120,6 +120,30 @@ sequenceDiagram
 The JWT supplies `user_id`, `employee_id`, and `role`. User text and model output cannot overwrite
 those values.
 
+### Live agent activity (`POST /api/v1/chat/stream`)
+
+The UI calls a streaming twin of `/chat` with the same body and token. The orchestrator and the
+shared ToolAgent loop report progress through an optional event sink, and the endpoint relays it as
+Server-Sent Events:
+
+| Event | Payload | Emitted when |
+| --- | --- | --- |
+| `step` | `{id, label, status}` (`running`, `success`, `error`) | routing finished, each model turn ("Thinking" → "Chose: building leave plan"), each tool call ("Building leave plan" → "Built leave plan"), self-corrections, policy retrieval |
+| `final` | the same `ChatResponse` as `/chat` (including `agent_activity`) | the reply is ready |
+| `error` | `{status, message}` | a failure after the stream started |
+
+- Steps carry labels only, never tool arguments, balances or identifiers.
+- Steps emitted before a role gate (routing) are held back until the first step from inside an
+  agent or policy retrieval. An unauthorized request therefore still fails with its normal HTTP
+  status (403) before any stream starts.
+- The work runs in a worker thread with its own database session, because a request's dependency
+  session closes before a streamed body is sent.
+- `/chat` is unchanged; the evaluation suite and tests use it. The UI falls back to `/chat` if the
+  stream endpoint is unavailable.
+
+In the UI, the steps appear in the reply bubble while the agent works (a spinner on the current step),
+then the bubble becomes the normal reply with the existing "Agent activity" panel.
+
 ## 6. Implemented LangGraph
 
 The application compiles one graph with these nodes:
@@ -384,6 +408,7 @@ Ideator PeopleDesk provides:
 - Role-aware prompts and request/approval panels
 - Policy source display grouped by document and pages
 - Pending-action Confirm and Cancel controls
+- Live agent steps while a reply is being prepared (streamed), then the Agent activity panel
 - Responsive desktop/mobile layout
 - Explicit status and error presentation
 
