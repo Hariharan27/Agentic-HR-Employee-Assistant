@@ -758,6 +758,8 @@ class HRAssistantOrchestrator:
         normalized_message = " ".join(re.sub(r"[^\w]+", " ", message.casefold()).split())
         return bool(normalized_value) and normalized_value in normalized_message
 
+    VEHICLE_FIELDS = ("registration_number", "vehicle_type", "make_model")
+
     PARKING_AGENT_INTENTS = {
         "parking_availability", "reserve_parking", "cancel_parking", "join_parking_waitlist", "parking",
     }
@@ -788,6 +790,10 @@ class HRAssistantOrchestrator:
             }
 
         if route.intent == "register_vehicle":
+            # Only a registration that is still being collected carries earlier values; a new
+            # "register / add / update my vehicle" request starts from what this message says.
+            if context.get("mode") != "register_vehicle":
+                context = {key: value for key, value in context.items() if key not in self.VEHICLE_FIELDS}
             context = self._merge_vehicle_context(
                 context, route, state["user_message"]
             )
@@ -801,10 +807,17 @@ class HRAssistantOrchestrator:
                 if not context.get(field)
             ]
             if missing:
+                understood = ", ".join(
+                    f"{label}: {context[field]}"
+                    for field, label in (("registration_number", "registration number"), ("vehicle_type", "vehicle type"), ("make_model", "make and model"))
+                    if context.get(field)
+                )
                 return {
                     "response": (
-                        "Use the vehicle registration form below so I can collect "
-                        f"{', '.join(missing)} and ask for confirmation before saving it. "
+                        "Please fill in the vehicle registration form below with the registration number, "
+                        "vehicle type (car or motorcycle) and make and model"
+                        + (f" (so far I have {understood})" if understood else "")
+                        + ". I'll show a summary for confirmation before saving it. "
                         f"A new registration number adds a vehicle (up to {self.parking.MAX_VEHICLES}); "
                         "an existing one with new details updates it."
                     ),
@@ -840,6 +853,10 @@ class HRAssistantOrchestrator:
                 arguments,
                 summary,
             )
+            # The values now live in the pending action; later turns start clean.
+            context = {
+                key: value for key, value in context.items() if key not in self.VEHICLE_FIELDS and key != "mode"
+            }
             return {
                 "response": f"{action.summary}. Reply yes to confirm or cancel.",
                 "active_domain": "parking",

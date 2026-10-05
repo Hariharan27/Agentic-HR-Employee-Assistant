@@ -435,9 +435,10 @@ function App() {
           const named = vehicles.find((vehicle) => compact.includes(vehicle.registration_number));
           const wantsUpdate = /\b(update|edit|change)\b/i.test(normalized);
           const target = named || (wantsUpdate && vehicles.length === 1 ? vehicles[0] : undefined);
+          const mentionsBike = /\b(bike|motorcycle|motorbike|scooter|two[- ]wheeler)\b/i.test(normalized);
           setVehicleForm(target
             ? { registrationNumber: target.registration_number, vehicleType: target.vehicle_type, makeModel: target.make_model || "" }
-            : emptyVehicleForm);
+            : { ...emptyVehicleForm, vehicleType: mentionsBike ? "MOTORCYCLE" : "CAR" });
         }).catch(() => setMyVehicles([]));
       }
       if (response.domain === "onboarding") {

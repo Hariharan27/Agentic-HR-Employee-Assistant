@@ -2673,3 +2673,35 @@ def test_parking_without_a_date_asks_with_the_fixed_wording(db_session):
     result = orchestrator(db_session, llm).chat("parking-no-date", "Book parking")
 
     assert result.message == "Please provide the parking date."
+
+
+def test_a_second_vehicle_request_shows_the_form_instead_of_reusing_the_first(db_session):
+    five_slots(db_session)  # the employee already has TN01AA1001
+    service = orchestrator(db_session, FakeLLM([
+        route(domain="general", intent="general"),
+        route(domain="parking", intent="register_vehicle", vehicle_type="MOTORCYCLE"),
+        route(domain="parking", intent="parking_availability", parking_date="2026-10-08"),
+    ]))
+
+    service.chat("second-vehicle", "Register vehicle with these details: registration number: TN09ZZ4321; vehicle type: CAR; make and model: Tata Nexon")
+    service.chat("second-vehicle", "yes")
+    again = service.chat("second-vehicle", "I'd like to add my bike as well")
+
+    assert again.intent == "register_vehicle"
+    assert "vehicle registration form below" in again.message
+    assert again.pending_action is None
+
+
+def test_parking_questions_reach_the_parking_agent_after_a_registration(db_session):
+    five_slots(db_session)
+    service = orchestrator(db_session, FakeLLM([
+        route(domain="general", intent="general"),
+        route(domain="parking", intent="parking_availability", parking_date="2026-10-08"),
+    ]))
+
+    service.chat("after-registration", "Register vehicle with these details: registration number: TN09ZZ4321; vehicle type: CAR")
+    service.chat("after-registration", "yes")
+    board = service.chat("after-registration", "Which parking slots are free on 2026-10-08?")
+
+    assert board.intent in {"parking_availability", "parking"}
+    assert "- B-21: free" in board.message, board.message
