@@ -7,6 +7,7 @@ from app.api.schemas.parking import (
     ParkingReservationEventResponse,
     ParkingReservationResponse,
     ParkingSuspensionResponse,
+    VehicleResponse,
 )
 from app.application.parking.service import ParkingService
 from app.domain.parking.entities import ParkingReservationData
@@ -39,6 +40,19 @@ def _reservation_response(item: ParkingReservationData) -> ParkingReservationRes
         completed_at=item.completed_at,
         no_show_at=item.no_show_at,
     )
+
+
+@router.get("/me/vehicles", response_model=list[VehicleResponse])
+def my_vehicles(actor: CurrentUser, db: Database, settings: AppSettings) -> list[VehicleResponse]:
+    """The employee's registered vehicles (at most two); used to pre-fill the update form."""
+    return [
+        VehicleResponse(
+            registration_number=item.registration_number,
+            vehicle_type=item.vehicle_type.value,
+            make_model=item.make_model,
+        )
+        for item in _service(db, settings).list_vehicles(actor)
+    ]
 
 
 @router.get("/me/suspension", response_model=ParkingSuspensionResponse)

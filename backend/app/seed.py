@@ -1,11 +1,12 @@
 import argparse
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
+from app.domain.leave.holidays import HOLIDAY_CALENDARS
 from app.infrastructure.database.models import (
     ConversationSession,
     Employee,
@@ -40,7 +41,7 @@ DEMO_USERS = (
             "joining_date": date(2023, 1, 9),
         },
         "username": "employee",
-        "password": "employee123",
+        "password": "Advik!Desk-2026",
         "role": "EMPLOYEE",
     },
     {
@@ -56,7 +57,7 @@ DEMO_USERS = (
             "joining_date": date(2020, 6, 1),
         },
         "username": "manager",
-        "password": "manager123",
+        "password": "Saanvika!Desk-2026",
         "role": "MANAGER",
     },
     {
@@ -72,7 +73,7 @@ DEMO_USERS = (
             "joining_date": date(2021, 4, 12),
         },
         "username": "hr",
-        "password": "hr12345",
+        "password": "Hariharan!Desk-2026",
         "role": "HR",
     },
     {
@@ -88,7 +89,7 @@ DEMO_USERS = (
             "joining_date": date(2020, 2, 10),
         },
         "username": "hradmin",
-        "password": "hradmin123",
+        "password": "Alaguselvi!Desk-2026",
         "role": "HR_ADMIN",
     },
     {
@@ -104,7 +105,7 @@ DEMO_USERS = (
             "joining_date": date(2021, 8, 16),
         },
         "username": "parkingadmin",
-        "password": "parkingadmin123",
+        "password": "Dhaswanth!Desk-2026",
         "role": "PARKING_ADMIN",
     },
 )
@@ -117,29 +118,22 @@ DEMO_BALANCES = {
     "PARKING_ADMIN": (("CASUAL", 6, 1, 0), ("SICK", 6, 0, 0), ("EARNED", 12, 2, 8)),
 }
 
-DEMO_VEHICLES = {
-    "EMPLOYEE": ("TN01AR1001", "CAR", "Hyundai i20"),
-    "MANAGER": ("TN01KI1001", "CAR", "Honda City"),
-    "HR": ("KA01MN1001", "CAR", "Tata Nexon"),
-    "HR_ADMIN": ("TN01NK1001", "MOTORCYCLE", "TVS Ntorq"),
-}
-
 DEMO_PARKING_SLOTS = (
-    ("B-21", "Chennai HQ - Basement B", "REGULAR"),
-    ("B-22", "Chennai HQ - Basement B", "REGULAR"),
-    ("B-23", "Chennai HQ - Basement B", "REGULAR"),
-    ("B-24", "Chennai HQ - Basement B", "REGULAR"),
-    ("B-25", "Chennai HQ - Basement B", "ACCESSIBLE"),
+    ("B-21", "Chennai HQ - Basement B", "REGULAR", "CAR"),
+    ("B-22", "Chennai HQ - Basement B", "REGULAR", "CAR"),
+    ("B-23", "Chennai HQ - Basement B", "REGULAR", "CAR"),
+    ("B-24", "Chennai HQ - Basement B", "REGULAR", "CAR"),
+    ("B-25", "Chennai HQ - Basement B", "ACCESSIBLE", "CAR"),
+    ("M-01", "Chennai HQ - Two-wheeler bay", "REGULAR", "MOTORCYCLE"),
+    ("M-02", "Chennai HQ - Two-wheeler bay", "REGULAR", "MOTORCYCLE"),
+    ("M-03", "Chennai HQ - Two-wheeler bay", "REGULAR", "MOTORCYCLE"),
+    ("M-04", "Chennai HQ - Two-wheeler bay", "REGULAR", "MOTORCYCLE"),
 )
 
 LEGACY_DEMO_EMPLOYEE_CODES = ("E1001", "M1001", "H1001", "H1002")
 
 
-def _next_parking_workday() -> date:
-    candidate = date.today() + timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate
+DEMO_EMPLOYEE_VEHICLE = ("TN01AR1001", "CAR", "Hyundai i20")
 
 
 def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[int]) -> None:
@@ -174,6 +168,9 @@ def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[in
             ParkingReservation.employee_id.in_(parking_employee_ids)
         )
     )
+    # Vehicles are created through the parking workflow. Remove only demo-owned
+    # vehicles when resetting the demo; parking slots are master data and stay.
+    db.execute(delete(Vehicle).where(Vehicle.employee_id.in_(parking_employee_ids)))
     if onboarding_ids:
         db.execute(
             delete(OnboardingTask).where(
@@ -319,6 +316,7 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
         elif reset_demo:
             user.username = item["username"]
             user.password_hash = hash_password(item["password"])
+            user.must_change_password = False
             user.role = item["role"]
             user.employee_id = employee.id
         users[item["role"]] = user
@@ -379,86 +377,58 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
                 balance.used_days = Decimal(used)
                 balance.carry_forward_limit_days = Decimal(carry_forward_limit)
 
-    vehicles: dict[str, Vehicle] = {}
-    for role, (registration_number, vehicle_type, make_model) in DEMO_VEHICLES.items():
-        employee = employees[role]
-        vehicle = db.scalar(select(Vehicle).where(Vehicle.employee_id == employee.id))
-        if vehicle is None:
-            vehicle = Vehicle(
-                employee_id=employee.id,
-                registration_number=registration_number,
+    for code, location, slot_type, slot_vehicle_type in DEMO_PARKING_SLOTS:
+        slot = db.scalar(select(ParkingSlot).where(ParkingSlot.code == code))
+        if slot is None:
+            db.add(ParkingSlot(
+                code=code, location=location, slot_type=slot_type,
+                vehicle_type=slot_vehicle_type, active=True,
+            ))
+        elif reset_demo or slot.vehicle_type != slot_vehicle_type:
+            slot.location = location
+            slot.slot_type = slot_type
+            slot.vehicle_type = slot_vehicle_type
+            slot.active = True
+
+    # The fallback employee account keeps one registered vehicle so parking can be tried (and
+    # evaluated) straight away. Newly onboarded employees still register theirs in chat.
+    registration, vehicle_type, make_model = DEMO_EMPLOYEE_VEHICLE
+    demo_employee = employees["EMPLOYEE"]
+    db.flush()
+    if db.scalar(select(Vehicle).where(Vehicle.employee_id == demo_employee.id)) is None and db.scalar(
+        select(Vehicle).where(Vehicle.registration_number == registration)
+    ) is None:
+        db.add(
+            Vehicle(
+                employee_id=demo_employee.id,
+                registration_number=registration,
                 vehicle_type=vehicle_type,
                 make_model=make_model,
                 active=True,
             )
-            db.add(vehicle)
-            db.flush()
-        elif reset_demo:
-            vehicle.registration_number = registration_number
-            vehicle.vehicle_type = vehicle_type
-            vehicle.make_model = make_model
-            vehicle.active = True
-        vehicles[role] = vehicle
+        )
 
-    parking_slots: dict[str, ParkingSlot] = {}
-    for code, location, slot_type in DEMO_PARKING_SLOTS:
-        slot = db.scalar(select(ParkingSlot).where(ParkingSlot.code == code))
-        if slot is None:
-            slot = ParkingSlot(
-                code=code,
-                location=location,
-                slot_type=slot_type,
-                active=True,
+    regional_dates = {
+        holiday_date for calendar in HOLIDAY_CALENDARS.values() for holiday_date, _ in calendar
+    }
+    # Earlier seeds stored a few company-wide holidays without a region; the regional calendars
+    # from the 2026 holiday list PDFs replace them.
+    for legacy in db.scalars(
+        select(Holiday).where(Holiday.region.is_(None), Holiday.holiday_date.in_(regional_dates))
+    ).all():
+        db.delete(legacy)
+    db.flush()
+    for region, calendar in HOLIDAY_CALENDARS.items():
+        for holiday_date, name in calendar:
+            holiday = db.scalar(
+                select(Holiday).where(Holiday.holiday_date == holiday_date, Holiday.region == region)
             )
-            db.add(slot)
-            db.flush()
-        elif reset_demo:
-            slot.location = location
-            slot.slot_type = slot_type
-            slot.active = True
-        parking_slots[code] = slot
+            if holiday is None:
+                db.add(Holiday(holiday_date=holiday_date, name=name, category="PUBLIC", region=region))
+            else:
+                holiday.name = name
+                holiday.category = "PUBLIC"
 
-    year = date.today().year
-    for holiday_date, name in (
-        (date(year, 1, 26), "Republic Day"),
-        (date(year, 8, 15), "Independence Day"),
-        (date(year, 10, 2), "Gandhi Jayanti"),
-        (date(year, 12, 25), "Christmas"),
-    ):
-        holiday = db.scalar(select(Holiday).where(Holiday.holiday_date == holiday_date))
-        if holiday is None:
-            db.add(Holiday(holiday_date=holiday_date, name=name, category="PUBLIC"))
-        elif reset_demo:
-            holiday.name = name
-            holiday.category = "PUBLIC"
-
-    parking_date = _next_parking_workday()
-    occupied = db.scalar(
-        select(ParkingReservation).where(
-            ParkingReservation.employee_id == employees["MANAGER"].id,
-            ParkingReservation.reservation_date == parking_date,
-            ParkingReservation.status.in_(("RESERVED", "CHECKED_IN")),
-        )
-    )
-    if occupied is None:
-        occupied = ParkingReservation(
-            employee_id=employees["MANAGER"].id,
-            vehicle_id=vehicles["MANAGER"].id,
-            slot_id=parking_slots["B-21"].id,
-            reservation_date=parking_date,
-            status="RESERVED",
-        )
-        db.add(occupied)
-        db.flush()
-        db.add(
-            ParkingReservationEvent(
-                reservation_id=occupied.id,
-                actor_user_id=users["MANAGER"].id,
-                from_status=None,
-                to_status="RESERVED",
-                reason="Seeded occupied slot for the parking demo",
-            )
-        )
 
 
 def seed(*, reset_demo: bool = False) -> None:

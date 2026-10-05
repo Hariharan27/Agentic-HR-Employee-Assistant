@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import UTC, date, datetime
 
 import httpx
@@ -8,6 +9,7 @@ from sqlalchemy import select
 from app.agent.orchestrator import HRAssistantOrchestrator
 from app.api.routes.chat import get_llm_gateway, get_policy_service
 from app.application.leave.service import LeaveService
+from app.application.notifications.service import EmailService
 from app.application.onboarding.handler import (
     ApproveOnboardingHandler,
     CreateOnboardingHandler,
@@ -23,11 +25,14 @@ from app.application.parking.handlers import (
     MarkParkingNoShowHandler,
     OverrideParkingNoShowHandler,
     RegisterVehicleHandler,
+    RemoveVehicleHandler,
     ReserveParkingHandler,
+    ReserveParkingPlanHandler,
 )
 from app.application.parking.service import ParkingService
 from app.application.pending.handlers import (
     ApplyLeaveHandler,
+    ApplyLeavePlanHandler,
     ApproveLeaveRequestHandler,
     CancelLeaveRequestHandler,
     RejectLeaveRequestHandler,
@@ -35,12 +40,13 @@ from app.application.pending.handlers import (
 from app.application.pending.service import PendingActionCoordinator
 from app.core.config import Settings
 from app.core.exceptions import (
+    NotFoundError,
     AuthorizationError,
     ConflictError,
     LLMServiceError,
-    ParkingUnavailableError,
 )
 from app.core.security import AuthenticatedUser
+from app.domain.leave.dates import resolve_leave_dates
 from app.domain.onboarding.entities import OnboardingCandidate
 from app.infrastructure.database.models import (
     ConversationSession,
@@ -54,6 +60,7 @@ from app.infrastructure.database.models import (
     Vehicle,
 )
 from app.infrastructure.llm.mantle import MantleLLMGateway
+from app.infrastructure.notifications.email import ConsoleEmailGateway
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.infrastructure.repositories.leave import SQLAlchemyLeaveRepository
 from app.infrastructure.repositories.onboarding import SQLAlchemyOnboardingRepository
@@ -65,15 +72,419 @@ from app.rag.service import PolicyContext
 from app.main import app
 
 
+TEST_TODAY = date(2026, 10, 5)  # a Monday; matches the parking clock below
+
+
 class FakeLLM:
     def __init__(self, responses: list[str]):
         self.responses = responses
         self.calls: list[tuple[ModelTier, bool]] = []
+        self.last_route: dict[str, object] = {}
+        self.last_any_route: dict[str, object] = {}
 
     def complete(self, tier, *, system, user, json_mode=False):
         self.calls.append((tier, json_mode))
-        return self.responses.pop(0)
+        if "tool-calling Parking Agent" in system:
+            if self.responses:
+                try:
+                    candidate = json.loads(self.responses[0])
+                except (TypeError, ValueError):
+                    candidate = {}
+                if candidate.get("action") in {"tool", "final"}:
+                    return self.responses.pop(0)
+            return self._simulated_parking_response(user)
+        if "tool-calling Onboarding Agent" in system:
+            if self.responses:
+                try:
+                    candidate = json.loads(self.responses[0])
+                except (TypeError, ValueError):
+                    candidate = {}
+                if candidate.get("action") in {"tool", "final"}:
+                    return self.responses.pop(0)
+            return self._simulated_onboarding_response(user)
+        if "tool-calling Leave Agent" in system:
+            if self.responses:
+                try:
+                    candidate = json.loads(self.responses[0])
+                except (TypeError, ValueError):
+                    candidate = {}
+                if candidate.get("action") in {"tool", "final"}:
+                    return self.responses.pop(0)
+            return self._legacy_leave_agent_response(user)
+        response = self.responses.pop(0)
+        try:
+            candidate = json.loads(response)
+        except (TypeError, ValueError):
+            candidate = {}
+        if candidate.get("domain") == "leave":
+            self.last_route = candidate
+        if candidate.get("domain"):
+            self.last_any_route = candidate
+        return response
 
+    def _legacy_leave_agent_response(self, prompt: str) -> str:
+        """Simulate a well-behaved Leave Agent model over the plan-based tools."""
+        results = []
+        marker = "Tool results so far:\n"
+        if marker in prompt:
+            try:
+                results = json.loads(prompt.split(marker, 1)[1])
+            except ValueError:
+                results = []
+        today_match = re.search(r"Current date: (\d{4}-\d{2}-\d{2})", prompt)
+        today = date.fromisoformat(today_match.group(1)) if today_match else date.today()
+        plan_match = re.search(r"Active leave plan: (.*)\n", prompt)
+        try:
+            active_plan = json.loads(plan_match.group(1)) if plan_match else None
+        except ValueError:
+            active_plan = None
+        message_match = re.search(r"Current user message: (.*)\n\nAvailable tools:", prompt, re.S)
+        message = message_match.group(1).strip() if message_match else ""
+        history_match = re.search(r"Recent conversation:\n(.*)\nCurrent user message:", prompt, re.S)
+        history_lines = history_match.group(1).splitlines() if history_match else []
+        # A finished or cancelled action starts a fresh request.
+        for index in range(len(history_lines) - 1, -1, -1):
+            line = history_lines[index].casefold()
+            if line.startswith("assistant:") and ("cancelled" in line or "submitted successfully" in line):
+                history_lines = history_lines[index + 1:]
+                break
+        earlier_user = [line[len("user: "):] for line in history_lines if line.startswith("user: ")]
+        intent = self._simulated_intent(message, active_plan, earlier_user)
+        leave_type = self._simulated_type(message)
+        if leave_type is None:
+            for earlier in reversed(earlier_user):
+                leave_type = self._simulated_type(earlier)
+                if leave_type:
+                    break
+        date_text = message if self._has_dates(message, today) else next(
+            (earlier for earlier in reversed(earlier_user) if self._has_dates(earlier, today)), None
+        )
+
+        if results:
+            latest = results[-1]
+            data = latest.get("result", {})
+            if latest.get("status") == "error":
+                return json.dumps({
+                    "action": "final",
+                    "message": data.get("error") or data.get("reason") or "The Leave operation failed.",
+                })
+            tool = latest.get("tool")
+            if tool == "resolve_dates":
+                if intent in {"holidays", "calculate_leave_days"}:
+                    days = [item["date"] for item in data.get("dates", [])]
+                    if not days:
+                        return json.dumps({"action": "final", "message": "Please provide the start and end dates."})
+                    name = "get_holidays" if intent == "holidays" else "calculate_leave_days"
+                    return self._tool(name, start_date=min(days), end_date=max(days))
+                if not data.get("dates"):
+                    return json.dumps({"action": "final", "message": "Please provide the start and end dates."})
+                if leave_type is None:
+                    return json.dumps({"action": "final", "message": "Please provide the leave type."})
+                return self._tool(
+                    "build_leave_plan",
+                    leave_type=leave_type,
+                    dates=[item["date"] for item in data["dates"]],
+                    **({"reason": self._reason(message)} if self._reason(message) else {}),
+                )
+            if tool == "build_leave_plan":
+                if intent == "apply_leave" and data.get("eligible"):
+                    return self._tool("prepare_leave_application", plan_id=data["plan_id"])
+                return json.dumps({"action": "final", "message": data.get("summary", "")})
+            if tool == "get_leave_balance":
+                lines = [
+                    f"{item['leave_type'].title()}: {item['available_days']} available ({item['pending_days']} pending)"
+                    for item in data.get("balances", [])
+                ]
+                message_text = "Your leave balance:\n" + "\n".join(lines)
+            elif tool in {"get_my_leave_requests", "get_managed_leave_requests"}:
+                lines = [
+                    f"Request ID #{item['request_id']}: {item.get('employee_name') or ''} {item['leave_type'].title()} "
+                    f"{item['start_date']} to {item['end_date']} — {item['working_days']} day(s), {item['status'].title()}"
+                    for item in data.get("requests", [])
+                ]
+                heading = "Pending leave approvals:" if tool == "get_managed_leave_requests" else "Your recent leave requests:"
+                message_text = heading + ("\n" + "\n".join(lines) if lines else " None.")
+            elif tool == "get_leave_request_history":
+                message_text = f"History for leave request #{data.get('request_id')}: " + ", ".join(
+                    f"{item['to_status'].title()} by user #{item['actor_user_id']}"
+                    for item in data.get("events", [])
+                )
+            elif tool == "get_holidays":
+                holidays = data.get("holidays", [])
+                message_text = "Configured holidays in that range: " + ", ".join(holidays) + "." if holidays else "No configured holidays fall in that range."
+            elif tool == "calculate_leave_days":
+                message_text = f"That range contains {data.get('working_days')} working leave day(s)."
+            else:
+                message_text = "The Leave information was retrieved successfully."
+            return json.dumps({"action": "final", "message": message_text})
+
+        arguments: dict[str, object] = {}
+        request_match = re.search(r"#(\d+)|\brequest\s+(\d+)\b", message.casefold())
+        if request_match:
+            arguments["request_id"] = int(request_match.group(1) or request_match.group(2))
+        reason = self._reason(message)
+        if intent in {"apply_leave", "leave_eligibility"}:
+            if (
+                intent == "apply_leave"
+                and active_plan
+                and active_plan.get("eligible")
+                and not self._has_dates(message, today)
+                and leave_type in {None, active_plan.get("leave_type")}
+            ):
+                return self._tool("prepare_leave_application", plan_id=active_plan["plan_id"])
+            if leave_type is None:
+                return json.dumps({"action": "final", "message": "Please provide the leave type."})
+            if date_text is None:
+                return json.dumps({"action": "final", "message": "Please provide the start and end dates."})
+            return self._tool("resolve_dates", text=date_text)
+        if intent in {"holidays", "calculate_leave_days"}:
+            if date_text is None:
+                return json.dumps({"action": "final", "message": "Please provide the start and end dates."})
+            return self._tool("resolve_dates", text=date_text)
+        if intent == "leave_balance":
+            return self._tool("get_leave_balance", **({"leave_type": leave_type} if leave_type else {}))
+        if intent == "leave_requests":
+            return self._tool("get_my_leave_requests")
+        if intent == "manager_leave_requests":
+            return self._tool("get_managed_leave_requests")
+        if intent in {"leave_request_history", "cancel_leave_request", "approve_leave_request", "reject_leave_request"}:
+            if "request_id" not in arguments:
+                return json.dumps({"action": "final", "message": "Please provide the request id."})
+            if intent == "leave_request_history":
+                return self._tool("get_leave_request_history", request_id=arguments["request_id"])
+            if intent == "cancel_leave_request":
+                return self._tool("prepare_leave_cancellation", request_id=arguments["request_id"],
+                                  **({"reason": reason} if reason else {}))
+            if intent == "approve_leave_request":
+                return self._tool("prepare_leave_approval", request_id=arguments["request_id"],
+                                  **({"comment": reason} if reason else {}))
+            if not reason:
+                return json.dumps({"action": "final", "message": "Please provide a reason."})
+            return self._tool("prepare_leave_rejection", request_id=arguments["request_id"], reason=reason)
+        return json.dumps({"action": "final", "message": "Please clarify the Leave request."})
+
+    def _simulated_parking_response(self, prompt: str) -> str:
+        """Simulate a well-behaved Parking Agent: list slots, let the user choose, then prepare."""
+        from app.agent.parking_agent import ParkingAgent
+
+        results = []
+        marker = "Tool results so far:\n"
+        if marker in prompt:
+            try:
+                results = json.loads(prompt.split(marker, 1)[1])
+            except ValueError:
+                results = []
+        today_match = re.search(r"Current date: (\d{4}-\d{2}-\d{2})", prompt)
+        today = date.fromisoformat(today_match.group(1)) if today_match else date.today()
+        message = (re.search(r"Current user message: (.*)\n\nAvailable tools:", prompt, re.S) or [None, ""])[1].strip()
+        plan_match = re.search(r"Current parking dates or plan: (.*)\n", prompt)
+        try:
+            active = json.loads(plan_match.group(1)) if plan_match else None
+        except ValueError:
+            active = None
+        history = (re.search(r"Recent conversation:\n(.*)\nCurrent user message:", prompt, re.S) or [None, ""])[1]
+        earlier_user = [line[len("user: "):] for line in history.splitlines() if line.startswith("user: ")]
+        final = lambda text: json.dumps({"action": "final", "message": text})  # noqa: E731
+        normalized = message.casefold()
+        slot_match = re.search(r"\b([a-z]-?\d{2})\b", normalized)
+        slot = slot_match.group(1).upper() if slot_match else None
+        if slot and "-" not in slot:
+            slot = slot[0] + "-" + slot[1:]
+        wants_waitlist = bool(re.search(r"\b(wait\s*list|waiting list)\b", normalized))
+        cancelling = bool(re.search(r"\bcancel\b", normalized))
+        date_text = message if self._has_dates(message, today) else next(
+            (item for item in reversed(earlier_user) if self._has_dates(item, today)), None
+        )
+        if results:
+            latest = results[-1]
+            data = latest.get("result", {})
+            if latest.get("status") == "error":
+                return final(data.get("error", "The parking step failed."))
+            tool = latest.get("tool")
+            if tool == "resolve_dates":
+                dates = [item["date"] for item in data.get("dates", [])]
+                if not dates:
+                    return final("Please provide the parking date.")
+                if cancelling:
+                    return self._tool("prepare_parking_cancellation", date=dates[0])
+                if slot or wants_waitlist:
+                    return self._tool("build_parking_plan", slot=slot or "waitlist", dates=dates)
+                return self._tool("list_parking_slots", dates=dates)
+            if tool == "list_parking_slots":
+                return final(ParkingAgent.board_text(data))
+            if tool == "build_parking_plan":
+                if data.get("eligible"):
+                    return self._tool("prepare_parking", plan_id=data["plan_id"])
+                return final(data["summary"])
+            return final("Done.")
+        if not (slot or wants_waitlist or cancelling or re.search(r"\b(book|reserve|park|parking|slot)", normalized)):
+            return final("Please clarify the parking request.")
+        if date_text and self._has_dates(message, today):
+            return self._tool("resolve_dates", text=date_text)
+        if (slot or wants_waitlist) and active and active.get("dates"):
+            return self._tool("build_parking_plan", slot=slot or "waitlist")
+        if date_text:
+            return self._tool("resolve_dates", text=date_text)
+        return final("Please provide the parking date.")
+
+    def _simulated_onboarding_response(self, prompt: str) -> str:
+        """Simulate a well-behaved Onboarding Agent model over the onboarding tools."""
+        results = []
+        marker = "Tool results so far:\n"
+        if marker in prompt:
+            try:
+                results = json.loads(prompt.split(marker, 1)[1])
+            except ValueError:
+                results = []
+        message_match = re.search(r"Current user message: (.*)\n\nAvailable tools:", prompt, re.S)
+        message = message_match.group(1).strip() if message_match else ""
+        draft_match = re.search(r"Current onboarding draft: (.*)\n", prompt)
+        try:
+            draft = json.loads(draft_match.group(1)) if draft_match else None
+        except ValueError:
+            draft = None
+        final = lambda text: json.dumps({"action": "final", "message": text})  # noqa: E731
+        if results:
+            latest = results[-1]
+            data = latest.get("result", {})
+            if latest.get("status") == "error":
+                return final(data.get("error", "The onboarding step failed."))
+            tool = latest.get("tool")
+            if tool == "update_onboarding_draft":
+                if data.get("invalid"):
+                    return final("Please check: " + "; ".join(f"{k}: {v}" for k, v in data["invalid"].items()) + ".")
+                if data.get("missing"):
+                    return final("Please provide the " + ", ".join(data["missing"]) + ".")
+                return self._tool("build_onboarding_plan")
+            if tool == "build_onboarding_plan":
+                return self._tool("prepare_onboarding", plan_id=data["plan_id"])
+            if tool == "get_onboarding_status":
+                lines = [f"{task['title']}: {task['status'].replace('_', ' ').title()}" for task in data["tasks"]]
+                return final(
+                    f"{data['name']} — {data['designation']}\nJoining: {data['joining_date']}\n"
+                    f"Status: {data['status'].replace('_', ' ').title()} ({data['completed_tasks']}/{data['total_tasks']} completed)\n"
+                    + "\n".join(lines)
+                )
+            if tool == "list_onboarding_approvals":
+                requests = data.get("requests", [])
+                return final("Pending onboarding approvals:\n" + "\n".join(
+                    f"#{item['request_id']}: {item['name']} — {item['designation']}" for item in requests
+                ) if requests else "There are no onboarding requests pending approval.")
+            return final("Done.")
+
+        normalized = message.casefold()
+        request_match = re.search(r"(?:#|\brequest\s+)\s*(\d+)", message)
+        request_id = int(request_match.group(1)) if request_match else None
+        reason_match = re.search(r"\bbecause\s+(.+)$", message, re.I)
+        if re.search(r"\b(reject|decline)\b", normalized):
+            if request_id is None:
+                return final("Please provide the onboarding request ID.")
+            if not reason_match:
+                return final("Please provide a reason for rejecting the onboarding request.")
+            return self._tool("prepare_onboarding_rejection", request_id=request_id, reason=reason_match.group(1).strip())
+        if re.search(r"\bapprove\b", normalized):
+            if request_id is None:
+                return final("Please provide the onboarding request ID.")
+            return self._tool("prepare_onboarding_approval", request_id=request_id)
+        if "pending" in normalized and "approval" in normalized:
+            return self._tool("list_onboarding_approvals")
+        if re.search(r"\b(status|progress)\b", normalized):
+            name = self.last_any_route.get("employee_name")
+            if request_id is not None:
+                return self._tool("get_onboarding_status", request_id=request_id)
+            if name:
+                return self._tool("get_onboarding_status", employee=name)
+            return final("Please provide the employee name, email, or onboarding request ID.")
+
+        route_fields = {
+            "name": self.last_any_route.get("employee_name"),
+            "email": self.last_any_route.get("employee_email"),
+            "designation": self.last_any_route.get("designation"),
+            "department": self.last_any_route.get("department"),
+            "reporting_manager": self.last_any_route.get("reporting_manager"),
+            "joining_date": self.last_any_route.get("joining_date"),
+            "location": self.last_any_route.get("location"),
+            "employment_type": self.last_any_route.get("employment_type"),
+        }
+        labelled = {
+            "name": r"(?:employee\s+)?name\s*:\s*([^,;\n]+)",
+            "email": r"email\s*:\s*([^,;\n]+)",
+            "designation": r"(?:designation|role)\s*:\s*([^,;\n]+)",
+            "department": r"department\s*:\s*([^,;\n]+)",
+            "reporting_manager": r"(?:reporting\s+manager|manager)\s*:\s*([^,;\n]+)",
+            "joining_date": r"joining\s+date\s*:\s*([^,;\n]+)",
+            "location": r"location\s*:\s*([^,;\n]+)",
+            "employment_type": r"employment\s+type\s*:\s*([^,;\n]+)",
+        }
+        fields = {key: value for key, value in route_fields.items() if value}
+        for key, pattern in labelled.items():
+            match = re.search(pattern, message, re.I)
+            if match:
+                fields[key] = match.group(1).strip()
+        if fields:
+            return self._tool("update_onboarding_draft", **fields)
+        missing = (draft or {}).get("missing") or [
+            "employee name", "email", "designation", "department", "reporting manager",
+            "joining date", "location", "employment type",
+        ]
+        return final("Please provide the " + ", ".join(missing) + ". You can also use the onboarding form below.")
+
+    def _simulated_intent(self, message, active_plan, earlier_user):
+        normalized = message.casefold()
+        if re.search(r"\bapprove\b.*\b(?:leave\s+)?request\b", normalized):
+            return "approve_leave_request"
+        if re.search(r"\breject\b.*\b(?:leave\s+)?request\b", normalized):
+            return "reject_leave_request"
+        if re.search(r"\bcancel\b.*\b(?:my\s+)?(?:leave\s+)?request\b", normalized):
+            return "cancel_leave_request"
+        if "pending approval" in normalized or "approval queue" in normalized:
+            return "manager_leave_requests"
+        if "history" in normalized:
+            return "leave_request_history"
+        if "holiday" in normalized and ("between" in normalized or "from" in normalized):
+            return "holidays"
+        if "working day" in normalized or "calculate" in normalized:
+            return "calculate_leave_days"
+        if "balance" in normalized or re.search(r"\bhow (?:many|much).*(?:leave|casual|sick|earned|\bcl\b|\bsl\b|\bel\b)", normalized):
+            return "leave_balance"
+        if "leave request status" in normalized or re.search(r"\b(list|show|status|pending)\b.*\b(?:leave\s+)?requests?\b", normalized):
+            return "leave_requests"
+        if re.search(r"\b(apply|create|submit|raise|want|need|go ahead)\b", normalized):
+            return "apply_leave"
+        if re.search(r"\b(can i|could i|eligible|eligibility)\b", normalized):
+            return "leave_eligibility"
+        route_intent = self.last_route.get("intent")
+        if route_intent in {"apply_leave", "leave_eligibility"} or earlier_user:
+            return route_intent if route_intent in {"apply_leave", "leave_eligibility"} else "apply_leave"
+        return route_intent
+
+    @staticmethod
+    def _simulated_type(text):
+        patterns = {
+            "CASUAL": r"\b(?:casual|casula|cl)\b",
+            "SICK": r"\b(?:sick|sl)\b",
+            "EARNED": r"\b(?:earned|el)\b",
+        }
+        for leave_type, pattern in patterns.items():
+            if re.search(pattern, text.casefold()):
+                return leave_type
+        return None
+
+    @staticmethod
+    def _has_dates(text, today):
+        try:
+            return not resolve_leave_dates(text, today).ambiguous
+        except Exception:
+            return True
+
+    @staticmethod
+    def _reason(text):
+        match = re.search(r"\bbecause\s+(.+)$", text, re.I)
+        return match.group(1).strip() if match else None
+
+    @staticmethod
+    def _tool(tool_name, /, **arguments):
+        return json.dumps({"action": "tool", "tool_calls": [{"name": tool_name, "arguments": arguments}]})
 
 class FakePolicies:
     def search(self, question: str) -> PolicyContext:
@@ -173,8 +584,8 @@ def test_route_decision_normalizes_domain_from_intent():
 def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, parking_now=None):
     current_actor = current_actor or actor(db_session)
     settings = settings or Settings()
-    leave = LeaveService(SQLAlchemyLeaveRepository(db_session))
-    onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db_session))
+    leave = LeaveService(SQLAlchemyLeaveRepository(db_session), today=lambda: TEST_TODAY)
+    onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db_session), today=lambda: TEST_TODAY)
     parking = ParkingService(
         SQLAlchemyParkingRepository(db_session),
         settings,
@@ -184,14 +595,23 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, par
         SQLAlchemyPendingActionRepository(db_session),
         {
             "apply_leave": ApplyLeaveHandler(leave),
+            "apply_leave_plan": ApplyLeavePlanHandler(leave),
             "approve_leave_request": ApproveLeaveRequestHandler(leave),
             "reject_leave_request": RejectLeaveRequestHandler(leave),
             "cancel_leave_request": CancelLeaveRequestHandler(leave),
             "create_onboarding": CreateOnboardingHandler(onboarding),
-            "approve_onboarding": ApproveOnboardingHandler(onboarding),
+            "approve_onboarding": ApproveOnboardingHandler(
+                onboarding,
+                EmailService(ConsoleEmailGateway()),
+                settings.finance_notification_email,
+                settings.it_notification_email,
+                settings.facilities_notification_email,
+            ),
             "reject_onboarding": RejectOnboardingHandler(onboarding),
             "register_vehicle": RegisterVehicleHandler(parking),
+            "remove_vehicle": RemoveVehicleHandler(parking),
             "reserve_parking": ReserveParkingHandler(parking),
+            "reserve_parking_plan": ReserveParkingPlanHandler(parking),
             "cancel_parking": CancelParkingHandler(parking),
             "join_parking_waitlist": JoinParkingWaitlistHandler(parking),
             "check_in_parking": CheckInParkingHandler(parking),
@@ -221,7 +641,7 @@ def test_chat_routes_balance_to_deterministic_leave_service(db_session):
 
     assert result.domain == "leave"
     assert "Casual: 4 available" in result.message
-    assert llm.calls == [("router", True)]
+    assert llm.calls == [("router", True), ("standard", True), ("standard", True)]
 
 
 def test_parking_reservation_requires_confirmation_and_reuses_single_chat(db_session):
@@ -233,21 +653,24 @@ def test_parking_reservation_requires_confirmation_and_reuses_single_chat(db_ses
                 intent="reserve_parking",
                 parking_date="2026-10-08",
             ),
+            route(domain="general", intent="general"),
             route(domain="leave", intent="leave_balance", leave_type="CASUAL"),
         ]
     )
     service = orchestrator(db_session, llm)
 
-    proposal = service.chat("parking-book", "Book parking on 2026-10-08")
+    listing = service.chat("parking-book", "Book parking on 2026-10-08")
+    assert "B-21: free" in listing.message and "B-22: free" in listing.message
+    assert listing.pending_action is None
+
+    proposal = service.chat("parking-book", "B-22 please")
 
     assert proposal.domain == "parking"
-    assert proposal.intent == "reserve_parking"
-    assert "Slot B-21 is available" in proposal.message
-    assert proposal.pending_action is not None
+    assert "slot B-22" in proposal.pending_action
     assert db_session.scalars(select(ParkingReservation)).all() == []
 
     confirmed = service.chat("parking-book", "yes")
-    assert "slot B-21 is reserved" in confirmed.message
+    assert "slot B-22 reserved" in confirmed.message
     assert len(db_session.scalars(select(ParkingReservation)).all()) == 1
 
     balance = service.chat("parking-book", "How many casual leaves do I have?")
@@ -311,7 +734,7 @@ def test_parking_booking_can_be_found_and_cancelled_with_confirmation(db_session
             ]
         ),
     )
-    service.chat("parking-lifecycle", "Reserve parking on 2026-10-08")
+    service.chat("parking-lifecycle", "Reserve B-21 on 2026-10-08")
     service.chat("parking-lifecycle", "yes")
 
     lookup = service.chat("parking-lifecycle", "Show my parking booking for 2026-10-08")
@@ -345,17 +768,19 @@ def test_full_parking_offers_confirmed_waitlist(db_session):
                     domain="parking",
                     intent="parking_availability",
                     parking_date="2026-10-08",
-                )
+                ),
+                route(domain="parking", intent="join_parking_waitlist"),
             ]
         ),
     )
 
-    proposal = service.chat("parking-full", "Can I get parking on 2026-10-08?")
-    assert "All regular parking slots are reserved" in proposal.message
+    listing = service.chat("parking-full", "Can I get parking on 2026-10-08?")
+    assert "B-21: taken" in listing.message
+    proposal = service.chat("parking-full", "Please add me to the waitlist")
     assert "waitlist" in proposal.pending_action
 
     confirmed = service.chat("parking-full", "yes")
-    assert "added to the parking waitlist" in confirmed.message
+    assert "added to the waitlist" in confirmed.message
 
 
 def test_parking_date_is_kept_for_follow_up_request(db_session):
@@ -378,7 +803,7 @@ def test_parking_date_is_kept_for_follow_up_request(db_session):
     assert "do not have" in first.message
     follow_up = service.chat("parking-context", "Book parking for that day")
     assert "2026-10-08" in follow_up.message
-    assert follow_up.pending_action is not None
+    assert follow_up.pending_action is None  # the employee chooses the slot next
 
 
 def test_parking_guard_does_not_allow_model_to_invent_date():
@@ -413,7 +838,7 @@ def test_parking_confirmation_revalidates_slot_and_preserves_pending_action(db_s
             ]
         ),
     )
-    service.chat("parking-revalidate", "Reserve parking on 2026-10-08")
+    service.chat("parking-revalidate", "Reserve B-21 on 2026-10-08")
     db_session.add(
         ParkingReservation(
             employee_id=manager.employee_id,
@@ -425,7 +850,7 @@ def test_parking_confirmation_revalidates_slot_and_preserves_pending_action(db_s
     )
     db_session.commit()
 
-    with pytest.raises(ParkingUnavailableError, match="no longer available"):
+    with pytest.raises(ConflictError, match="availability changed"):
         service.chat("parking-revalidate", "yes")
 
     assert db_session.scalar(
@@ -583,14 +1008,14 @@ def test_manager_onboarding_collects_fields_then_confirms_atomically(db_session)
     confirmed = service.chat("onboarding-session", "yes")
 
     assert "pending HR administrator approval" in confirmed.message
-    assert "4 provisioning tasks" in confirmed.message
+    assert "5 provisioning tasks" in confirmed.message
     created = db_session.scalar(select(OnboardingRequest))
     assert created.employee_name == "Priya Raman"
-    assert len(db_session.scalars(select(OnboardingTask)).all()) == 4
+    assert len(db_session.scalars(select(OnboardingTask)).all()) == 5
     assert db_session.scalar(
         select(PendingAction).where(PendingAction.session_id == "onboarding-session")
     ) is None
-    assert len(llm.calls) == 2
+    assert [tier for tier, _ in llm.calls].count("router") == 2  # one routing call per user turn
 
 
 def test_hr_admin_approves_onboarding_with_confirmation_and_credentials_are_redacted(db_session):
@@ -706,7 +1131,7 @@ def test_manager_can_get_onboarding_status_by_name_in_chat(db_session):
 
     assert result.intent == "onboarding_status"
     assert "Priya Raman — Backend Developer" in result.message
-    assert "0/4 completed" in result.message
+    assert "0/5 completed" in result.message
 
 
 def test_cancelling_onboarding_confirmation_creates_nothing_and_clears_context(db_session):
@@ -770,12 +1195,13 @@ def test_leave_application_requires_confirmation_and_executes_on_yes(db_session)
     assert db_session.scalars(select(LeaveRequest)).all() == []
     assert db_session.scalar(select(PendingAction).where(PendingAction.session_id == "apply-session"))
 
+    calls_before_confirmation = len(llm.calls)
     confirmed = service.chat("apply-session", "yes")
 
     assert "submitted successfully" in confirmed.message
     assert len(db_session.scalars(select(LeaveRequest)).all()) == 1
     assert db_session.scalar(select(PendingAction).where(PendingAction.session_id == "apply-session")) is None
-    assert len(llm.calls) == 1
+    assert len(llm.calls) == calls_before_confirmation  # confirmation never calls a model
 
 
 def test_pending_leave_can_be_cancelled_without_execution(db_session):
@@ -871,8 +1297,9 @@ def test_employee_cannot_approve_a_leave_request_through_chat(db_session):
         actor(db_session), "CASUAL", date(2026, 10, 12), date(2026, 10, 12)
     )
 
+    # The role gate fails before any model call, so the API answers 403.
     with pytest.raises(AuthorizationError):
-        orchestrator(db_session, FakeLLM([route(intent="leave_requests")])).chat(
+        orchestrator(db_session, FakeLLM([route(intent="approve_leave_request")])).chat(
             "employee-approve", f"Approve leave request #{created.id}"
         )
 
@@ -919,52 +1346,37 @@ def test_leave_request_status_lists_requests_instead_of_applying_leave(db_sessio
     assert result.pending_action is None
 
 
-def test_leave_guard_extracts_textual_single_date():
+@pytest.mark.parametrize(
+    ("message", "intent"),
+    [
+        ("Can I take casual leave next Monday?", "leave_eligibility"),
+        ("Could I use sick leave tomorrow?", "leave_eligibility"),
+        ("Apply casual leave next Monday.", "apply_leave"),
+        ("Please create a sick leave request for tomorrow.", "apply_leave"),
+    ],
+)
+def test_leave_guard_distinguishes_eligibility_from_application(message, intent):
+    decision = RouteDecision.model_validate_json(route(intent="general"))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, message, today=date(2026, 10, 5)
+    )
+
+    assert guarded.domain == "leave"
+    assert guarded.intent == intent
+
+
+def test_leave_guard_does_not_route_non_leave_eligibility_to_leave():
     decision = RouteDecision.model_validate_json(route(
-        intent="apply_leave",
-        leave_type="CASUAL",
-        start_date=None,
-        end_date=None,
+        domain="leave", intent="leave_eligibility"
     ))
 
     guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Apply casual leave on 5 October", today=date(2026, 10, 4)
+        decision, "Am I eligible to take a loan?"
     )
 
-    assert guarded.start_date == date(2026, 10, 5)
-    assert guarded.end_date == date(2026, 10, 5)
-
-
-def test_leave_guard_extracts_duration_from_today():
-    decision = RouteDecision.model_validate_json(route(
-        intent="apply_leave",
-        leave_type="CASUAL",
-        start_date=None,
-        end_date=None,
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Apply casual leave for 5 days from today", today=date(2026, 10, 5)
-    )
-
-    assert guarded.start_date == date(2026, 10, 5)
-    assert guarded.end_date == date(2026, 10, 9)
-
-
-def test_leave_guard_extracts_duration_from_textual_start_date():
-    decision = RouteDecision.model_validate_json(route(
-        intent="apply_leave",
-        leave_type="EARNED",
-        start_date=None,
-        end_date=None,
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Apply earned leave from 5 October for 5 days", today=date(2026, 10, 4)
-    )
-
-    assert guarded.start_date == date(2026, 10, 5)
-    assert guarded.end_date == date(2026, 10, 9)
+    assert guarded.domain == "general"
+    assert guarded.intent == "general"
 
 
 def test_apply_leave_remembers_date_then_accepts_leave_type_follow_up(db_session):
@@ -1001,7 +1413,7 @@ def test_apply_leave_remembers_type_then_accepts_date_follow_up(db_session):
     proposal = service.chat("leave-type-first", "5th october")
 
     assert "leave type" in missing_type.message
-    assert "start date" in missing_dates.message
+    assert "start date and end date" in missing_dates.message
     assert proposal.intent == "apply_leave"
     assert "Casual leave from 2026-10-05 to 2026-10-05" in proposal.message
     assert proposal.pending_action is not None
@@ -1055,7 +1467,7 @@ def test_apply_leave_follow_up_handles_tomorrow_typo(db_session):
 
     assert "leave type" in missing.message
     assert proposal.intent == "apply_leave"
-    assert "Sick leave from 2026-10-05 to 2026-10-05" in proposal.message
+    assert "Sick leave from 2026-10-06 to 2026-10-06" in proposal.message
     assert proposal.pending_action is not None
 
 
@@ -1084,28 +1496,24 @@ def test_apply_leave_follow_up_preserves_textual_date_range_after_cancel(db_sess
 
 
 @pytest.mark.parametrize(
-    ("message", "expected_type", "expected_start", "expected_end"),
+    "message",
     [
-        ("please create casual leave request on 5 October", "CASUAL", date(2026, 10, 5), date(2026, 10, 5)),
-        ("I need sick leave tomorrow", "SICK", date(2026, 10, 5), date(2026, 10, 5)),
-        ("I need sick leave tommorrow", "SICK", date(2026, 10, 5), date(2026, 10, 5)),
-        ("raise privilege leave request from 5 October for 2 days", "EARNED", date(2026, 10, 5), date(2026, 10, 6)),
-        ("create leave from 13th october to 14th october", None, date(2026, 10, 13), date(2026, 10, 14)),
+        "please create casual leave request on 5 October",
+        "I need sick leave tomorrow",
+        "I need sick leave tommorrow",
+        "raise privilege leave request from 5 October for 2 days",
+        "create leave from 13th october to 14th october",
     ],
 )
-def test_apply_leave_guard_supports_varied_phrasings(
-    message, expected_type, expected_start, expected_end
-):
+def test_apply_leave_guard_supports_varied_phrasings(message):
     decision = RouteDecision.model_validate_json(route(domain="general", intent="general"))
 
     guarded = HRAssistantOrchestrator._apply_routing_guards(
         decision, message, today=date(2026, 10, 4)
     )
 
+    assert guarded.domain == "leave"
     assert guarded.intent == "apply_leave"
-    assert guarded.leave_type == expected_type
-    assert guarded.start_date == expected_start
-    assert guarded.end_date == expected_end
 
 
 def test_manager_can_switch_from_approval_queue_to_policy_question(db_session):
@@ -1178,35 +1586,6 @@ def test_policy_guard_routes_resignation_notice_question_to_rag(db_session):
     assert result.sources[0]["document"] == "Revised Leave Policy - I2I.pdf"
 
 
-def test_iso_date_guard_preserves_user_supplied_order():
-    decision = RouteDecision.model_validate_json(route(
-        intent="calculate_leave_days",
-        start_date="2026-11-01",
-        end_date="2026-11-10",
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Calculate leave days from 2026-11-10 to 2026-11-01"
-    )
-
-    assert guarded.start_date.isoformat() == "2026-11-10"
-    assert guarded.end_date.isoformat() == "2026-11-01"
-
-
-def test_router_cannot_invent_dates_when_user_provides_none():
-    decision = RouteDecision.model_validate_json(route(
-        intent="apply_leave",
-        leave_type="SICK",
-        start_date="2026-10-04",
-        end_date="2026-10-04",
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(decision, "Apply for sick leave")
-
-    assert guarded.start_date is None
-    assert guarded.end_date is None
-
-
 def test_apply_leave_guard_takes_priority_over_incidental_i_have_phrase():
     decision = RouteDecision.model_validate_json(route(intent="leave_balance", leave_type="SICK"))
 
@@ -1266,7 +1645,9 @@ def test_low_confidence_route_escalates_to_complex_model(db_session):
     result = orchestrator(db_session, llm).chat("escalation-session", "How much casual leave is left?")
 
     assert "Casual: 4 available" in result.message
-    assert llm.calls == [("router", True), ("complex", False)]
+    assert llm.calls == [
+        ("router", True), ("complex", False), ("standard", True), ("standard", True)
+    ]
 
 
 def test_invalid_router_output_escalates_to_complex_model(db_session):
@@ -1275,7 +1656,282 @@ def test_invalid_router_output_escalates_to_complex_model(db_session):
     result = orchestrator(db_session, llm).chat("invalid-route-session", "How much CL is left?")
 
     assert "Casual: 4 available" in result.message
-    assert llm.calls == [("router", True), ("complex", False)]
+    assert llm.calls == [
+        ("router", True), ("complex", False), ("standard", True), ("standard", True)
+    ]
+
+
+def test_leave_agent_simple_balance_emits_only_balance_activity(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "final", "message": "You have 4 Casual Leave days available."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-balance", "How much casual leave do I have?")
+
+    assert result.message == "You have 4 Casual Leave days available."
+    assert [event["tool"] for event in result.agent_activity or []] == ["get_leave_balance"]
+    assert result.agent_activity[0]["status"] == "success"
+
+
+def test_leave_agent_falls_back_to_tool_results_after_repeated_malformed_output(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "tool", "tool_calls": []}),
+        json.dumps({"action": "tool", "tool_calls": []}),
+    ])
+
+    result = orchestrator(db_session, llm).chat(
+        "agent-balance-recovery", "How much casual leave do I have?"
+    )
+
+    assert "Casual 4 days available" in result.message
+    assert result.intent == "leave_balance"
+    assert [event["tool"] for event in result.agent_activity] == ["get_leave_balance"]
+    assert result.pending_action is None
+    # one tool turn, one invalid turn, one repair turn (also invalid): no regex guessing
+    assert llm.calls.count(("standard", True)) == 3
+
+
+def test_leave_agent_repairs_one_malformed_output_with_the_validation_error(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "final", "message": ""}),  # schema-invalid: final without a message
+        json.dumps({"action": "final", "message": "You have 4 Casual Leave days available."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-repair", "How much casual leave do I have?")
+
+    assert result.message == "You have 4 Casual Leave days available."
+
+
+def test_leave_agent_regenerates_an_answer_with_numbers_not_in_tool_results(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "final", "message": "You have 7 casual leave days left."}),
+        json.dumps({"action": "final", "message": "You have 4 casual leave days available."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-grounding", "Show my leave balances")
+
+    assert result.message == "You have 4 casual leave days available."
+
+
+def test_leave_agent_never_shows_an_answer_that_stays_ungrounded(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "final", "message": "You have 7 casual leave days left."}),
+        json.dumps({"action": "final", "message": "You have 6 casual leave days left."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-grounding-fallback", "How much casual leave do I have?")
+
+    assert "Casual 4 days available" in result.message
+    assert "7" not in result.message and "6 casual" not in result.message
+
+
+def test_leave_agent_feeds_tool_errors_back_so_the_model_can_correct_itself(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "VACATION", "dates": ["2026-10-12"]}}]}),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": ["2026-10-12"]}}]}),
+        json.dumps({"action": "final", "message": "Yes, you are eligible: 1 working day of casual leave on 2026-10-12; 3 days remain."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-tool-error", "Can I take casual leave on 12 October?")
+
+    assert [(event["tool"], event["status"]) for event in result.agent_activity] == [
+        ("build_leave_plan", "error"), ("build_leave_plan", "success")
+    ]
+    assert "3 days remain" in result.message
+
+
+def test_leave_agent_warns_once_about_a_repeated_tool_call_then_continues(db_session):
+    call = {"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [call]}),
+        json.dumps({"action": "tool", "tool_calls": [call]}),
+        json.dumps({"action": "final", "message": "You have 4 Casual Leave days available."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-repeat", "How much casual leave do I have?")
+
+    assert result.message == "You have 4 Casual Leave days available."
+    assert [event["tool"] for event in result.agent_activity] == ["get_leave_balance"]
+
+
+def test_leave_agent_recovers_eligibility_when_final_model_output_is_malformed(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "resolve_dates", "arguments": {"text": "2026-11-04"}}]}),
+        json.dumps({"action": "tool", "tool_calls": [{
+            "name": "build_leave_plan",
+            "arguments": {"leave_type": "CASUAL", "dates": ["2026-11-04"]},
+        }]}),
+        json.dumps({"action": "tool", "tool_calls": []}),
+    ])
+
+    result = orchestrator(db_session, llm).chat(
+        "agent-eligibility-recovery", "Can I take casual leave on 2026-11-04?"
+    )
+
+    assert "eligible" in result.message
+    assert "1 working day" in result.message
+    assert result.pending_action is None
+
+
+def test_leave_agent_can_chain_multiple_tools_and_ground_final_response(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility"),
+        json.dumps({
+            "action": "tool",
+            "tool_calls": [
+                {"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}},
+                {"name": "get_holidays", "arguments": {"start_date": "2026-10-12", "end_date": "2026-10-13"}},
+                {"name": "calculate_leave_days", "arguments": {"start_date": "2026-10-12", "end_date": "2026-10-13"}},
+                {"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": ["2026-10-12", "2026-10-13"]}},
+            ],
+        }),
+        json.dumps({"action": "final", "message": "You are eligible for 2 working days of Casual Leave."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat(
+        "agent-multi-tool", "Can I take casual leave on October 12 and 13?"
+    )
+
+    assert "eligible" in result.message
+    assert [event["tool"] for event in result.agent_activity or []] == [
+        "get_leave_balance", "get_holidays", "calculate_leave_days", "build_leave_plan"
+    ]
+
+
+def test_leave_agent_can_use_policy_rag_and_preserve_sources(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility"),
+        # Turn 1 is answered by the simulated model: resolve_dates -> build_leave_plan.
+        route(intent="leave_eligibility"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "search_leave_policy", "arguments": {"question": "Can leave be combined with a holiday?"}}]}),
+        json.dumps({"action": "final", "message": "The policy passages retrieved for this question should be reviewed with the date calculation."}),
+    ])
+    service = orchestrator(db_session, llm)
+
+    plan = service.chat("agent-policy", "Can I take casual leave next Monday?")
+    result = service.chat("agent-policy", "Does the leave policy allow this around the holiday?")
+
+    assert "2026-10-12" in plan.message
+
+    assert result.sources
+    assert result.agent_activity[0]["tool"] == "search_leave_policy"
+
+
+def test_leave_agent_context_then_apply_it_stays_behind_confirmation(db_session):
+    llm = FakeLLM([
+        route(intent="apply_leave"),
+        json.dumps({"action": "final", "message": "Please provide the start and end dates."}),
+        route(intent="apply_leave"),
+        # Turn 2: the simulated model resolves "October 12", builds the plan, then prepares it.
+    ])
+    service = orchestrator(db_session, llm)
+
+    first = service.chat("agent-context", "I want to take casual leave")
+    proposal = service.chat("agent-context", "Apply it on October 12")
+
+    assert "start date and end date" in first.message
+    assert "Reply yes to confirm" in proposal.message
+    assert "2026-10-12 to 2026-10-12" in proposal.message
+    assert [event["tool"] for event in proposal.agent_activity] == [
+        "resolve_dates", "build_leave_plan", "prepare_leave_application"
+    ]
+    assert db_session.scalars(select(LeaveRequest)).all() == []
+    assert db_session.scalar(select(PendingAction).where(PendingAction.session_id == "agent-context"))
+
+
+def test_leave_agent_insufficient_balance_explains_without_pending_action(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": [
+            "2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20"
+        ]}}]}),
+        json.dumps({"action": "final", "message": "This is not eligible because the requested days exceed your available balance."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat(
+        "agent-insufficient", "Can I take 7 days of casual leave from October 12?"
+    )
+
+    assert "not eligible" in result.message
+    assert result.pending_action is None
+    assert db_session.scalars(select(LeaveRequest)).all() == []
+
+
+def test_leave_agent_surfaces_invalid_date_range_without_pending_action(db_session):
+    llm = FakeLLM([
+        route(intent="apply_leave", leave_type="CASUAL"),
+        json.dumps({
+            "action": "tool",
+            "tool_calls": [{
+                "name": "resolve_dates",
+                "arguments": {"text": "from 20 October to 10 October"},
+            }],
+        }),
+    ])
+
+    result = orchestrator(db_session, llm).chat(
+        "agent-invalid-range", "Apply casual leave from 20 October to 10 October"
+    )
+
+    assert "End date must be on or after start date" in result.message
+    assert result.pending_action is None
+    assert db_session.scalars(select(LeaveRequest)).all() == []
+
+
+def test_leave_agent_rejects_unauthorized_manager_action_without_mutation(db_session):
+    llm = FakeLLM([
+        route(intent="approve_leave_request", request_id=999),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "prepare_leave_approval", "arguments": {"request_id": 999}}]}),
+        json.dumps({"action": "final", "message": "You are not authorized to approve that leave request."}),
+    ])
+
+    with pytest.raises(AuthorizationError):
+        orchestrator(db_session, llm).chat("agent-authorization", "Approve leave request #999")
+    assert llm.calls.count(("standard", True)) == 0
+
+
+def test_leave_tools_reject_model_supplied_identity_fields(db_session):
+    service = orchestrator(db_session, FakeLLM([]))
+
+    execution = service.leave_agent.tools.execute(
+        "get_leave_balance",
+        {"leave_type": "CASUAL", "employee_id": 9999},
+        session_id="agent-identity-guard",
+    )
+
+    assert execution.ok is False
+    assert "authenticated session" in execution.data["error"]
+
+
+def test_leave_agent_stops_at_configured_iteration_limit(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+    ])
+
+    result = orchestrator(
+        db_session,
+        llm,
+        settings=Settings(leave_agent_max_iterations=1, llm_max_calls_per_request=4),
+    ).chat("agent-limit", "How much casual leave do I have?")
+
+    assert "stopped early" in result.message
+    assert "Casual 4 days available" in result.message
+    assert result.pending_action is None
+    assert result.agent_activity[0]["tool"] == "get_leave_balance"
 
 
 def test_model_call_budget_is_enforced(db_session):
@@ -1386,7 +2042,7 @@ def test_authenticated_chat_endpoint_wires_parking_workflow(client, db_session):
         response = client.post(
             "/api/v1/chat",
             headers={"Authorization": f"Bearer {token}"},
-            json={"message": "Reserve parking on 2026-10-08"},
+            json={"message": "Reserve B-21 on 2026-10-08"},
         )
     finally:
         app.dependency_overrides.pop(get_llm_gateway, None)
@@ -1404,3 +2060,882 @@ def test_chat_endpoint_requires_authentication(client):
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "authentication_failed"
+
+
+def test_tuesday_and_sunday_eligibility_then_apply_it_uses_the_same_one_day_plan(db_session):
+    """Regression: 'Tuesday and Sunday' was answered as 1 day, then applied as 4 days (Tue-Sun)."""
+    llm = FakeLLM([
+        route(intent="leave_eligibility", leave_type="CASUAL"),
+        route(domain="general", intent="general"),
+    ])
+    service = orchestrator(db_session, llm)
+
+    answer = service.chat("tue-sun", "can i take a casual leave on Tuesday and Sunday")
+    proposal = service.chat("tue-sun", "can you apply for it")
+
+    assert "1 working day(s) on 2026-10-06" in answer.message
+    assert "2026-10-11 (Sun, weekly off)" in answer.message
+    assert answer.pending_action is None
+    assert proposal.pending_action is not None
+    assert "Apply for 1 working day(s) of Casual leave from 2026-10-06 to 2026-10-06" in proposal.pending_action
+    assert [event["tool"] for event in proposal.agent_activity] == ["prepare_leave_application"]
+
+    confirmed = service.chat("tue-sun", "yes")
+    requests = db_session.scalars(select(LeaveRequest)).all()
+
+    assert "1 working day(s) was submitted successfully" in confirmed.message
+    assert [(item.start_date, item.end_date, item.working_days) for item in requests] == [
+        (date(2026, 10, 6), date(2026, 10, 6), 1)
+    ]
+
+
+def test_separate_days_plan_is_confirmed_as_separate_requests(db_session):
+    llm = FakeLLM([route(intent="apply_leave", leave_type="SICK")])
+    service = orchestrator(db_session, llm)
+
+    proposal = service.chat("separate-days", "apply sick leave on Tuesday and Friday")
+    confirmed = service.chat("separate-days", "yes")
+
+    assert "2026-10-06 (Tue); 2026-10-09 (Fri)" in proposal.message
+    assert "requests were submitted successfully" in confirmed.message
+    assert len(db_session.scalars(select(LeaveRequest)).all()) == 2
+
+
+def test_prepare_requires_the_active_plan_id(db_session):
+    service = orchestrator(db_session, FakeLLM([]))
+
+    execution = service.leave_agent.tools.execute(
+        "prepare_leave_application", {"plan_id": "lp_unknown"}, session_id="no-plan", active_plan=None
+    )
+
+    assert execution.ok is False
+    assert "No active leave plan" in execution.data["error"]
+
+
+def test_read_tools_never_change_the_active_plan(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility", leave_type="CASUAL"),
+        route(intent="calculate_leave_days"),
+    ])
+    service = orchestrator(db_session, llm)
+
+    service.chat("plan-stable", "can i take casual leave on Tuesday and Sunday")
+    service.chat("plan-stable", "calculate working days from Tuesday to Sunday")
+    stored = json.loads(db_session.get(ConversationSession, "plan-stable").state_json)
+
+    assert stored["leave_plan"]["requested_dates"] == ["2026-10-06", "2026-10-11"]
+
+
+
+class FakeToolCallingLLM(FakeLLM):
+    """Router via JSON, Leave Agent via scripted native tool-calling turns."""
+
+    def __init__(self, routes, turns):
+        super().__init__(routes)
+        self.turns = list(turns)
+        self.tool_requests = []
+
+    def complete_with_tools(self, tier, *, system, messages, tools):
+        self.calls.append((tier, "tools"))
+        self.tool_requests.append({"messages": messages, "tools": tools})
+        return self.turns.pop(0)
+
+
+def test_native_tool_calling_runs_the_same_plan_flow(db_session):
+    from app.llm.ports import LLMToolCall, LLMToolTurn
+
+    llm = FakeToolCallingLLM(
+        [route(intent="leave_eligibility", leave_type="CASUAL")],
+        [
+            LLMToolTurn(None, [LLMToolCall("c1", "resolve_dates", {"text": "Tuesday and Sunday"})]),
+            LLMToolTurn(None, [LLMToolCall("c2", "build_leave_plan", {"leave_type": "CASUAL", "dates": ["2026-10-06", "2026-10-11"]})]),
+            LLMToolTurn("Yes: 1 working day on 2026-10-06; Sunday 2026-10-11 is a weekly off. 3 days remain.", []),
+        ],
+    )
+    service = orchestrator(db_session, llm, settings=Settings(leave_agent_native_tools=True))
+
+    result = service.chat("native-tools", "can i take casual leave on Tuesday and Sunday")
+
+    assert "1 working day" in result.message
+    assert [event["tool"] for event in result.agent_activity] == ["resolve_dates", "build_leave_plan"]
+    last = llm.tool_requests[-1]["messages"]
+    assert [item["role"] for item in last] == ["user", "assistant", "tool", "assistant", "tool"]
+    assert last[2]["tool_call_id"] == "c1" and last[4]["tool_call_id"] == "c2"
+    assert {tool["function"]["name"] for tool in llm.tool_requests[0]["tools"]} >= {
+        "resolve_dates", "build_leave_plan", "prepare_leave_application"
+    }
+
+
+def test_mantle_gateway_native_tool_calling_contract():
+    captured = {}
+
+    def handler(request: httpx.Request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": None,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "get_leave_balance", "arguments": "{\"leave_type\": \"CASUAL\"}"}}],
+        }}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    gateway = MantleLLMGateway(Settings(bedrock_api_key="test-key", llm_max_retries=0), client=client)
+
+    turn = gateway.complete_with_tools(
+        "standard",
+        system="agent",
+        messages=[{"role": "user", "content": "balance?"}],
+        tools=[{"type": "function", "function": {"name": "get_leave_balance", "description": "d", "parameters": {"type": "object"}}}],
+    )
+
+    assert turn.content is None
+    assert turn.tool_calls[0].name == "get_leave_balance"
+    assert turn.tool_calls[0].arguments == {"leave_type": "CASUAL"}
+    assert captured["body"]["tools"][0]["function"]["name"] == "get_leave_balance"
+    assert captured["body"]["tool_choice"] == "auto"
+    assert captured["body"]["messages"][0] == {"role": "system", "content": "agent"}
+
+
+
+def test_leave_replies_keep_bold_but_normalise_spaces_and_drop_headings(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "final", "message": "## Balance\nYou currently have **4\u202fcasual leave days** available."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("plain-text", "How much casual leave do I have?")
+
+    assert result.message == "Balance\nYou currently have **4 casual leave days** available."
+
+
+def test_route_decision_does_not_map_privilege_leave_to_earned():
+    decision = RouteDecision.model_validate_json(route(intent="leave_balance", leave_type="PL"))
+
+    assert decision.leave_type is None
+
+
+def test_leave_rules_tool_returns_policy_rules_with_page_sources(db_session):
+    service = orchestrator(db_session, FakeLLM([]))
+
+    execution = service.leave_agent.tools.execute(
+        "get_leave_rules", {"leave_type": "EARNED"}, session_id="rules"
+    )
+
+    rules = {item["rule"]: item for item in execution.data["rules"]}
+    assert "earned_carry_forward" in rules and "entitlement_casual" not in rules
+    assert rules["holidays_not_counted"]["enforced_by_system"] is True
+    assert rules["earned_carry_forward"]["source"]["page"] == 2
+    assert {source["document"] for source in execution.sources} == {"Revised Leave Policy - I2I.pdf"}
+
+
+def test_split_leave_is_offered_then_built_only_after_the_employee_agrees(db_session):
+    days = ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"]
+    llm = FakeLLM([
+        route(intent="apply_leave", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": days}}]}),
+        json.dumps({"action": "final", "message": "You have 4 casual days, so 1 day is short. Shall I use 1 earned day for the rest?"}),
+        route(domain="general", intent="general"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": days, "split_with": "EARNED"}}]}),
+    ])
+    service = orchestrator(db_session, llm)
+
+    offer = service.chat("split", "apply casual leave from 12 Oct to 16 Oct")
+    assert offer.pending_action is None
+    # The scripted turn rebuilds the plan with split_with; the simulated model then prepares it.
+    proposal = service.chat("split", "yes, use earned leave for the rest")
+
+    assert "4 Casual on 2026-10-12 to 2026-10-15 + 1 Earned on 2026-10-16" in proposal.pending_action
+    confirmed = service.chat("split", "yes")
+    assert "were submitted successfully" in confirmed.message
+    assert sorted((item.leave_type, item.working_days) for item in db_session.scalars(select(LeaveRequest)).all()) == [
+        ("CASUAL", 4), ("EARNED", 1)
+    ]
+
+
+def test_onboarding_confirmation_counts_the_planned_provisioning_tasks(db_session):
+    service = orchestrator(
+        db_session, FakeLLM([complete_onboarding_route()]), current_actor=actor(db_session, "manager")
+    )
+
+    proposal = service.chat("onboarding-task-count", complete_onboarding_message())
+
+    assert "with 5 provisioning requests" in proposal.pending_action
+
+
+def test_same_leave_next_week_moves_the_active_plan_by_seven_days(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility", leave_type="CASUAL"),
+        route(domain="general", intent="general"),
+    ])
+    service = orchestrator(db_session, llm)
+    service.chat("shift", "can i take casual leave on Tuesday and Sunday")
+    plan_id = json.loads(db_session.get(ConversationSession, "shift").state_json)["leave_plan"]["plan_id"]
+    llm.responses.extend([
+        json.dumps({"action": "tool", "tool_calls": [{"name": "shift_leave_plan", "arguments": {"plan_id": plan_id, "shift_days": 7}}]}),
+        json.dumps({"action": "final", "message": "Moved: 1 working day on 2026-10-13; Sunday 2026-10-18 is a weekly off."}),
+    ])
+
+    moved = service.chat("shift", "same leave next week")
+    stored = json.loads(db_session.get(ConversationSession, "shift").state_json)["leave_plan"]
+
+    assert stored["requested_dates"] == ["2026-10-13", "2026-10-18"]
+    assert stored["leave_type"] == "CASUAL" and stored["eligible"] is True
+    assert [event["tool"] for event in moved.agent_activity] == ["shift_leave_plan"]
+
+
+ONBOARDING_FORM = {
+    "name": "Nila Raman",
+    "email": "nila.raman@example.com",
+    "designation": "Software Engineer",
+    "department": "Engineering",
+    "reporting_manager": "Test Manager",
+    "joining_date": "2026-10-12",
+    "location": "Chennai",
+    "employment_type": "Permanent",
+}
+
+
+def test_onboarding_form_goes_straight_to_a_plan_without_any_model_call(db_session):
+    llm = FakeLLM([])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "manager"))
+
+    proposal = service.chat("onboarding-form", "Submitted the onboarding form", onboarding_form=ONBOARDING_FORM)
+
+    assert llm.calls == []
+    assert "New employee onboarding" in proposal.message
+    assert "Set up payroll and salary account" in proposal.message
+    assert "with 5 provisioning requests" in proposal.pending_action
+    assert proposal.onboarding_draft["email"] == "nila.raman@example.com"
+
+
+def test_onboarding_form_reports_invalid_fields(db_session):
+    service = orchestrator(db_session, FakeLLM([]), current_actor=actor(db_session, "manager"))
+    form = {**ONBOARDING_FORM, "joining_date": "2026-10-01", "location": "Mumbai", "employment_type": "freelance"}
+
+    result = service.chat("onboarding-form-invalid", "Submitted the onboarding form", onboarding_form=form)
+
+    assert "Please check the onboarding form" in result.message
+    assert "joining date must be today (2026-10-05) or later" in result.message
+    assert "location must be Chennai or Bengaluru" in result.message
+    assert "employment type must be Permanent, Contract, Intern" in result.message
+    assert result.pending_action is None
+
+
+def test_chat_details_and_the_form_fill_one_shared_draft(db_session):
+    llm = FakeLLM([route(domain="onboarding", intent="start_onboarding", employee_name="Nila Raman",
+                         designation="Software Engineer")])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "manager"))
+
+    first = service.chat("onboarding-mixed", "Onboard Nila Raman as a Software Engineer")
+    rest = {key: value for key, value in ONBOARDING_FORM.items() if key not in {"name", "designation"}}
+    proposal = service.chat("onboarding-mixed", "Submitted the onboarding form", onboarding_form=rest)
+
+    assert first.onboarding_draft == {"name": "Nila Raman", "designation": "Software Engineer"}
+    assert "Please provide the email" in first.message
+    assert "Name: Nila Raman" in proposal.message and proposal.pending_action is not None
+
+
+def test_onboarding_tool_rejects_values_the_user_did_not_state(db_session):
+    service = orchestrator(db_session, FakeLLM([]), current_actor=actor(db_session, "manager"))
+    tools = service.onboarding_agent.tools
+    tools.turn_text = "Onboard Nila Raman as a Software Engineer"
+
+    execution = tools.execute(
+        "update_onboarding_draft",
+        {"name": "Nila Raman", "email": "invented@example.com", "location": "Blr"},
+        session_id="s",
+    )
+
+    assert execution.data["draft"] == {"employee name": "Nila Raman"}
+    assert set(execution.data["not_stated_by_user"]) == {"email", "location"}
+
+
+def test_onboarding_field_aliases_normalise(db_session):
+    service = orchestrator(db_session, FakeLLM([]), current_actor=actor(db_session, "manager"))
+    tools = service.onboarding_agent.tools
+    tools.turn_text = "she is perm, based in Blr, reports to manager, joins next Monday"
+
+    execution = tools.execute(
+        "update_onboarding_draft",
+        {"employment_type": "perm", "location": "Blr", "reporting_manager": "manager", "joining_date": "next Monday"},
+        session_id="s",
+    )
+
+    assert execution.data["draft"] == {
+        "employment type": "Permanent", "location": "Bengaluru",
+        "reporting manager": "Test Manager", "joining date": "2026-10-12",
+    }
+
+
+def test_manager_cannot_approve_onboarding_and_gets_403(db_session):
+    llm = FakeLLM([route(domain="onboarding", intent="approve_onboarding", request_id=999)])
+
+    with pytest.raises(AuthorizationError):
+        orchestrator(db_session, llm, current_actor=actor(db_session, "manager")).chat(
+            "manager-approve-onboarding", "Approve onboarding request #999"
+        )
+
+
+def test_hr_admin_rejection_asks_for_a_reason_then_prepares_it(db_session):
+    created = OnboardingService(SQLAlchemyOnboardingRepository(db_session), today=lambda: TEST_TODAY).create_onboarding(
+        actor(db_session, "manager"),
+        OnboardingCandidate(name="Nila Raman", email="nila.raman@example.com", designation="Software Engineer",
+                            department="Engineering", reporting_manager="Test Manager",
+                            joining_date=date(2026, 10, 12), location="Chennai", employment_type="Permanent"),
+    )
+    llm = FakeLLM([route(domain="general", intent="general"), route(domain="general", intent="general")])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "hradmin"))
+
+    missing = service.chat("reject-onboarding", f"Reject onboarding request #{created.id}")
+    proposal = service.chat("reject-onboarding", f"Reject onboarding request #{created.id} because duplicate hire")
+
+    assert "Please provide a reason" in missing.message and missing.pending_action is None
+    assert proposal.pending_action == f"Reject onboarding request #{created.id} for Nila Raman: duplicate hire"
+
+
+def test_chat_endpoint_accepts_a_structured_onboarding_form(client, db_session):
+    app.dependency_overrides[get_llm_gateway] = lambda: FakeLLM([])
+    app.dependency_overrides[get_policy_service] = lambda: FakePolicies()
+    try:
+        token = client.post(
+            "/api/v1/auth/login", json={"username": "manager", "password": "manager-password"}
+        ).json()["access_token"]
+        form = {**ONBOARDING_FORM, "joining_date": "2099-01-15"}
+        response = client.post(
+            "/api/v1/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"message": "Submitted the onboarding form", "onboarding_form": form},
+        )
+    finally:
+        app.dependency_overrides.pop(get_llm_gateway, None)
+        app.dependency_overrides.pop(get_policy_service, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["domain"] == "onboarding" and body["pending_action"]
+    assert body["onboarding_draft"]["joining_date"] == "2099-01-15"
+
+
+
+def five_slots(db_session):
+    """B-21..B-24 regular plus B-25 accessible, as in the demo seed."""
+    employee_vehicle, manager_vehicle, slots = setup_parking(db_session, slots=4)
+    accessible = ParkingSlot(code="B-25", location="Chennai HQ", slot_type="ACCESSIBLE", active=True)
+    db_session.add(accessible)
+    db_session.commit()
+    return employee_vehicle, manager_vehicle, [*slots, accessible]
+
+
+def test_availability_lists_all_five_slots_with_accessible_last(db_session):
+    _, manager_vehicle, slots = five_slots(db_session)
+    db_session.add(ParkingReservation(employee_id=actor(db_session, "manager").employee_id, vehicle_id=manager_vehicle.id,
+                                      slot_id=slots[1].id, reservation_date=date(2026, 10, 8), status="RESERVED"))
+    db_session.commit()
+    llm = FakeLLM([route(domain="parking", intent="parking_availability", parking_date="2026-10-08")])
+
+    listing = orchestrator(db_session, llm).chat("five-slots", "Which parking slots are available on 2026-10-08?")
+
+    lines = [line for line in listing.message.splitlines() if line.startswith("- B-")]
+    assert lines == ["- B-21: free", "- B-22: taken", "- B-23: free", "- B-24: free", "- B-25 (accessible): free"]
+    assert listing.pending_action is None
+
+
+def test_one_slot_for_several_days_asks_about_days_where_it_is_taken(db_session):
+    _, manager_vehicle, slots = five_slots(db_session)
+    db_session.add(ParkingReservation(employee_id=actor(db_session, "manager").employee_id, vehicle_id=manager_vehicle.id,
+                                      slot_id=slots[1].id, reservation_date=date(2026, 10, 13), status="RESERVED"))
+    db_session.commit()
+    service = orchestrator(db_session, FakeLLM([
+        route(domain="parking", intent="reserve_parking"),
+        route(domain="general", intent="general"),
+    ]))
+    plan_dates = ["2026-10-12", "2026-10-13", "2026-10-14"]
+
+    taken = service.chat("multi-day", "Reserve B-22 from 12 Oct to 14 Oct")
+    assert "2026-10-13: slot B-22 is taken; free slots: B-21, B-23, B-24, B-25" in taken.message
+    assert taken.pending_action is None
+
+    service.llm.responses.extend([
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_parking_plan", "arguments": {
+            "slot": "B-22", "dates": plan_dates, "alternatives": {"2026-10-13": "B-23"}}}]}),
+    ])
+    proposal = service.chat("multi-day", "use B-23 on the 13th, B-22 otherwise")
+    assert "2026-10-12 (Mon): slot B-22" in proposal.pending_action
+    assert "2026-10-13 (Tue): slot B-23" in proposal.pending_action
+    assert "2026-10-14 (Wed): slot B-22" in proposal.pending_action
+
+    confirmed = service.chat("multi-day", "yes")
+    booked = sorted((item.reservation_date.isoformat(), item.slot_id) for item in db_session.scalars(
+        select(ParkingReservation).where(ParkingReservation.employee_id == actor(db_session).employee_id)))
+    assert [day for day, _ in booked] == plan_dates
+    assert "Parking booked" in confirmed.message
+
+
+def test_the_agent_cannot_choose_a_slot_the_employee_did_not_name(db_session):
+    five_slots(db_session)
+    service = orchestrator(db_session, FakeLLM([]))
+    tools = service.parking_agent.tools
+    tools.turn_text = "book parking tomorrow"
+
+    execution = tools.execute(
+        "build_parking_plan", {"slot": "B-21", "dates": ["2026-10-06"]}, session_id="s", active_plan=None
+    )
+
+    assert execution.ok is False
+    assert "must choose the slot themselves" in execution.data["error"]
+
+
+def test_waitlist_is_refused_while_slots_are_free(db_session):
+    five_slots(db_session)
+    parking = ParkingService(SQLAlchemyParkingRepository(db_session), Settings(),
+                             now=lambda: datetime(2026, 10, 5, 4, 30, tzinfo=UTC))
+
+    plan = parking.build_parking_plan(actor(db_session), [date(2026, 10, 8)], "waitlist")
+
+    assert not plan.eligible
+    assert "are free, so the waitlist is not needed" in plan.problems[0]
+
+
+def test_apply_intent_stages_confirmation_when_the_model_stops_at_an_eligible_plan(db_session):
+    llm = FakeLLM([
+        route(intent="apply_leave", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": ["2026-10-12"]}}]}),
+        json.dumps({"action": "final", "message": "You are eligible. Shall I prepare it?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-apply", "Apply casual leave on 12 October")
+
+    assert result.pending_action is not None
+    assert result.message.startswith("Apply for 1 working day(s) of Casual leave from 2026-10-12 to 2026-10-12")
+    assert "Reply yes to confirm or cancel" in result.message
+
+
+def test_missing_leave_type_is_asked_then_the_follow_up_reuses_the_asked_dates(db_session):
+    service = orchestrator(db_session, FakeLLM([
+        route(intent="apply_leave"),
+        json.dumps({"action": "final", "message": "Which leave type?"}),
+        route(intent="apply_leave", leave_type="CASUAL"),
+        json.dumps({"action": "final", "message": "Okay."}),
+    ]))
+
+    asked = service.chat("finalize-follow-up", "Apply leave on 12 October")
+    proposal = service.chat("finalize-follow-up", "casual")
+
+    assert asked.message == "Please provide the leave type for 2026-10-12: casual, sick or earned."
+    assert asked.pending_action is None
+    assert proposal.pending_action is not None
+    assert "Casual leave from 2026-10-12 to 2026-10-12" in proposal.message
+
+
+def test_another_employees_balance_shows_only_the_callers_own(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance"),
+        json.dumps({"action": "final", "message": "I can't share that."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-identity", "Show employee E1002's casual leave balance")
+
+    assert result.message.startswith("I can only show your own leave balance. Your leave balance: Casual")
+    assert "E1002" not in result.message
+
+
+def test_request_id_is_asked_when_an_id_action_names_no_request(db_session):
+    llm = FakeLLM([
+        route(intent="cancel_leave_request"),
+        json.dumps({"action": "final", "message": "Which one?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-id", "Cancel my leave request")
+
+    assert result.message.startswith("Please provide the request ID.")
+    assert result.pending_action is None
+
+
+def test_plural_parking_reservations_route_to_the_reservation_list():
+    decision = RouteDecision.model_validate_json(route(domain="general", intent="general"))
+
+    guarded = HRAssistantOrchestrator._apply_routing_guards(
+        decision, "Show my parking reservations", today=date(2026, 10, 4)
+    )
+
+    assert guarded.intent == "parking_reservations"
+
+
+def test_reversed_range_count_explains_the_order_when_the_model_only_asks_back(db_session):
+    llm = FakeLLM([
+        route(intent="calculate_leave_days"),
+        json.dumps({"action": "final", "message": "Did you mean the other way round?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-reversed", "Calculate leave days from 2026-11-10 to 2026-11-01")
+
+    assert "End date must be on or after start date" in result.message
+
+
+def test_balance_question_is_answered_even_when_the_model_asks_for_a_type(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance"),
+        json.dumps({"action": "final", "message": "Which leave type?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-balance", "'; DROP TABLE x; -- What is my leave balance?")
+
+    assert result.message.startswith("Your leave balance:")
+    assert "only show your own" not in result.message
+
+
+def test_an_alternative_for_one_day_keeps_the_slot_the_employee_already_chose(db_session):
+    five_slots(db_session)
+    service = orchestrator(db_session, FakeLLM([]))
+    tools = service.parking_agent.tools
+    tools.turn_text = "use B-23 on the 13th"
+
+    execution = tools.execute(
+        "build_parking_plan",
+        {"slot": "B-22", "dates": ["2026-10-12", "2026-10-13"], "alternatives": {"2026-10-13": "B-23"}},
+        session_id="s",
+        active_plan={"slot_code": "B-22", "dates": ["2026-10-12", "2026-10-13"]},
+    )
+    unchosen = tools.execute(
+        "build_parking_plan", {"slot": "B-24", "dates": ["2026-10-12"]}, session_id="s",
+        active_plan={"slot_code": "B-22"},
+    )
+
+    assert "must choose the slot themselves" not in str(execution.data.get("error", ""))
+    assert unchosen.ok is False and "must choose the slot themselves" in unchosen.data["error"]
+
+
+def test_employee_removes_vehicle_after_confirmation(db_session):
+    employee_vehicle, _, _ = five_slots(db_session)
+    service = orchestrator(db_session, FakeLLM([
+        route(domain="parking", intent="general"),
+        route(domain="general", intent="general"),
+    ]))
+
+    proposal = service.chat("remove-vehicle", "Remove my vehicle")
+    assert proposal.intent == "remove_vehicle"
+    assert proposal.pending_action.startswith(f"Remove vehicle {employee_vehicle.registration_number}")
+    assert db_session.get(Vehicle, employee_vehicle.id).active is True
+
+    confirmed = service.chat("remove-vehicle", "yes")
+    assert "was removed from your parking profile" in confirmed.message
+    db_session.expire_all()
+    assert db_session.get(Vehicle, employee_vehicle.id).active is False
+
+
+def test_vehicle_with_an_upcoming_booking_cannot_be_removed(db_session):
+    employee_vehicle, _, slots = five_slots(db_session)
+    db_session.add(ParkingReservation(employee_id=actor(db_session).employee_id, vehicle_id=employee_vehicle.id,
+                                      slot_id=slots[0].id, reservation_date=date(2026, 10, 8), status="RESERVED"))
+    db_session.commit()
+
+    with pytest.raises(ConflictError, match="Cancel them first"):
+        orchestrator(db_session, FakeLLM([route(domain="parking", intent="general")])).chat(
+            "remove-blocked", "Delete my car from parking"
+        )
+
+
+def test_two_vehicles_are_listed_and_a_booking_asks_which_one(db_session):
+    employee_vehicle, _, _ = five_slots(db_session)
+    db_session.add(Vehicle(employee_id=actor(db_session).employee_id, registration_number="TN09ZZ4321",
+                           vehicle_type="MOTORCYCLE", make_model="TVS Jupiter", active=True))
+    db_session.commit()
+    service = orchestrator(db_session, FakeLLM([route(domain="parking", intent="parking_vehicle")]))
+
+    listing = service.chat("two-vehicles", "Show my vehicles")
+    assert listing.message.startswith("Your registered vehicles:")
+    assert employee_vehicle.registration_number in listing.message and "TN09ZZ4321" in listing.message
+
+    db_session.add(ParkingSlot(code="M-01", location="Two-wheeler bay", slot_type="REGULAR",
+                               vehicle_type="MOTORCYCLE", active=True))
+    db_session.commit()
+    me = actor(db_session)
+    # A car slot books the only car; a bike slot books the only motorcycle.
+    car_plan = service.parking.build_parking_plan(me, [date(2026, 10, 8)], "B-21")
+    assert car_plan.eligible and car_plan.vehicle == employee_vehicle.registration_number
+    bike_plan = service.parking.build_parking_plan(me, [date(2026, 10, 8)], "M-01")
+    assert bike_plan.eligible and bike_plan.vehicle == "TN09ZZ4321"
+    # The vehicle can be named by type or registration; a mismatched slot is refused.
+    by_type = service.parking.build_parking_plan(me, [date(2026, 10, 8)], "M-01", None, "my bike")
+    assert by_type.eligible and by_type.vehicle == "TN09ZZ4321"
+    mismatch = service.parking.build_parking_plan(me, [date(2026, 10, 8)], "B-21", None, "tn09 zz 4321")
+    assert not mismatch.eligible and "is a car slot" in mismatch.problems[0]
+    board = service.parking.slot_board(me, [date(2026, 10, 8)], "bike")
+    assert [slot["slot"] for slot in board["days"][0]["slots"]] == ["M-01"]
+
+
+def test_a_reversed_range_is_reported_even_if_the_model_swapped_it(db_session):
+    llm = FakeLLM([
+        route(intent="calculate_leave_days"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "calculate_leave_days", "arguments": {"start_date": "2026-11-01", "end_date": "2026-11-10"}}]}),
+        json.dumps({"action": "final", "message": "That range contains 7 working leave days."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("swapped-range", "Calculate leave days from 2026-11-10 to 2026-11-01")
+
+    assert "End date must be on or after start date" in result.message
+
+
+def test_parking_without_a_date_asks_with_the_fixed_wording(db_session):
+    five_slots(db_session)
+    llm = FakeLLM([
+        route(domain="parking", intent="reserve_parking"),
+        json.dumps({"action": "final", "message": "Which date would you like to book?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("parking-no-date", "Book parking")
+
+    assert result.message == "Please provide the parking date."
+
+
+def test_a_second_vehicle_request_shows_the_form_instead_of_reusing_the_first(db_session):
+    five_slots(db_session)  # the employee already has TN01AA1001
+    service = orchestrator(db_session, FakeLLM([
+        route(domain="general", intent="general"),
+        route(domain="parking", intent="register_vehicle", vehicle_type="MOTORCYCLE"),
+        route(domain="parking", intent="parking_availability", parking_date="2026-10-08"),
+    ]))
+
+    service.chat("second-vehicle", "Register vehicle with these details: registration number: TN09ZZ4321; vehicle type: CAR; make and model: Tata Nexon")
+    service.chat("second-vehicle", "yes")
+    again = service.chat("second-vehicle", "I'd like to add my bike as well")
+
+    assert again.intent == "register_vehicle"
+    assert "vehicle registration form below" in again.message
+    assert again.pending_action is None
+
+
+def test_parking_questions_reach_the_parking_agent_after_a_registration(db_session):
+    five_slots(db_session)
+    service = orchestrator(db_session, FakeLLM([
+        route(domain="general", intent="general"),
+        route(domain="parking", intent="parking_availability", parking_date="2026-10-08"),
+    ]))
+
+    service.chat("after-registration", "Register vehicle with these details: registration number: TN09ZZ4321; vehicle type: CAR")
+    service.chat("after-registration", "yes")
+    board = service.chat("after-registration", "Which parking slots are free on 2026-10-08?")
+
+    assert board.intent in {"parking_availability", "parking"}
+    assert "- B-21: free" in board.message, board.message
+
+
+ALL_ONBOARDING_LABELS = (
+    "employee name", "email", "designation", "department",
+    "reporting manager", "joining date", "location", "employment type",
+)
+
+
+def test_onboarding_asks_for_every_missing_detail_and_points_at_the_form(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([route(domain="onboarding", intent="start_onboarding")]),
+        current_actor=actor(db_session, "manager"),
+    )
+
+    reply = service.chat("onboarding-ask-all", "I need to onboard a new employee")
+
+    assert reply.intent == "start_onboarding"
+    assert reply.pending_action is None
+    assert reply.onboarding_draft is None
+    assert "onboarding form below" in reply.message
+    for label in ALL_ONBOARDING_LABELS:
+        assert label in reply.message
+
+
+def test_new_onboarding_after_a_confirmed_one_starts_from_a_clean_draft(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([complete_onboarding_route(), route(domain="onboarding", intent="start_onboarding")]),
+        current_actor=actor(db_session, "manager"),
+    )
+    service.chat("onboarding-again", complete_onboarding_message())
+    assert "pending HR administrator approval" in service.chat("onboarding-again", "yes").message
+
+    again = service.chat("onboarding-again", "Onboard another new employee")
+
+    assert again.pending_action is None
+    assert again.onboarding_draft is None
+    assert "Priya" not in again.message
+    for label in ALL_ONBOARDING_LABELS:
+        assert label in again.message
+
+
+def test_abandoned_onboarding_draft_does_not_leak_into_a_later_onboarding(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(
+                domain="onboarding",
+                intent="start_onboarding",
+                employee_name="Priya Raman",
+                designation="Backend Developer",
+            ),
+            route(domain="leave", intent="leave_balance"),
+            route(domain="onboarding", intent="start_onboarding"),
+        ]),
+        current_actor=actor(db_session, "manager"),
+    )
+    partial = service.chat("onboarding-abandoned", "Onboard Priya Raman as a Backend Developer")
+    assert partial.onboarding_draft and partial.onboarding_draft.get("name") == "Priya Raman"
+    assert "So far I have" in partial.message
+    service.chat("onboarding-abandoned", "What is my leave balance?")
+
+    fresh = service.chat("onboarding-abandoned", "I need to onboard a new employee")
+
+    assert fresh.onboarding_draft is None
+    assert "Priya" not in fresh.message
+    assert "employee name" in fresh.message
+
+
+def test_yes_after_an_empty_vehicle_list_starts_the_real_registration_flow(db_session):
+    service = orchestrator(
+        db_session,
+        FakeLLM([
+            route(domain="parking", intent="parking_vehicle"),
+            route(domain="parking", intent="parking"),
+            route(domain="general", intent="general"),
+            route(domain="general", intent="general"),
+        ]),
+        current_actor=actor(db_session),
+    )
+    listed = service.chat("vehicle-offer", "can you get my vehicle list")
+    assert "do not have a registered vehicle" in listed.message
+
+    offer = service.chat("vehicle-offer", "yes please register it")
+    assert offer.intent == "register_vehicle"
+    assert "vehicle registration form below" in offer.message
+    assert offer.pending_action is None
+
+    details = service.chat("vehicle-offer", "TN84P2145 and the make is 2022 and then model Zeta")
+    assert details.pending_action is None
+    assert "registration number: TN84P2145" in details.message
+    assert "vehicle registration form below" in details.message
+
+    proposal = service.chat("vehicle-offer", "it is a car")
+    assert proposal.pending_action and "TN84P2145" in proposal.pending_action
+    assert service.parking.list_vehicles(service.actor) == []  # nothing saved before Confirm
+
+
+def test_model_replies_claiming_a_vehicle_was_registered_are_detected():
+    claims = HRAssistantOrchestrator._claims_vehicle_registered
+    assert claims("Your vehicle TN84P2145 (2022 Zeta) has been registered. You can now use it.")
+    assert claims("I've successfully registered your vehicle.")
+    assert not claims("You do not have a registered vehicle yet.")
+    assert not claims("Your registered vehicle: TN01AR1001, car")
+
+
+def test_free_slot_question_checks_the_vehicle_list_first(db_session):
+    llm = FakeLLM([
+        route(domain="parking", intent="parking_availability"),
+        route(domain="general", intent="general"),
+    ])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session))
+
+    reply = service.chat("slots-no-vehicle", "Which parking slot is free tomorrow?")
+
+    assert "need a registered vehicle" in reply.message
+    assert reply.pending_action is None
+    assert reply.agent_activity[0]["label"].startswith("Checked registered vehicles")
+    assert not any("Parking Agent" in str(call) for call in llm.calls)
+
+    follow_up = service.chat("slots-no-vehicle", "yes")
+    assert follow_up.intent == "register_vehicle"
+    assert "vehicle registration form below" in follow_up.message
+
+
+def _car_and_bike(db_session):
+    car, _, _ = five_slots(db_session)
+    db_session.add_all([
+        Vehicle(employee_id=actor(db_session).employee_id, registration_number="TN84P2145",
+                vehicle_type="MOTORCYCLE", make_model="Suzuki", active=True),
+        ParkingSlot(code="M-01", location="Two-wheeler bay", slot_type="REGULAR",
+                    vehicle_type="MOTORCYCLE", active=True),
+    ])
+    db_session.commit()
+    return car
+
+
+def test_slot_board_groups_car_and_bike_slots_and_a_named_type_filters_it(db_session):
+    car = _car_and_bike(db_session)
+    tools = orchestrator(db_session, FakeLLM([])).parking_agent.tools
+    agent = orchestrator(db_session, FakeLLM([])).parking_agent
+
+    tools.turn_text = "reserve a slot day after tomorrow"
+    both = tools.execute("list_parking_slots", {"dates": ["2026-10-07"]}, session_id="s", active_plan=None)
+    text = agent.board_text(both.data)
+    assert f"Car slots for {car.registration_number}:" in text
+    assert "Motorcycle slots for TN84P2145:\n- M-01: free" in text
+    assert "a motorcycle slot books your bike" in text
+
+    tools.turn_text = "is any bike slot free day after tomorrow"
+    bikes = tools.execute("list_parking_slots", {"dates": ["2026-10-07"]}, session_id="s", active_plan=None)
+    assert [slot["slot"] for slot in bikes.data["days"][0]["slots"]] == ["M-01"]
+
+
+def test_choosing_the_vehicle_by_saying_car_builds_the_plan(db_session):
+    car = _car_and_bike(db_session)
+    tools = orchestrator(db_session, FakeLLM([])).parking_agent.tools
+    active = {"dates": ["2026-10-07"], "slot_code": "B-21"}
+
+    tools.turn_text = "car"
+    execution = tools.execute(
+        "build_parking_plan", {"slot": "B-21", "vehicle": car.registration_number},
+        session_id="s", active_plan=active,
+    )
+
+    assert execution.ok, execution.data
+    assert execution.data["eligible"] and execution.data["vehicle"] == car.registration_number
+
+
+def test_a_bike_only_employee_cannot_ask_for_a_car_slot(db_session):
+    _car_and_bike(db_session)
+    parking = orchestrator(db_session, FakeLLM([])).parking
+    me = actor(db_session)
+    car = next(item for item in parking.list_vehicles(me) if item.vehicle_type.value == "CAR")
+    db_session.get(Vehicle, car.id).active = False
+    db_session.commit()
+
+    with pytest.raises(NotFoundError, match="You do not have a registered car"):
+        parking.slot_board(me, [date(2026, 10, 7)], "car")
+    plan = parking.build_parking_plan(me, [date(2026, 10, 7)], "B-21")
+    assert not plan.eligible and "is a car slot" in plan.problems[0]
+    assert parking.build_parking_plan(me, [date(2026, 10, 7)], "M-01").eligible
+
+
+def _pending_onboarding(db_session):
+    return OnboardingService(SQLAlchemyOnboardingRepository(db_session)).create_onboarding(
+        actor(db_session, "manager"),
+        OnboardingCandidate(
+            name="Nila Raman", email="nila.raman@example.com", designation="Software Engineer",
+            department="Engineering", reporting_manager="Test Manager", joining_date=date(2026, 10, 12),
+            location="Chennai", employment_type="Permanent",
+        ),
+    )
+
+
+def test_hr_admin_approving_a_bare_request_number_means_the_onboarding_request(db_session):
+    created = _pending_onboarding(db_session)
+    llm = FakeLLM([
+        route(domain="onboarding", intent="onboarding_approvals"),
+        route(domain="leave", intent="approve_leave_request", request_id=created.id),
+    ])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "hradmin"))
+
+    queue = service.chat("hr-admin-bare-id", "Which onboarding requests are waiting for my approval?")
+    assert f"#{created.id}: Nila Raman" in queue.message
+
+    proposal = service.chat("hr-admin-bare-id", f"can you approve request {created.id}")
+
+    assert proposal.intent == "approve_onboarding"
+    assert proposal.pending_action and "Nila Raman" in proposal.pending_action
+
+
+def test_manager_approving_a_bare_request_number_after_leave_means_the_leave_request():
+    decision = RouteDecision(domain="onboarding", intent="approve_onboarding", confidence=0.9, request_id=7)
+    stub = HRAssistantOrchestrator.__new__(HRAssistantOrchestrator)
+    stub.actor = type("A", (), {"role": "MANAGER"})()
+    swapped = stub._contextual_review_target(decision, {"user_message": "approve request 7", "previous_domain": "leave"})
+    assert swapped.intent == "approve_leave_request"
+    kept = stub._contextual_review_target(decision, {"user_message": "approve onboarding 7", "previous_domain": "leave"})
+    assert kept.intent == "approve_onboarding"

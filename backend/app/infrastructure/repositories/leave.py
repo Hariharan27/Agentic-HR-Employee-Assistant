@@ -37,9 +37,21 @@ class SQLAlchemyLeaveRepository:
             for row in rows
         ]
 
-    def get_holidays(self, start_date: date, end_date: date) -> set[date]:
-        statement = select(Holiday.holiday_date).where(Holiday.holiday_date.between(start_date, end_date))
-        return set(self.db.scalars(statement).all())
+    def get_holidays(
+        self, start_date: date, end_date: date, region: str | None = None
+    ) -> dict[date, str]:
+        """Holidays in the range for one regional calendar, plus holidays that apply everywhere."""
+        statement = select(Holiday.holiday_date, Holiday.name).where(
+            Holiday.holiday_date.between(start_date, end_date)
+        )
+        statement = statement.where(
+            Holiday.region.is_(None) if region is None
+            else (Holiday.region.is_(None)) | (Holiday.region == region)
+        )
+        return {holiday_date: name for holiday_date, name in self.db.execute(statement).all()}
+
+    def get_employee_location(self, employee_id: int) -> str | None:
+        return self.db.scalar(select(Employee.location).where(Employee.id == employee_id))
 
     def get_pending_days(self, employee_id: int, leave_type: LeaveType) -> Decimal:
         statement = select(func.coalesce(func.sum(LeaveRequest.working_days), 0)).where(

@@ -14,6 +14,10 @@ class RegisterVehicleArguments(BaseModel):
     make_model: str | None = Field(default=None, max_length=120)
 
 
+class RemoveVehicleArguments(BaseModel):
+    registration_number: str = Field(min_length=1, max_length=32)
+
+
 class ReserveParkingArguments(BaseModel):
     requested_date: date
     slot_id: int = Field(gt=0)
@@ -55,6 +59,23 @@ class RegisterVehicleHandler:
         )
 
 
+class RemoveVehicleHandler:
+    action_type = "remove_vehicle"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return RemoveVehicleArguments.model_validate(arguments).model_dump(mode="json")
+        except PydanticValidationError as exc:
+            raise ValidationError("Invalid arguments for vehicle removal") from exc
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = RemoveVehicleArguments.model_validate(arguments)
+        return self.parking_service.stage_vehicle_removal(actor, validated.registration_number)
+
+
 class ReserveParkingHandler:
     action_type = "reserve_parking"
 
@@ -71,6 +92,36 @@ class ReserveParkingHandler:
         validated = ReserveParkingArguments.model_validate(arguments)
         return self.parking_service.stage_reservation(
             actor, validated.requested_date, validated.slot_id
+        )
+
+
+class ReserveParkingPlanArguments(BaseModel):
+    dates: list[date] = Field(min_length=1, max_length=14)
+    slot_code: str = Field(min_length=1, max_length=20)
+    alternatives: dict[date, str] = Field(default_factory=dict)
+    fingerprint: str = Field(min_length=8, max_length=64)
+    vehicle: str | None = Field(default=None, max_length=32)
+
+
+class ReserveParkingPlanHandler:
+    """Confirm a parking plan: rebuild it, require it unchanged, reserve or waitlist each date."""
+
+    action_type = "reserve_parking_plan"
+
+    def __init__(self, parking_service: ParkingService):
+        self.parking_service = parking_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return ReserveParkingPlanArguments.model_validate(arguments).model_dump(mode="json")
+        except PydanticValidationError as exc:
+            raise ValidationError("Invalid arguments for parking reservation") from exc
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = ReserveParkingPlanArguments.model_validate(arguments)
+        return self.parking_service.stage_parking_plan(
+            actor, validated.dates, validated.slot_code, validated.alternatives, validated.fingerprint,
+            validated.vehicle,
         )
 
 

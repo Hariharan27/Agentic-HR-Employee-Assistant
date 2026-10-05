@@ -45,8 +45,8 @@ The Parking Administrator is a separate operational role and does not approve le
 - Apply for Casual, Sick, or Earned Leave.
 - View personal leave requests and their explicit request IDs.
 - Cancel an eligible personal leave request.
-- Register or update one active personal vehicle.
-- View the registered vehicle.
+- Register up to two personal vehicles, list them, update a vehicle's details, and remove one.
+  Updating or removing a vehicle is refused while an upcoming booking uses it.
 - Check parking availability.
 - Reserve and cancel personal parking bookings.
 - Join the parking waitlist when all regular slots are occupied.
@@ -126,7 +126,8 @@ written in chat cannot override that trusted identity.
 - Cannot use onboarding to create a privileged role.
 - Does not manage parking attendance.
 
-The temporary password is shown only once after approval and should be shared securely.
+The temporary password is shown only once after approval and should be shared securely. The
+employee must replace it with their own password on first sign-in before anything else works.
 
 ## Parking Administrator
 
@@ -184,7 +185,7 @@ Employee asks "Register my vehicle"
   → registration number is normalized and validated
   → duplicate ownership is rejected
   → employee confirms the action
-  → one active vehicle is stored
+  → the vehicle is stored (at most two active vehicles per employee)
   → parking reservation becomes available
 ```
 
@@ -207,11 +208,11 @@ attendance and operational exceptions, not the employee's HR hierarchy.
 
 | Role | Username | Password |
 |---|---|---|
-| Employee | `employee` | `employee123` |
-| Manager | `manager` | `manager123` |
-| HR | `hr` | `hr12345` |
-| HR Administrator | `hradmin` | `hradmin123` |
-| Parking Administrator | `parkingadmin` | `parkingadmin123` |
+| Employee | `employee` | `Advik!Desk-2026` |
+| Manager | `manager` | `Saanvika!Desk-2026` |
+| HR | `hr` | `Hariharan!Desk-2026` |
+| HR Administrator | `hradmin` | `Alaguselvi!Desk-2026` |
+| Parking Administrator | `parkingadmin` | `Dhaswanth!Desk-2026` |
 
 These credentials are for local demonstration only. Newly onboarded employees receive dynamically
 generated credentials when their onboarding request is approved.

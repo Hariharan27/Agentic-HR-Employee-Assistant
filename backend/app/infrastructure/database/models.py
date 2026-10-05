@@ -2,7 +2,7 @@ from datetime import date, datetime
 
 from decimal import Decimal
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint, func, text
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint, false, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.infrastructure.database.base import Base
@@ -40,6 +40,8 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(24))
     employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="RESTRICT"), unique=True)
+    # Set for accounts created with a one-time temporary password (onboarding activation).
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (Index("ix_users_username", "username"),)
@@ -152,11 +154,16 @@ class Holiday(Base):
     __tablename__ = "holidays"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    holiday_date: Mapped[date] = mapped_column(Date, unique=True)
+    holiday_date: Mapped[date] = mapped_column(Date)
     name: Mapped[str] = mapped_column(String(160))
     category: Mapped[str] = mapped_column(String(40), default="PUBLIC")
+    # Regional calendar (TAMIL_NADU, KARNATAKA); NULL applies to every location.
+    region: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
-    __table_args__ = (Index("ix_holidays_date", "holiday_date"),)
+    __table_args__ = (
+        Index("ix_holidays_date", "holiday_date"),
+        UniqueConstraint("holiday_date", "region", name="uq_holidays_date_region"),
+    )
 
 
 class OnboardingRequest(Base):
@@ -229,9 +236,8 @@ class Vehicle(Base):
     __tablename__ = "vehicles"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    employee_id: Mapped[int] = mapped_column(
-        ForeignKey("employees.id", ondelete="CASCADE"), unique=True
-    )
+    # Up to two vehicles per employee (enforced by ParkingService); registrations are unique.
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), index=True)
     registration_number: Mapped[str] = mapped_column(String(32), unique=True)
     vehicle_type: Mapped[str] = mapped_column(String(24))
     make_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -256,6 +262,8 @@ class ParkingSlot(Base):
     code: Mapped[str] = mapped_column(String(24), unique=True)
     location: Mapped[str] = mapped_column(String(120))
     slot_type: Mapped[str] = mapped_column(String(24), default="REGULAR")
+    # Cars park in car slots and motorcycles in bike slots.
+    vehicle_type: Mapped[str] = mapped_column(String(16), default="CAR", server_default="CAR")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -264,6 +272,9 @@ class ParkingSlot(Base):
     __table_args__ = (
         CheckConstraint(
             "slot_type IN ('REGULAR', 'ACCESSIBLE')", name="ck_parking_slots_type"
+        ),
+        CheckConstraint(
+            "vehicle_type IN ('CAR', 'MOTORCYCLE')", name="ck_parking_slots_vehicle_type"
         ),
         Index("ix_parking_slots_active_type", "active", "slot_type"),
     )

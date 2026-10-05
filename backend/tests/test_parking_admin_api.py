@@ -173,3 +173,18 @@ def test_reservation_history_is_owner_or_parking_admin_only(client, db_session):
     assert forbidden.status_code == 403
     assert admin.status_code == 200
     assert owner.json()[0]["reason"] == "Reserved by employee"
+
+
+def test_employee_lists_own_vehicles(client, db_session):
+    token = client.post("/api/v1/auth/login", json={"username": "employee", "password": "correct-password"}).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    assert client.get("/api/v1/parking/me/vehicles", headers=headers).json() == []
+    from app.infrastructure.database.models import User, Vehicle
+    from sqlalchemy import select
+    employee_id = db_session.scalar(select(User).where(User.username == "employee")).employee_id
+    db_session.add(Vehicle(employee_id=employee_id, registration_number="TN01ZZ1234", vehicle_type="CAR", make_model="i20", active=True))
+    db_session.commit()
+
+    vehicles = client.get("/api/v1/parking/me/vehicles", headers=headers).json()
+
+    assert vehicles == [{"registration_number": "TN01ZZ1234", "vehicle_type": "CAR", "make_model": "i20"}]

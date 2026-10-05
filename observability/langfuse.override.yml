@@ -1,0 +1,19 @@
+# Local overrides for the official Langfuse docker-compose.yml (see observability/README.md).
+#  - PeopleDesk's own PostgreSQL already uses host port 5432, so Langfuse's Postgres stays
+#    internal to its Docker network.
+#  - Headless initialization creates the org, project, API keys and an admin login on first start,
+#    so PeopleDesk can send traces without any clicking in the Langfuse UI.
+services:
+  postgres:
+    ports: !reset []
+  langfuse-web:
+    environment:
+      LANGFUSE_INIT_ORG_ID: ideas2it
+      LANGFUSE_INIT_ORG_NAME: Ideas2IT
+      LANGFUSE_INIT_PROJECT_ID: peopledesk
+      LANGFUSE_INIT_PROJECT_NAME: PeopleDesk
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-peopledesk-local
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-peopledesk-local
+      LANGFUSE_INIT_USER_EMAIL: langfuse-admin@example.com
+      LANGFUSE_INIT_USER_NAME: PeopleDesk Admin
+      LANGFUSE_INIT_USER_PASSWORD: PeopleDesk!Trace-2026

@@ -24,3 +24,11 @@ def test_invalid_date_range_is_rejected():
     with pytest.raises(ValidationError, match="End date"):
         calculate_working_days(date(2026, 10, 6), date(2026, 10, 5), set())
 
+
+
+def test_leave_type_aliases_resolve():
+    from app.domain.leave.entities import LeaveType
+
+    assert LeaveType.parse("CL") is LeaveType.CASUAL
+    assert LeaveType.parse("sl") is LeaveType.SICK
+    assert LeaveType.parse("Earned Leave") is LeaveType.EARNED

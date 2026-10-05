@@ -1,5 +1,8 @@
-from datetime import date
+from collections.abc import Callable
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from uuid import uuid4
 
 from app.application.leave.ports import LeaveRepository
 from app.core.exceptions import (
@@ -18,17 +21,37 @@ from app.domain.leave.entities import (
     LeaveStatus,
     LeaveType,
 )
+from app.domain.leave.holidays import DEFAULT_REGION, region_for_location
+from app.domain.leave.plan import ExcludedDay, LeavePlan, PlanSegment, plan_ttl
 from app.domain.leave.rules import calculate_working_days, validate_date_range
+
+from app.domain.leave.policy_rules import SICK_BACKDATE_DAYS
+
+MAX_PLAN_DAYS = 62
 
 
 class LeaveService:
     """Deterministic leave use cases. Employee identity always comes from trusted auth context."""
 
-    def __init__(self, repository: LeaveRepository):
+    def __init__(
+        self,
+        repository: LeaveRepository,
+        *,
+        today: Callable[[], date] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ):
         self.repository = repository
+        self.today = today or date.today
+        self.now = now or (lambda: datetime.now(UTC))
 
     @staticmethod
     def _parse_leave_type(value: str) -> LeaveType:
+        if value.strip().upper().replace(" ", "_") in {"PL", "PRIVILEGE", "PRIVILEGE_LEAVE"}:
+            raise ValidationError(
+                "Privilege Leave (PL) is a separate legacy balance kept after the EL conversion and is "
+                "not managed in PeopleDesk; check or apply PL in iAssistant. PeopleDesk handles "
+                "CASUAL, SICK and EARNED leave"
+            )
         try:
             return LeaveType.parse(value)
         except ValueError as exc:
@@ -51,17 +74,29 @@ class LeaveService:
             for b in balances
         ]
 
-    def get_holidays(self, start_date: date, end_date: date) -> set[date]:
-        validate_date_range(start_date, end_date)
-        return self.repository.get_holidays(start_date, end_date)
+    def holiday_region(self, actor: AuthenticatedUser | None) -> str:
+        if actor is None:
+            return DEFAULT_REGION
+        return region_for_location(self.repository.get_employee_location(actor.employee_id))
 
-    def calculate_leave_days(self, start_date: date, end_date: date) -> Decimal:
-        return calculate_working_days(start_date, end_date, self.get_holidays(start_date, end_date))
+    def get_holidays(
+        self, start_date: date, end_date: date, actor: AuthenticatedUser | None = None
+    ) -> dict[date, str]:
+        """Holidays (date -> name) in the employee's regional calendar."""
+        validate_date_range(start_date, end_date)
+        return self.repository.get_holidays(start_date, end_date, self.holiday_region(actor))
+
+    def calculate_leave_days(
+        self, start_date: date, end_date: date, actor: AuthenticatedUser | None = None
+    ) -> Decimal:
+        return calculate_working_days(
+            start_date, end_date, set(self.get_holidays(start_date, end_date, actor))
+        )
 
     def check_leave_eligibility(self, actor: AuthenticatedUser, leave_type: str,
                                 start_date: date, end_date: date) -> LeaveEligibility:
         parsed = self._parse_leave_type(leave_type)
-        working_days = self.calculate_leave_days(start_date, end_date)
+        working_days = self.calculate_leave_days(start_date, end_date, actor)
         if working_days == 0:
             return LeaveEligibility(False, working_days, Decimal("0"), "The selected range has no working days")
         balances = self.get_leave_balance(actor, parsed.value)
@@ -71,6 +106,152 @@ class LeaveService:
         if working_days > available:
             return LeaveEligibility(False, working_days, available, "Insufficient available leave balance")
         return LeaveEligibility(True, working_days, available)
+
+    def build_leave_plan(
+        self,
+        actor: AuthenticatedUser,
+        leave_type: str,
+        dates: list[date] | tuple[date, ...],
+        reason: str | None = None,
+        split_with: str | None = None,
+    ) -> LeavePlan:
+        """Validate explicit leave dates and group them into contiguous request segments.
+
+        Weekends and holidays inside the requested dates are excluded and reported, separate days
+        stay separate requests, and every business rule is evaluated here, never by the model.
+        """
+        parsed = self._parse_leave_type(leave_type)
+        requested = tuple(sorted(set(dates)))
+        if not requested:
+            raise ValidationError("At least one leave date is required")
+        if (requested[-1] - requested[0]).days + 1 > MAX_PLAN_DAYS:
+            raise ValidationError(f"A leave plan can cover at most {MAX_PLAN_DAYS} calendar days")
+        holidays = self.repository.get_holidays(requested[0], requested[-1], self.holiday_region(actor))
+
+        def working(day: date) -> bool:
+            return day.weekday() < 5 and day not in holidays
+
+        excluded = tuple(
+            ExcludedDay(day, "holiday", holidays[day]) if day in holidays else ExcludedDay(day, "weekly off")
+            for day in requested if not working(day)
+        )
+        working_dates = [day for day in requested if working(day)]
+        requested_set = set(requested)
+
+        balances = {item.leave_type: item.available_days for item in self.get_leave_balance(actor)}
+        if parsed not in balances:
+            raise NotFoundError("No leave balance was found for the requested leave type")
+        available = balances[parsed]
+        secondary = self._parse_leave_type(split_with) if split_with else None
+        if secondary is parsed:
+            raise ValidationError("A split must combine two different leave types")
+        if secondary is not None and secondary not in balances:
+            raise NotFoundError(f"No {secondary.value.title()} leave balance was found")
+        # Requested type first, in date order; the remaining days use the agreed second type.
+        primary_count = len(working_dates) if secondary is None else int(min(available, len(working_dates)))
+        assigned = [
+            (day, parsed if index < primary_count else secondary)
+            for index, day in enumerate(working_dates)
+        ]
+
+        groups: list[list[tuple[date, LeaveType]]] = []
+        for day, kind in assigned:
+            if groups and groups[-1][-1][1] is kind:
+                previous = groups[-1][-1][0]
+                gap = [previous + timedelta(days=offset) for offset in range(1, (day - previous).days)]
+                if all(item in requested_set or not working(item) for item in gap):
+                    groups[-1].append((day, kind))
+                    continue
+            groups.append([(day, kind)])
+        segments = tuple(
+            PlanSegment(group[0][1], group[0][0], group[-1][0], Decimal(len(group))) for group in groups
+        )
+
+        problems: list[str] = []
+        today = self.today()
+        earliest = today - timedelta(days=SICK_BACKDATE_DAYS) if parsed is LeaveType.SICK else today
+        if working_dates and working_dates[0] < earliest:
+            problems.append(
+                f"{parsed.value.title()} leave cannot start before {earliest.isoformat()}"
+                if parsed is LeaveType.SICK
+                else f"{parsed.value.title()} leave cannot be applied for past dates ({working_dates[0].isoformat()})"
+            )
+        later_years = sorted({day.year for day in working_dates if day.year > today.year})
+        if later_years:
+            problems.append(
+                "Leave entitlements follow the calendar year, so dates in "
+                + ", ".join(str(year) for year in later_years)
+                + " can be applied once that year's leave is credited"
+            )
+        if not segments:
+            problems.append("The selected dates have no working days")
+        for segment in segments:
+            if self.repository.has_overlapping_request(actor.employee_id, segment.start_date, segment.end_date):
+                problems.append(
+                    f"An active leave request overlaps {segment.start_date.isoformat()}"
+                    + ("" if segment.start_date == segment.end_date else f" to {segment.end_date.isoformat()}")
+                )
+        days_by_type: dict[LeaveType, Decimal] = {}
+        for segment in segments:
+            days_by_type[segment.leave_type] = days_by_type.get(segment.leave_type, Decimal("0")) + segment.working_days
+        for kind, needed in days_by_type.items():
+            if needed > balances[kind]:
+                problems.append(
+                    f"Insufficient {kind.value.title()} balance: needs {needed.normalize():f} day(s), "
+                    f"{balances[kind].normalize():f} available"
+                )
+        split_options: tuple[tuple[LeaveType, Decimal], ...] = ()
+        primary_needed = days_by_type.get(parsed, Decimal("0"))
+        if secondary is None and primary_needed > available:
+            shortfall = primary_needed - available
+            split_options = tuple(
+                (kind, balances[kind])
+                for kind in LeaveType
+                if kind is not parsed and kind in balances and balances[kind] >= shortfall
+            )
+        normalized_reason = reason.strip() if reason and reason.strip() else None
+        plan = LeavePlan(
+            leave_type=parsed,
+            requested_dates=requested,
+            segments=segments,
+            excluded_days=excluded,
+            available_before=available,
+            problems=tuple(problems),
+            reason=normalized_reason,
+            split_with=secondary,
+            secondary_available=balances[secondary] if secondary is not None else None,
+            split_options=split_options,
+        )
+        return replace(
+            plan,
+            plan_id=f"lp_{uuid4().hex[:10]}",
+            expires_at=self.now() + plan_ttl(),
+            fingerprint=plan.compute_fingerprint(),
+        )
+
+    def stage_leave_plan(
+        self,
+        actor: AuthenticatedUser,
+        leave_type: str,
+        dates: list[date] | tuple[date, ...],
+        expected_fingerprint: str,
+        reason: str | None = None,
+        split_with: str | None = None,
+    ) -> list[LeaveRequestData]:
+        """Rebuild the confirmed plan, require it unchanged, and stage one request per segment."""
+        plan = self.build_leave_plan(actor, leave_type, dates, reason, split_with)
+        if plan.fingerprint != expected_fingerprint:
+            raise ConflictError(
+                "The leave details changed since this confirmation was prepared "
+                f"({plan.summary()}). Cancel it and ask again for an updated plan"
+            )
+        if not plan.eligible:
+            raise ValidationError("; ".join(plan.problems) or "The leave plan is not eligible")
+        return [
+            self.stage_leave_application(actor, segment.leave_type.value, segment.start_date,
+                                         segment.end_date, plan.reason)
+            for segment in plan.segments
+        ]
 
     def apply_leave(self, actor: AuthenticatedUser, leave_type: str, start_date: date,
                     end_date: date, reason: str | None = None) -> LeaveRequestData:
@@ -89,8 +270,10 @@ class LeaveService:
         locked = self.repository.get_balances(actor.employee_id, parsed, for_update=True)
         if not locked:
             raise NotFoundError("No leave balance was found for the requested leave type")
-        working_days = calculate_working_days(start_date, end_date,
-                                              self.repository.get_holidays(start_date, end_date))
+        working_days = calculate_working_days(
+            start_date, end_date,
+            set(self.repository.get_holidays(start_date, end_date, self.holiday_region(actor))),
+        )
         if working_days == 0:
             raise ValidationError("The selected range has no working days")
         if self.repository.has_overlapping_request(actor.employee_id, start_date, end_date):

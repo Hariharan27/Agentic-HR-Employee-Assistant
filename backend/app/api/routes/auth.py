@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.dependencies import AppSettings, CurrentUser, Database
-from app.api.schemas.auth import LoginRequest, ProfileResponse, TokenResponse
+from app.api.schemas.auth import ChangePasswordRequest, LoginRequest, ProfileResponse, TokenResponse
 from app.application.authentication import AuthenticationService
 
 router = APIRouter(prefix="/api/v1/auth", tags=["authentication"])
@@ -10,7 +10,16 @@ router = APIRouter(prefix="/api/v1/auth", tags=["authentication"])
 @router.post("/login", response_model=TokenResponse)
 def login(body: LoginRequest, db: Database, settings: AppSettings) -> TokenResponse:
     token, user = AuthenticationService(db, settings).login(body.username, body.password)
-    return TokenResponse(access_token=token, role=user.role)
+    return TokenResponse(access_token=token, role=user.role, must_change_password=user.must_change_password)
+
+
+@router.post("/change-password", response_model=ProfileResponse)
+def change_password(
+    body: ChangePasswordRequest, context: CurrentUser, db: Database, settings: AppSettings
+) -> ProfileResponse:
+    service = AuthenticationService(db, settings)
+    service.change_password(context, body.current_password, body.new_password)
+    return me(context, db, settings)
 
 
 @router.get("/me", response_model=ProfileResponse)
@@ -23,5 +32,6 @@ def me(context: CurrentUser, db: Database, settings: AppSettings) -> ProfileResp
         name=employee.name,
         email=employee.email,
         role=user.role,
+        must_change_password=user.must_change_password,
     )
 

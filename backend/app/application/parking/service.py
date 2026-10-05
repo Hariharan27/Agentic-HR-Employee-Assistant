@@ -1,4 +1,6 @@
 from collections.abc import Callable
+from dataclasses import replace
+from uuid import uuid4
 from datetime import UTC, date, datetime, time, timedelta
 import re
 from zoneinfo import ZoneInfo
@@ -15,6 +17,7 @@ from app.core.exceptions import (
     ValidationError,
 )
 from app.core.security import AuthenticatedUser, require_role
+from app.domain.parking.plan import ParkingPlan, ParkingPlanLine, parking_plan_ttl
 from app.domain.parking.entities import (
     ParkingAvailability,
     ParkingReservationData,
@@ -44,13 +47,98 @@ class ParkingService:
         self.timezone = ZoneInfo(settings.app_timezone)
         self.now = now or (lambda: datetime.now(UTC))
 
-    def get_vehicle(self, actor: AuthenticatedUser) -> VehicleData:
-        vehicle = self.repository.get_active_vehicle(actor.employee_id)
-        if vehicle is None:
+    MAX_VEHICLES = 2
+
+    @staticmethod
+    def normalize_registration(value: str) -> str:
+        return re.sub(r"[\s-]+", "", value or "").upper()
+
+    def list_vehicles(self, actor: AuthenticatedUser) -> list[VehicleData]:
+        return self.repository.list_active_vehicles(actor.employee_id)
+
+    _TYPE_WORDS = (
+        (re.compile(r"\b(bike|bikes|motorcycle|motorcycles|motorbike|scooter|scooty|two[- ]?wheeler|2[- ]?wheeler)\b", re.I), VehicleType.MOTORCYCLE),
+        (re.compile(r"\b(car|cars|four[- ]?wheeler|4[- ]?wheeler)\b", re.I), VehicleType.CAR),
+    )
+
+    @classmethod
+    def vehicle_type_in(cls, text: str | None) -> VehicleType | None:
+        """The vehicle type a phrase names ("my car", "the bike"), if exactly one is named."""
+        found = {kind for pattern, kind in cls._TYPE_WORDS if text and pattern.search(text)}
+        return found.pop() if len(found) == 1 else None
+
+    @staticmethod
+    def type_label(kind: VehicleType) -> str:
+        return "motorcycle" if kind is VehicleType.MOTORCYCLE else "car"
+
+    @classmethod
+    def describe_vehicles(cls, vehicles: list[VehicleData]) -> str:
+        return ", ".join(f"{item.registration_number} ({cls.type_label(item.vehicle_type)})" for item in vehicles)
+
+    def get_vehicle(self, actor: AuthenticatedUser, registration_number: str | None = None) -> VehicleData:
+        """The employee's vehicle: the one named by registration (or part of it) or by type
+        ("car", "bike"), or the only one. Two vehicles and no choice → ask."""
+        vehicles = self.list_vehicles(actor)
+        if not vehicles:
             raise NotFoundError(
-                "No active vehicle is registered for your employee account. Contact Workplace Operations."
+                "No active vehicle is registered for your employee account. Register a vehicle first."
             )
-        return vehicle
+        if registration_number:
+            wanted = self.normalize_registration(registration_number)
+            match = next((item for item in vehicles if item.registration_number == wanted), None)
+            if match is not None:
+                return match
+            kind = self.vehicle_type_in(registration_number)
+            if kind is not None:
+                of_kind = [item for item in vehicles if item.vehicle_type is kind]
+                if not of_kind:
+                    raise NotFoundError(
+                        f"You do not have a registered {self.type_label(kind)}. "
+                        f"Your registered vehicles: {self.describe_vehicles(vehicles)}."
+                    )
+                if len(of_kind) == 1:
+                    return of_kind[0]
+                raise ValidationError(
+                    f"You have two registered {self.type_label(kind)}s ({self.describe_vehicles(of_kind)}). "
+                    "Which registration number should I use?"
+                )
+            partial = [item for item in vehicles if len(wanted) >= 3 and wanted in item.registration_number]
+            if len(partial) == 1:
+                return partial[0]
+            raise NotFoundError(
+                f"{wanted} is not one of your registered vehicles ({self.describe_vehicles(vehicles)})."
+            )
+        if len(vehicles) == 1:
+            return vehicles[0]
+        raise ValidationError(
+            f"You have two registered vehicles ({' and '.join(f'{item.registration_number} ({self.type_label(item.vehicle_type)})' for item in vehicles)}). "
+            "Which one should I use?"
+        )
+
+    @staticmethod
+    def slots_for(slots, kind: VehicleType | None):
+        """Only the slots a vehicle of this type may use (all slots when the type is unknown)."""
+        return [slot for slot in slots if kind is None or slot.vehicle_type is kind]
+
+    def upcoming_bookings(self, actor: AuthenticatedUser, vehicle: VehicleData) -> list[ParkingReservationData]:
+        """Reserved or checked-in bookings from today on that use this vehicle."""
+        today = self._local_now().date()
+        return [
+            item
+            for item in self.repository.list_reservations(actor.employee_id)
+            if item.vehicle_id == vehicle.id
+            and item.reservation_date >= today
+            and item.status in {ParkingReservationStatus.RESERVED, ParkingReservationStatus.CHECKED_IN}
+        ]
+
+    def _require_no_upcoming(self, actor: AuthenticatedUser, vehicle: VehicleData, action: str) -> None:
+        upcoming = self.upcoming_bookings(actor, vehicle)
+        if upcoming:
+            bookings = ", ".join(f"#{item.id} on {item.reservation_date}" for item in upcoming[:5])
+            raise ConflictError(
+                f"Vehicle {vehicle.registration_number} has upcoming parking bookings ({bookings}). "
+                f"Cancel them first, then {action} the vehicle."
+            )
 
     def prepare_vehicle_registration(
         self,
@@ -87,7 +175,22 @@ class ParkingService:
         existing = self.repository.get_vehicle_by_registration(normalized_registration)
         if existing is not None and existing.employee_id != actor.employee_id:
             raise ConflictError("This vehicle registration is already assigned to another employee.")
+        vehicles = self.list_vehicles(actor)
+        current = next((item for item in vehicles if item.registration_number == normalized_registration), None)
+        if current is not None:
+            # Updating details is allowed only while no booking depends on the vehicle.
+            self._require_no_upcoming(actor, current, "update")
+        elif len(vehicles) >= self.MAX_VEHICLES:
+            raise ConflictError(
+                f"You already have {self.MAX_VEHICLES} registered vehicles ("
+                + ", ".join(item.registration_number for item in vehicles)
+                + "). Remove one before adding another."
+            )
         return normalized_registration, parsed_type, normalized_model
+
+    def is_registered(self, actor: AuthenticatedUser, registration_number: str) -> bool:
+        wanted = self.normalize_registration(registration_number)
+        return any(item.registration_number == wanted for item in self.list_vehicles(actor))
 
     def register_vehicle(
         self,
@@ -125,12 +228,31 @@ class ParkingService:
             normalized_model,
         )
 
+    def prepare_vehicle_removal(
+        self, actor: AuthenticatedUser, registration_number: str | None = None
+    ) -> VehicleData:
+        """The vehicle can be removed only when none of its bookings are still ahead."""
+        require_role(actor, "EMPLOYEE")
+        vehicle = self.get_vehicle(actor, registration_number)
+        self._require_no_upcoming(actor, vehicle, "remove")
+        return vehicle
+
+    def stage_vehicle_removal(self, actor: AuthenticatedUser, registration_number: str) -> VehicleData:
+        vehicle = self.prepare_vehicle_removal(actor, registration_number)
+        removed = self.repository.deactivate_vehicle(vehicle.id)
+        if removed is None:
+            raise NotFoundError("That vehicle is no longer registered.")
+        return removed
+
     def check_availability(
         self, actor: AuthenticatedUser, requested_date: date
     ) -> ParkingAvailability:
         self._validate_booking_date(requested_date)
-        vehicle = self.get_vehicle(actor)
-        slots = tuple(self.repository.list_available_slots(requested_date))
+        vehicles = self.list_vehicles(actor)
+        if not vehicles:
+            raise NotFoundError("No active vehicle is registered for your employee account. Register a vehicle first.")
+        vehicle = vehicles[0]
+        slots = tuple(self.slots_for(self.repository.list_available_slots(requested_date), vehicle.vehicle_type))
         return ParkingAvailability(requested_date, vehicle, slots)
 
     def get_active_reservation(
@@ -157,9 +279,11 @@ class ParkingService:
                 f"You already have parking slot {existing.slot.code} reserved for {requested_date}."
             )
         vehicle = self.get_vehicle(actor)
-        slots = self.repository.list_available_slots(requested_date)
+        slots = self.slots_for(self.repository.list_available_slots(requested_date), vehicle.vehicle_type)
         if not slots:
-            raise ParkingUnavailableError(f"No regular parking slots are available for {requested_date}.")
+            raise ParkingUnavailableError(
+                f"No {self.type_label(vehicle.vehicle_type)} parking slots are available for {requested_date}."
+            )
         return vehicle, slots[0]
 
     def reserve_parking(
@@ -174,11 +298,15 @@ class ParkingService:
             raise
 
     def stage_reservation(
-        self, actor: AuthenticatedUser, requested_date: date, slot_id: int
+        self,
+        actor: AuthenticatedUser,
+        requested_date: date,
+        slot_id: int,
+        vehicle_registration: str | None = None,
     ) -> ParkingReservationData:
         self._validate_booking_date(requested_date)
         self._validate_booking_eligibility(actor)
-        vehicle = self.get_vehicle(actor)
+        vehicle = self.get_vehicle(actor, vehicle_registration)
         existing = self.repository.get_active_reservation(
             actor.employee_id, requested_date, for_update=True
         )
@@ -188,6 +316,11 @@ class ParkingService:
             )
         available = self.repository.list_available_slots(requested_date, for_update=True)
         slot = next((item for item in available if item.id == slot_id), None)
+        if slot is not None and slot.vehicle_type is not vehicle.vehicle_type:
+            raise ValidationError(
+                f"Slot {slot.code} is a {self.type_label(slot.vehicle_type)} slot, but "
+                f"{vehicle.registration_number} is a {self.type_label(vehicle.vehicle_type)}."
+            )
         if slot is None:
             raise ParkingUnavailableError(
                 "The offered parking slot is no longer available. Please check availability again."
@@ -216,6 +349,196 @@ class ParkingService:
         if waiting is not None:
             self.repository.update_waitlist_status(waiting.id, ParkingWaitlistStatus.ALLOCATED)
         return created
+
+    MAX_PLAN_DAYS = 14
+
+    def slot_board(
+        self,
+        actor: AuthenticatedUser,
+        dates: list[date] | tuple[date, ...],
+        vehicle_registration: str | None = None,
+    ) -> dict[str, object]:
+        """The slots the employee's vehicle(s) may use, with their status on each date (who holds a
+        slot is never shown). Car slots are only shown for a car, bike slots only for a motorcycle."""
+        requested = sorted(set(dates))
+        if not requested:
+            raise ValidationError("Please provide the parking date.")
+        if len(requested) > self.MAX_PLAN_DAYS:
+            raise ValidationError(f"Parking can be planned for at most {self.MAX_PLAN_DAYS} days at once")
+        vehicles = self.list_vehicles(actor)
+        if vehicle_registration:
+            vehicles = [self.get_vehicle(actor, vehicle_registration)]
+        kinds = {item.vehicle_type for item in vehicles}
+        slots = [slot for slot in self.repository.list_active_slots() if not kinds or slot.vehicle_type in kinds]
+        days = []
+        for day in requested:
+            entry: dict[str, object] = {"date": day.isoformat(), "weekday": day.strftime("%A")}
+            try:
+                self._validate_booking_date(day)
+            except ValidationError as exc:
+                entry["unavailable_reason"] = str(exc)
+            own = self.repository.get_active_reservation(actor.employee_id, day)
+            if own is not None:
+                entry["your_reservation"] = own.slot.code
+            if self.repository.get_waitlist_entry(actor.employee_id, day) is not None:
+                entry["you_are_waitlisted"] = True
+            taken = self.repository.list_taken_slot_ids(day)
+            entry["slots"] = [
+                {
+                    "slot": slot.code,
+                    "type": slot.slot_type.value,
+                    "vehicle_type": slot.vehicle_type.value,
+                    "location": slot.location,
+                    "status": "taken" if slot.id in taken else "free",
+                }
+                for slot in slots
+            ]
+            entry["free_slots"] = [slot.code for slot in slots if slot.id not in taken]
+            days.append(entry)
+        suspension = self.get_suspension(actor)
+        return {
+            "days": days,
+            "vehicles": [
+                {"registration_number": item.registration_number, "vehicle_type": item.vehicle_type.value}
+                for item in vehicles
+            ],
+            "note": "Accessible slots are offered after the regular slots are taken, or when asked for. "
+            "Car slots are for cars and motorcycle slots for motorcycles.",
+            **({"suspended_until": suspension.suspended_until.isoformat()} if suspension.active else {}),
+        }
+
+    def build_parking_plan(
+        self,
+        actor: AuthenticatedUser,
+        dates: list[date] | tuple[date, ...],
+        slot_code: str,
+        alternatives: dict[date, str] | None = None,
+        vehicle_registration: str | None = None,
+    ) -> ParkingPlan:
+        """One chosen slot for every date; taken dates need an agreed alternative slot or the waitlist."""
+        requested = tuple(sorted(set(dates)))
+        if not requested:
+            raise ValidationError("Please provide the parking date.")
+        if len(requested) > self.MAX_PLAN_DAYS:
+            raise ValidationError(f"Parking can be planned for at most {self.MAX_PLAN_DAYS} days at once")
+        all_slots = {slot.code.upper(): slot for slot in self.repository.list_active_slots()}
+        waitlist_only = slot_code.strip().upper() == "WAITLIST"
+        chosen = None if waitlist_only else all_slots.get(slot_code.strip().upper())
+        if chosen is None and not waitlist_only:
+            raise ValidationError(f"There is no parking slot {slot_code}. Slots: {', '.join(sorted(all_slots))}")
+        alternatives = {day: code.strip().upper() for day, code in (alternatives or {}).items()}
+        if waitlist_only:
+            alternatives = {day: "WAITLIST" for day in requested}
+        problems: list[str] = []
+        vehicle: VehicleData | None = None
+        try:
+            vehicle = self.get_vehicle(actor, vehicle_registration)
+        except ValidationError as exc:  # two vehicles and none chosen yet
+            # The chosen slot's type picks the vehicle when only one vehicle fits it.
+            fitting = [
+                item for item in self.list_vehicles(actor)
+                if chosen is not None and item.vehicle_type is chosen.vehicle_type
+            ]
+            if len(fitting) == 1:
+                vehicle = fitting[0]
+            else:
+                problems.append(str(exc))
+        vehicle_text = vehicle.registration_number if vehicle else ""
+        kind = vehicle.vehicle_type if vehicle else (chosen.vehicle_type if chosen else None)
+        slots = {code: slot for code, slot in all_slots.items() if kind is None or slot.vehicle_type is kind}
+        if vehicle is not None and chosen is not None and chosen.vehicle_type is not vehicle.vehicle_type:
+            problems.append(
+                f"Slot {chosen.code} is a {self.type_label(chosen.vehicle_type)} slot, but "
+                f"{vehicle.registration_number} is a {self.type_label(vehicle.vehicle_type)}; "
+                f"choose a {self.type_label(vehicle.vehicle_type)} slot ("
+                + ", ".join(sorted(slots)) + ")"
+            )
+        lines: list[ParkingPlanLine] = []
+        choices: list[tuple[date, tuple[str, ...]]] = []
+        try:
+            self._validate_booking_eligibility(actor)
+        except ConflictError as exc:
+            problems.append(str(exc))
+        for day in requested:
+            try:
+                self._validate_booking_date(day)
+            except ValidationError as exc:
+                problems.append(f"{day.isoformat()}: {exc}")
+                continue
+            own = self.repository.get_active_reservation(actor.employee_id, day)
+            if own is not None:
+                lines.append(ParkingPlanLine(day, "already_reserved", own.slot.code, own.slot.id))
+                continue
+            if self.repository.get_waitlist_entry(actor.employee_id, day) is not None:
+                lines.append(ParkingPlanLine(day, "already_waitlisted"))
+                continue
+            taken = self.repository.list_taken_slot_ids(day)
+            free = tuple(code for code, slot in slots.items() if slot.id not in taken)
+            wanted = alternatives.get(day, chosen.code.upper() if chosen else "WAITLIST")
+            if wanted == "WAITLIST":
+                if free:
+                    problems.append(f"{day.isoformat()}: slots {', '.join(free)} are free, so the waitlist is not needed")
+                else:
+                    lines.append(ParkingPlanLine(day, "waitlist"))
+                continue
+            slot = slots.get(wanted)
+            if slot is None and wanted in all_slots:
+                if not (chosen is not None and wanted == chosen.code.upper() and vehicle is not None):
+                    problems.append(
+                        f"{day.isoformat()}: slot {wanted} is a "
+                        f"{self.type_label(all_slots[wanted].vehicle_type)} slot"
+                    )
+            elif slot is None:
+                problems.append(f"{day.isoformat()}: there is no parking slot {wanted}")
+            elif slot.id in taken:
+                choices.append((day, free))
+                problems.append(
+                    f"{day.isoformat()}: slot {slot.code} is taken; "
+                    + (f"free slots: {', '.join(free)}" if free else "all slots are taken, so only the waitlist is possible")
+                )
+            else:
+                lines.append(ParkingPlanLine(day, "reserve", slot.code, slot.id))
+        plan = ParkingPlan(
+            slot_code=chosen.code if chosen else "WAITLIST",
+            dates=requested,
+            alternatives=tuple(sorted(alternatives.items())),
+            lines=tuple(lines),
+            problems=tuple(problems),
+            choices=tuple(choices),
+            vehicle=vehicle_text,
+        )
+        return replace(
+            plan,
+            plan_id=f"pp_{uuid4().hex[:10]}",
+            expires_at=self.now() + parking_plan_ttl(),
+            fingerprint=plan.compute_fingerprint(),
+        )
+
+    def stage_parking_plan(
+        self,
+        actor: AuthenticatedUser,
+        dates: list[date] | tuple[date, ...],
+        slot_code: str,
+        alternatives: dict[date, str] | None,
+        expected_fingerprint: str,
+        vehicle_registration: str | None = None,
+    ) -> list[object]:
+        """Rebuild the confirmed plan, require it unchanged, then reserve or waitlist each date."""
+        plan = self.build_parking_plan(actor, dates, slot_code, alternatives, vehicle_registration)
+        if plan.fingerprint != expected_fingerprint:
+            raise ConflictError(
+                "Parking availability changed since this confirmation was prepared. "
+                "Cancel it and check the slots again"
+            )
+        if not plan.eligible:
+            raise ValidationError("; ".join(plan.problems) or "The parking plan has nothing to book")
+        results: list[object] = []
+        for line in plan.actionable:
+            if line.action == "reserve":
+                results.append(self.stage_reservation(actor, line.day, line.slot_id, plan.vehicle or None))
+            else:
+                results.append(self.stage_join_waitlist(actor, line.day, plan.vehicle or None))
+        return results
 
     def prepare_cancellation(
         self, actor: AuthenticatedUser, requested_date: date
@@ -272,9 +595,10 @@ class ParkingService:
             raise ConflictError(f"You already have a parking reservation for {requested_date}.")
         if self.repository.get_waitlist_entry(actor.employee_id, requested_date) is not None:
             raise ConflictError(f"You are already on the parking waitlist for {requested_date}.")
-        if self.repository.list_available_slots(requested_date):
+        if self.slots_for(self.repository.list_available_slots(requested_date), vehicle.vehicle_type):
             raise ConflictError(
-                "A regular parking slot is currently available. Please reserve it instead of joining the waitlist."
+                f"A {self.type_label(vehicle.vehicle_type)} parking slot is currently available. "
+                "Please reserve it instead of joining the waitlist."
             )
         return vehicle
 
@@ -290,11 +614,11 @@ class ParkingService:
             raise
 
     def stage_join_waitlist(
-        self, actor: AuthenticatedUser, requested_date: date
+        self, actor: AuthenticatedUser, requested_date: date, vehicle_registration: str | None = None
     ) -> ParkingWaitlistData:
         self._validate_booking_date(requested_date)
         self._validate_booking_eligibility(actor)
-        vehicle = self.get_vehicle(actor)
+        vehicle = self.get_vehicle(actor, vehicle_registration)
         if self.repository.get_active_reservation(
             actor.employee_id, requested_date, for_update=True
         ) is not None:
@@ -303,7 +627,9 @@ class ParkingService:
             actor.employee_id, requested_date, for_update=True
         ) is not None:
             raise ConflictError(f"You are already on the parking waitlist for {requested_date}.")
-        if self.repository.list_available_slots(requested_date, for_update=True):
+        if self.slots_for(
+            self.repository.list_available_slots(requested_date, for_update=True), vehicle.vehicle_type
+        ):
             raise ConflictError(
                 "A parking slot became available. Please reserve it instead of joining the waitlist."
             )

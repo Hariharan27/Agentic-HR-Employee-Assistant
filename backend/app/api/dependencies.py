@@ -25,3 +25,10 @@ def get_current_user(
 
 CurrentUser = Annotated[AuthenticatedUser, Depends(get_current_user)]
 
+
+def require_password_changed(actor: CurrentUser, db: Database, settings: AppSettings) -> None:
+    """Accounts with a temporary password may only change it (403 password_change_required)."""
+    from app.application.authentication import AuthenticationService
+
+    AuthenticationService(db, settings).require_password_changed(actor)
+

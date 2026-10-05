@@ -1,11 +1,16 @@
+import json
 import logging
+import threading
 import time
+from typing import Any
 
 import httpx
 
+from app.core import tracing
 from app.core.config import Settings
 from app.core.exceptions import LLMServiceError
 from app.llm.models import ModelTier
+from app.llm.ports import LLMToolCall, LLMToolTurn
 
 logger = logging.getLogger("app.llm")
 
@@ -16,6 +21,8 @@ class MantleLLMGateway:
     def __init__(self, settings: Settings, *, client: httpx.Client | None = None):
         self.settings = settings
         self.client = client or httpx.Client(timeout=45.0)
+        # Token usage of the latest call on this thread, for the tracing generation.
+        self._usage = threading.local()
 
     def complete(
         self,
@@ -27,7 +34,117 @@ class MantleLLMGateway:
     ) -> str:
         if not self.settings.bedrock_api_key:
             raise LLMServiceError("BEDROCK_API_KEY is not configured")
-        return self._openai_completion(tier, system=system, user=user, json_mode=json_mode)
+        model, max_tokens = self._model_and_budget(tier)
+        with tracing.observe(
+            f"llm.{tier}", as_type="generation", model=model,
+            input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model_parameters={"max_tokens": max_tokens, "json_mode": json_mode},
+            metadata={"tier": tier},
+        ) as generation:
+            content = self._openai_completion(tier, system=system, user=user, json_mode=json_mode)
+            tracing.safe_update(generation, output=content, usage_details=getattr(self._usage, "value", None))
+            return content
+
+    def complete_with_tools(
+        self,
+        tier: ModelTier,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> LLMToolTurn:
+        """OpenAI-compatible native tool calling (`tools` + `tool_calls`)."""
+        if not self.settings.bedrock_api_key:
+            raise LLMServiceError("BEDROCK_API_KEY is not configured")
+        model, max_tokens = self._model_and_budget(tier)
+        with tracing.observe(
+            f"llm.{tier}.tools", as_type="generation", model=model,
+            input=[{"role": "system", "content": system}, *messages],
+            model_parameters={"max_tokens": max_tokens, "tools": len(tools)},
+            metadata={"tier": tier, "tools": [item.get("function", {}).get("name") for item in tools]},
+        ) as generation:
+            turn = self._tool_completion(tier, model, max_tokens, system=system, messages=messages, tools=tools)
+            tracing.safe_update(
+                generation,
+                output={"content": turn.content, "tool_calls": [{"name": c.name, "arguments": c.arguments} for c in turn.tool_calls]},
+                usage_details=getattr(self._usage, "value", None),
+            )
+            return turn
+
+    def _tool_completion(
+        self,
+        tier: ModelTier,
+        model: str,
+        max_tokens: int,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> LLMToolTurn:
+        body: dict[str, object] = {
+            "model": model,
+            "messages": [{"role": "system", "content": system}, *messages],
+            "tools": tools,
+            "tool_choice": "auto",
+            "max_tokens": max_tokens,
+        }
+        if tier == "complex":
+            body["reasoning_effort"] = self.settings.complex_reasoning_effort
+        if tier == "router":
+            body["reasoning_effort"] = self.settings.router_reasoning_effort
+        response = self._post(
+            f"{self.settings.bedrock_openai_base_url.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {self.settings.bedrock_api_key}"},
+            json=body,
+        )
+        try:
+            payload = response.json()
+            message = payload["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMServiceError("Bedrock Mantle returned an invalid Chat Completions response") from exc
+        calls: list[LLMToolCall] = []
+        for index, item in enumerate(message.get("tool_calls") or []):
+            function = item.get("function") or {}
+            raw_arguments = function.get("arguments") or "{}"
+            try:
+                arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Tool call arguments were not valid JSON for {function.get('name')}") from exc
+            if not isinstance(arguments, dict):
+                raise ValueError("Tool call arguments must be a JSON object")
+            calls.append(LLMToolCall(str(item.get("id") or f"call_{index}"), str(function.get("name", "")), arguments))
+        content = message.get("content")
+        usage = payload.get("usage", {})
+        self._usage.value = {
+            key: int(value)
+            for key, value in (("input", usage.get("prompt_tokens")), ("output", usage.get("completion_tokens")))
+            if isinstance(value, (int, float))
+        } or None
+        logger.info(
+            "llm_call_completed",
+            extra={
+                "model": model,
+                "tier": tier,
+                "input_tokens": usage.get("prompt_tokens"),
+                "output_tokens": usage.get("completion_tokens"),
+                "status": response.status_code,
+                "tool_calls": len(calls),
+            },
+        )
+        return LLMToolTurn(content.strip() if isinstance(content, str) and content.strip() else None, calls)
+
+    def _model_and_budget(self, tier: ModelTier) -> tuple[str, int]:
+        model = {
+            "router": self.settings.router_model_id,
+            "standard": self.settings.standard_model_id,
+            "complex": self.settings.complex_model_id,
+        }[tier]
+        max_tokens = {
+            "router": self.settings.router_max_output_tokens,
+            "standard": self.settings.standard_max_output_tokens,
+            "complex": self.settings.complex_max_output_tokens,
+        }[tier]
+        return model, max_tokens
 
     def _openai_completion(
         self,
@@ -76,6 +193,11 @@ class MantleLLMGateway:
         if not isinstance(content, str) or not content.strip():
             raise LLMServiceError("Bedrock Mantle returned an empty response")
         usage = payload.get("usage", {})
+        self._usage.value = {
+            key: int(value)
+            for key, value in (("input", usage.get("prompt_tokens")), ("output", usage.get("completion_tokens")))
+            if isinstance(value, (int, float))
+        } or None
         logger.info(
             "llm_call_completed",
             extra={

@@ -26,6 +26,7 @@ Intent = Literal[
     "reject_onboarding",
     "parking_vehicle",
     "register_vehicle",
+    "remove_vehicle",
     "parking_availability",
     "reserve_parking",
     "parking_reservations",
@@ -86,6 +87,7 @@ class RouteDecision(BaseModel):
             "reject_onboarding": "onboarding",
             "parking_vehicle": "parking",
             "register_vehicle": "parking",
+            "remove_vehicle": "parking",
             "parking_availability": "parking",
             "reserve_parking": "parking",
             "parking_reservations": "parking",
@@ -114,13 +116,13 @@ class RouteDecision(BaseModel):
             "CASUAL_LEAVE": "CASUAL",
             "SL": "SICK",
             "SICK_LEAVE": "SICK",
-            "PL": "EARNED",
             "EL": "EARNED",
             "EARNED": "EARNED",
             "EARNED_LEAVE": "EARNED",
-            "PRIVILEGE": "EARNED",
-            "PRIVILEGE_LEAVE": "EARNED",
         }
+        if normalized in {"PL", "PRIVILEGE", "PRIVILEGE_LEAVE"}:
+            # Privilege Leave is a separate legacy balance (policy 5.1), not Earned Leave.
+            return None
         result = aliases.get(normalized, normalized)
         if result not in {"CASUAL", "SICK", "EARNED"}:
             raise ValueError("unsupported leave type")

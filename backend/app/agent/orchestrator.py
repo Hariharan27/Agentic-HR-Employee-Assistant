@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -8,15 +9,28 @@ from zoneinfo import ZoneInfo
 from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError as PydanticValidationError
 
+from app.agent.leave_agent import LeaveAgent
+from app.agent.onboarding_agent import OnboardingAgent
+from app.agent.onboarding_tools import OnboardingToolExecutor
+from app.agent.parking_agent import ParkingAgent
+from app.agent.parking_tools import ParkingToolExecutor
+from app.agent.leave_tools import LeaveToolExecutor
 from app.agent.state import AgentState
 from app.application.leave.service import LeaveService
 from app.application.onboarding.service import OnboardingService
 from app.application.parking.service import ParkingService
 from app.application.pending.service import PendingActionCoordinator
+from app.core import tracing
 from app.core.config import Settings
-from app.core.exceptions import LLMServiceError, ParkingUnavailableError
+from app.core.exceptions import (
+    ApplicationError,
+    LLMServiceError,
+    ParkingUnavailableError,
+    PendingActionExpiredError,
+)
 from app.core.security import AuthenticatedUser, require_role
-from app.domain.onboarding.entities import TASK_TITLES, OnboardingCandidate
+from app.domain.leave.plan import stored_plan_inputs
+from app.domain.onboarding.draft import FIELDS as ONBOARDING_FIELDS, missing_fields
 from app.domain.pending.entities import ConfirmationDecision
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.llm.models import ModelTier, RouteDecision
@@ -31,6 +45,7 @@ Return exactly one JSON object with these fields:
   manager_leave_requests, approve_leave_request, reject_leave_request, cancel_leave_request,
   leave_request_history, calculate_leave_days, holidays, start_onboarding, onboarding_status,
   onboarding_approvals, approve_onboarding, reject_onboarding, parking_vehicle, register_vehicle,
+  remove_vehicle,
   parking_availability, reserve_parking, parking_reservations, cancel_parking,
   join_parking_waitlist, parking_admin_reservations, check_in_parking,
   admin_cancel_parking, mark_parking_no_show, override_parking_no_show,
@@ -75,7 +90,8 @@ and the dedicated approve_onboarding or reject_onboarding intents for reviewing 
 request. Extract only onboarding values explicitly stated by the user; never guess a name, email,
 role, department, manager, date, location, or employment type. Existing values are supplied
 separately and should not be repeated as newly extracted fields.
-Use register_vehicle when an employee wants to add, register, replace, or update their vehicle.
+Use register_vehicle when an employee wants to add, register, replace, or update their vehicle,
+and remove_vehicle when they want to remove, delete, or deregister it.
 Extract vehicle values only when explicitly supplied. Use parking_vehicle to view the employee's
 registered vehicle. Use parking_availability when the user
 asks whether parking is available, reserve_parking when they ask to book, parking_reservations to
@@ -97,6 +113,8 @@ class ChatResult:
     intent: str | None
     sources: list[dict[str, object]]
     pending_action: str | None = None
+    agent_activity: list[dict[str, str]] | None = None
+    onboarding_draft: dict[str, str] | None = None
 
 
 class HRAssistantOrchestrator:
@@ -122,9 +140,76 @@ class HRAssistantOrchestrator:
         self.pending = pending
         self.policies = policies
         self.llm = llm
+        self.leave_agent = LeaveAgent(
+            settings=settings,
+            llm=llm,
+            tools=LeaveToolExecutor(
+                actor=actor,
+                leave=leave,
+                pending=pending,
+                policies=policies,
+            ),
+        )
+        self.onboarding_agent = OnboardingAgent(
+            settings=settings,
+            llm=llm,
+            tools=OnboardingToolExecutor(actor=actor, onboarding=onboarding, pending=pending),
+        )
+        self.parking_agent = ParkingAgent(
+            settings=settings,
+            llm=llm,
+            tools=ParkingToolExecutor(
+                actor=actor, parking=parking, pending=pending, today=lambda: parking._local_now().date()
+            ),
+        )
+        #: Optional live-activity sink (streamed chat). Events: {"id", "label", "status", "commit"}.
+        #: "commit" marks steps after every role gate, from which the HTTP stream may start.
+        self.on_event: Callable[[dict[str, object]], None] | None = None
+        for agent in (self.leave_agent, self.onboarding_agent, self.parking_agent):
+            agent.on_event = self._agent_event
         self.graph = self._build_graph()
 
-    def chat(self, session_id: str, message: str) -> ChatResult:
+    def _emit(self, step_id: str, label: str, status: str, *, commit: bool = False) -> None:
+        if self.on_event is None:
+            return
+        try:
+            self.on_event({"id": step_id, "label": label, "status": status, "commit": commit})
+        except Exception:  # noqa: BLE001 - live display must never break a chat
+            pass
+
+    def _agent_event(self, event: dict[str, str]) -> None:
+        # Agents only run after their domain's role gate, so their steps can start the stream.
+        self._emit(event["id"], event["label"], event["status"], commit=True)
+
+    def _route_node(self, state: AgentState) -> AgentState:
+        with tracing.observe("route", as_type="chain", input=state["user_message"]) as observation:
+            result = self._route(state)
+            route = result.get("route")
+            if isinstance(route, RouteDecision):
+                tracing.safe_update(observation, output=route.model_dump(exclude_none=True))
+        route = result.get("route")
+        if isinstance(route, RouteDecision):
+            intent = (route.intent or route.domain).replace("_", " ")
+            self._emit("route", f"Understood: {route.domain.title()} · {intent}", "success")
+        return result
+
+    def _confirmation_node(self, state: AgentState) -> AgentState:
+        self._emit("route", "Checking your reply to the pending action", "success")
+        action = state.get("pending_action")
+        with tracing.observe(
+            "confirmation", as_type="guardrail", input=state["user_message"],
+            metadata={"action_type": getattr(action, "action_type", None), "summary": getattr(action, "summary", None)},
+        ) as observation:
+            result = self._handle_confirmation(state)
+            tracing.safe_update(
+                observation,
+                output="[sensitive response withheld]" if result.get("sensitive_response") else result.get("response"),
+            )
+            return result
+
+    def chat(
+        self, session_id: str, message: str, *, onboarding_form: dict[str, str] | None = None
+    ) -> ChatResult:
         stored = self.conversations.load_or_create(session_id, self.actor.user_id)
         history = self._safe_history(stored.get("messages"))
         state: AgentState = {
@@ -135,15 +220,40 @@ class HRAssistantOrchestrator:
             "user_message": message.strip(),
             "messages": history,
             "active_domain": self._safe_domain(stored.get("active_domain")),
-            "leave_context": self._safe_leave_context(stored.get("leave_context")),
+            "previous_domain": self._safe_domain(stored.get("active_domain")),
+            "leave_plan": self._safe_leave_plan(stored.get("leave_plan")),
             "onboarding_context": self._safe_onboarding_context(
                 stored.get("onboarding_context")
             ),
             "parking_context": self._safe_parking_context(stored.get("parking_context")),
+            "parking_plan": self._safe_parking_plan(stored.get("parking_plan")),
+            "onboarding_form": self._safe_onboarding_form(onboarding_form),
             "sources": [],
+            "agent_activity": [],
             "llm_calls": 0,
         }
-        result = self.graph.invoke(state)
+        with tracing.trace(
+            "chat",
+            user_id=str(self.actor.user_id),
+            session_id=session_id,
+            tags=[self.actor.role.lower()],
+            input=message.strip(),
+            metadata={"role": self.actor.role, "form": bool(onboarding_form)},
+        ) as root:
+            result = self.graph.invoke(state)
+            route = result.get("route")
+            tracing.safe_update(
+                root,
+                output="[sensitive response withheld]" if result.get("sensitive_response") else result.get("response"),
+                metadata={
+                    "role": self.actor.role,
+                    "domain": route.domain if isinstance(route, RouteDecision) else result.get("active_domain"),
+                    "intent": route.intent if isinstance(route, RouteDecision) else None,
+                    "pending_action": result.get("pending_summary"),
+                    "llm_calls": result.get("llm_calls", 0),
+                    "tools": [item.get("tool") for item in result.get("agent_activity", [])],
+                },
+            )
         response = result["response"]
         stored_response = (
             "Onboarding was approved and one-time credentials were shown to the HR administrator."
@@ -161,9 +271,10 @@ class HRAssistantOrchestrator:
             {
                 "messages": updated_history,
                 "active_domain": result.get("active_domain"),
-                "leave_context": result.get("leave_context", {}),
+                "leave_plan": result.get("leave_plan"),
                 "onboarding_context": result.get("onboarding_context", {}),
                 "parking_context": result.get("parking_context", state.get("parking_context", {})),
+                "parking_plan": result.get("parking_plan", state.get("parking_plan")),
             },
         )
         route = result.get("route")
@@ -175,13 +286,19 @@ class HRAssistantOrchestrator:
             intent=route.intent if isinstance(route, RouteDecision) else None,
             sources=result.get("sources", []),
             pending_action=result.get("pending_summary"),
+            agent_activity=result.get("agent_activity", []),
+            onboarding_draft={
+                name: value
+                for name, value in (result.get("onboarding_context") or {}).items()
+                if name in ONBOARDING_FIELDS
+            } or None,
         )
 
     def _build_graph(self):
         graph = StateGraph(AgentState)
         graph.add_node("resolve_pending_action", self._resolve_pending_action)
-        graph.add_node("confirmation", self._handle_confirmation)
-        graph.add_node("router", self._route)
+        graph.add_node("confirmation", self._confirmation_node)
+        graph.add_node("router", self._route_node)
         graph.add_node("policy", self._handle_policy)
         graph.add_node("leave", self._handle_leave)
         graph.add_node("onboarding", self._handle_onboarding)
@@ -230,14 +347,57 @@ class HRAssistantOrchestrator:
                 "response": "The pending action has been cancelled. No changes were made.",
                 "active_domain": self._action_domain(action.action_type),
                 "pending_summary": None,
-                "leave_context": {},
+                "leave_plan": None,
                 "onboarding_context": {},
                 "parking_context": {},
+                "parking_plan": None,
             }
-        created = self.pending.confirm(self.actor, state["session_id"])
+        try:
+            created = self.pending.confirm(self.actor, state["session_id"])
+        except PendingActionExpiredError:
+            return {
+                "response": "This confirmation has expired. No changes were made; please start the action again.",
+                "active_domain": self._action_domain(action.action_type),
+                "pending_summary": None,
+                "leave_plan": None,
+                "onboarding_context": {},
+                "parking_context": {},
+                "parking_plan": None,
+            }
+        except ApplicationError as exc:
+            if action.action_type not in {
+                "apply_leave",
+                "apply_leave_plan",
+                "cancel_leave_request",
+                "approve_leave_request",
+                "reject_leave_request",
+            }:
+                raise
+            return {
+                "response": (
+                    f"The action could not be completed: {exc}. No changes were made. "
+                    "The existing confirmation is still waiting; cancel it and create a new request if needed."
+                ),
+                "active_domain": self._action_domain(action.action_type),
+                "pending_summary": action.summary,
+            }
         action_type = action.action_type
         if action_type == "approve_leave_request":
             response = f"Leave request #{created.id} was approved successfully."
+        elif action_type == "apply_leave_plan":
+            requests = list(created)
+            label = requests[0].leave_type.value.title()
+            if len(requests) == 1:
+                response = (
+                    f"Your {label} leave request for {self._number(requests[0].working_days)} "
+                    f"working day(s) was submitted successfully with request ID {requests[0].id}."
+                )
+            else:
+                response = f"Your {label} leave requests were submitted successfully: " + ", ".join(
+                    f"#{item.id} ({item.start_date} to {item.end_date}, "
+                    f"{self._number(item.working_days)} day(s))"
+                    for item in requests
+                ) + "."
         elif action_type == "reject_leave_request":
             response = f"Leave request #{created.id} was rejected successfully."
         elif action_type == "cancel_leave_request":
@@ -261,8 +421,15 @@ class HRAssistantOrchestrator:
         elif action_type == "register_vehicle":
             model = f" ({created.make_model})" if created.make_model else ""
             response = (
-                f"Vehicle {created.registration_number} was registered successfully as a "
+                f"Vehicle {created.registration_number} was updated: {created.vehicle_type.value.lower()}{model}."
+                if action.summary.startswith("Update vehicle")
+                else f"Vehicle {created.registration_number} was registered successfully as a "
                 f"{created.vehicle_type.value.lower()}{model}. You can now reserve parking."
+            )
+        elif action_type == "remove_vehicle":
+            response = (
+                f"Vehicle {created.registration_number} was removed from your parking profile. "
+                "Register a vehicle again before booking parking."
             )
         elif action_type == "reserve_parking":
             response = (
@@ -274,6 +441,14 @@ class HRAssistantOrchestrator:
                 f"Your parking reservation #{created.id} for {created.reservation_date} "
                 "was cancelled successfully."
             )
+        elif action_type == "reserve_parking_plan":
+            lines = []
+            for item in created:
+                if hasattr(item, "slot"):
+                    lines.append(f"{item.reservation_date}: slot {item.slot.code} reserved (reservation #{item.id})")
+                else:
+                    lines.append(f"{item.requested_date}: added to the waitlist")
+            response = "Parking booked:\n" + "\n".join(f"- {line}" for line in lines)
         elif action_type == "join_parking_waitlist":
             response = f"You were added to the parking waitlist for {created.requested_date}."
         elif action_type == "check_in_parking":
@@ -299,9 +474,10 @@ class HRAssistantOrchestrator:
             "response": response,
             "active_domain": self._action_domain(action_type),
             "pending_summary": None,
-            "leave_context": {},
+            "leave_plan": None,
             "onboarding_context": {},
             "parking_context": {},
+            "parking_plan": None,
         }
         if action_type == "approve_onboarding":
             result["sensitive_response"] = True
@@ -311,7 +487,9 @@ class HRAssistantOrchestrator:
     def _action_domain(action_type: str) -> str:
         if action_type in {
             "register_vehicle",
+            "remove_vehicle",
             "reserve_parking",
+            "reserve_parking_plan",
             "cancel_parking",
             "join_parking_waitlist",
             "check_in_parking",
@@ -326,6 +504,9 @@ class HRAssistantOrchestrator:
         } else "leave"
 
     def _route(self, state: AgentState) -> AgentState:
+        if state.get("onboarding_form"):
+            form_route = RouteDecision(domain="onboarding", intent="start_onboarding", confidence=1.0)
+            return {"route": form_route, "active_domain": "onboarding", "llm_calls": 0}
         security_route = self._security_route(state["user_message"])
         if security_route is not None:
             return {"route": security_route, "active_domain": security_route.domain, "llm_calls": 0}
@@ -349,7 +530,14 @@ class HRAssistantOrchestrator:
         decision = self._apply_routing_guards(
             decision, state["user_message"], date.fromisoformat(today)
         )
-        if (
+        decision = self._contextual_review_target(decision, state)
+        if state.get("active_domain") == "parking" and self._is_vehicle_registration_follow_up(
+            state["user_message"], state.get("parking_context") or {}, decision
+        ):
+            decision = decision.model_copy(
+                update={"domain": "parking", "intent": "register_vehicle", "confidence": 0.99}
+            )
+        elif (
             state.get("active_domain") == "onboarding"
             and state.get("onboarding_context")
             and decision.domain == "general"
@@ -359,30 +547,43 @@ class HRAssistantOrchestrator:
             )
         elif (
             state.get("active_domain") == "parking"
-            and state.get("parking_context")
+            and (
+                any(key != "offer" for key in (state.get("parking_context") or {}))
+                or state.get("parking_plan")
+            )
             and decision.domain == "general"
         ):
             parking_intent = (
                 "register_vehicle"
-                if state["parking_context"].get("mode") == "register_vehicle"
+                if (state.get("parking_context") or {}).get("mode") == "register_vehicle"
                 else "parking"
             )
             decision = decision.model_copy(
                 update={"domain": "parking", "intent": parking_intent, "confidence": 0.99}
             )
-        elif (
-            state.get("active_domain") == "leave"
-            and state.get("leave_context")
-            and (
+        elif state.get("active_domain") == "leave" and (
+            self._message_is_only_leave_type(state["user_message"])
+            or (
                 decision.domain == "general"
-                or self._message_is_only_leave_type(state["user_message"])
-                or self._extract_leave_dates(
-                    state["user_message"], date.fromisoformat(today)
-                ) != (None, None)
+                and (
+                    state.get("leave_plan")
+                    or self._contains_date_reference(state["user_message"])
+                )
+            )
+            or (
+                state.get("leave_plan")
+                and bool(re.search(r"\b(policy|holiday|holidays|rule|rules)\b", state["user_message"], re.I))
+                and bool(re.search(r"\b(this|that|it|these|those|leave)\b", state["user_message"], re.I))
             )
         ):
+            # Keep a leave conversation in the Leave Agent; the agent, not routing, decides what
+            # the follow-up means.
             decision = decision.model_copy(
-                update={"domain": "leave", "intent": "apply_leave", "confidence": 0.99}
+                update={
+                    "domain": "leave",
+                    "intent": decision.intent if decision.domain == "leave" else "apply_leave",
+                    "confidence": 0.99,
+                }
             )
         return {"route": decision, "active_domain": decision.domain, "llm_calls": calls}
 
@@ -415,14 +616,29 @@ class HRAssistantOrchestrator:
         return "unsupported"
 
     def _handle_policy(self, state: AgentState) -> AgentState:
-        context = self.policies.search(state["user_message"])
+        self._emit("policy", "Searching policy documents", "running", commit=True)
+        with tracing.observe("policy.search", as_type="retriever", input=state["user_message"]) as observation:
+            context = self.policies.search(state["user_message"])
+            tracing.safe_update(observation, output=context.sources)
+        documents = {str(item.get("document")) for item in context.sources if isinstance(item, dict)}
+        self._emit(
+            "policy",
+            f"Found {len(context.sources)} passage(s) in {len(documents)} document(s)" if context.sources
+            else "No matching policy passages",
+            "success" if context.sources else "error",
+            commit=True,
+        )
+        self._emit("answer", "Writing the answer from the policy text", "running", commit=True)
         system = (
             "Answer the employee's HR policy question using only the supplied policy context. "
             "Do not add rules that are absent, and explicitly mention any conflict in the passages. "
             "Lead with the direct answer and use at most three short sentences unless the employee "
             "asks for steps or a detailed explanation. Use plain text only: no Markdown, headings, "
             "bullets, quotations, document names, page numbers, or inline citations. The interface "
-            "shows source documents separately. Use natural grammar and spacing, such as '12 days'."
+            "shows source documents separately. Use natural grammar and spacing, such as '12 days'. "
+            "Write every number as digits (6, not six). "
+            "Write leave types in full the first time (Earned Leave (EL), Privilege Leave (PL), "
+            "Casual Leave (CL), Sick Leave (SL))."
         )
         raw, calls = self._complete(
             state,
@@ -455,357 +671,99 @@ class HRAssistantOrchestrator:
         return cleaned.strip()
 
     def _handle_leave(self, state: AgentState) -> AgentState:
-        route: RouteDecision = state["route"]
-        if route.intent == "leave_balance":
-            balances = self.leave.get_leave_balance(self.actor, route.leave_type)
-            lines = [
-                f"{balance.leave_type.value.title()}: {self._number(balance.available_days)} available "
-                f"({self._number(balance.pending_days)} pending)"
-                for balance in balances
-            ]
-            return {"response": "Your leave balance:\n" + "\n".join(lines), "active_domain": "leave", "leave_context": {}}
-        if route.intent == "leave_requests":
-            requests = self.leave.get_my_leave_requests(self.actor)
-            if not requests:
-                return {"response": "You do not have any leave requests.", "active_domain": "leave", "leave_context": {}}
-            lines = [
-                f"Request ID #{item.id}: {item.leave_type.value.title()} {item.start_date} to {item.end_date} "
-                f"— {self._number(item.working_days)} day(s), {item.status.value.title()}"
-                for item in requests[:10]
-            ]
-            return {"response": "Your recent leave requests:\n" + "\n".join(lines), "active_domain": "leave", "leave_context": {}}
-        if route.intent == "manager_leave_requests":
-            requests = self.leave.get_managed_leave_requests(self.actor)
-            if not requests:
-                return {"response": "There are no pending leave requests in your approval queue.",
-                        "active_domain": "leave", "leave_context": {}}
-            lines = [
-                f"Request ID #{item.id}: {item.employee_name or item.employee_code or item.employee_id} — "
-                f"{item.leave_type.value.title()} {item.start_date} to {item.end_date}, "
-                f"{self._number(item.working_days)} day(s)"
-                for item in requests[:20]
-            ]
-            return {"response": "Pending leave approvals:\n" + "\n".join(lines),
-                    "active_domain": "leave", "leave_context": {}}
-        if route.intent == "leave_request_history":
-            if route.request_id is None:
-                return {"response": "Please provide the leave request ID.", "active_domain": "leave", "leave_context": {}}
-            events = self.leave.get_leave_request_history(self.actor, route.request_id)
-            lines = [
-                f"{item.to_status.value.title()} by user #{item.actor_user_id}"
-                + (f" — {item.comment}" if item.comment else "")
-                for item in events
-            ]
-            return {"response": f"History for leave request #{route.request_id}:\n" + "\n".join(lines),
-                    "active_domain": "leave", "leave_context": {}}
-        if route.intent in {"approve_leave_request", "reject_leave_request", "cancel_leave_request"}:
-            if route.request_id is None:
-                return {"response": "Please provide the leave request ID.", "active_domain": "leave", "leave_context": {}}
-            if route.intent == "reject_leave_request" and not route.reason:
-                return {"response": "Please provide a reason for rejecting the leave request.",
-                        "active_domain": "leave", "leave_context": {}}
-            if route.intent == "cancel_leave_request":
-                request = self.leave.prepare_leave_cancellation(self.actor, route.request_id)
-                action_type = "cancel_leave_request"
-                arguments = {"request_id": route.request_id, "reason": route.reason}
-                summary = f"Cancel your pending leave request #{request.id}"
-            else:
-                request = self.leave.prepare_leave_decision(self.actor, route.request_id)
-                if route.intent == "approve_leave_request":
-                    action_type = "approve_leave_request"
-                    arguments = {"request_id": route.request_id, "comment": route.reason}
-                    summary = f"Approve leave request #{request.id} for {request.employee_name or request.employee_code}"
-                else:
-                    action_type = "reject_leave_request"
-                    arguments = {"request_id": route.request_id, "reason": route.reason}
-                    summary = f"Reject leave request #{request.id}: {route.reason}"
-            action = self.pending.propose(
-                self.actor, state["session_id"], action_type, arguments, summary
-            )
-            return {
-                "response": f"{action.summary}. Reply yes to confirm or cancel.",
-                "active_domain": "leave",
-                "leave_context": {},
-                "pending_summary": action.summary,
-            }
-        if route.intent == "apply_leave":
-            context = self._merge_leave_context(
-                state.get("leave_context", {}), route, state["user_message"]
-            )
-            route = route.model_copy(
-                update={
-                    "leave_type": context.get("leave_type"),
-                    "start_date": date.fromisoformat(context["start_date"]) if context.get("start_date") else None,
-                    "end_date": date.fromisoformat(context["end_date"]) if context.get("end_date") else None,
-                    "reason": context.get("reason"),
-                }
-            )
-        else:
-            context = {}
-        if route.intent in {"leave_eligibility", "apply_leave", "calculate_leave_days", "holidays"}:
-            missing = self._missing_leave_fields(route)
-            if missing:
-                return {
-                    "response": f"Please provide {', '.join(missing)}.",
-                    "active_domain": "leave",
-                    "leave_context": context if route.intent == "apply_leave" else {},
-                }
-        if route.intent == "holidays":
-            holidays = sorted(self.leave.get_holidays(route.start_date, route.end_date))
-            message = "No configured holidays fall in that range."
-            if holidays:
-                message = "Configured holidays in that range: " + ", ".join(map(str, holidays)) + "."
-            return {"response": message, "active_domain": "leave", "leave_context": {}}
-        if route.intent == "calculate_leave_days":
-            days = self.leave.calculate_leave_days(route.start_date, route.end_date)
-            return {"response": f"That range contains {self._number(days)} working leave day(s).",
-                    "active_domain": "leave", "leave_context": {}}
-        if route.intent in {"leave_eligibility", "apply_leave"}:
-            eligibility = self.leave.check_leave_eligibility(
-                self.actor, route.leave_type, route.start_date, route.end_date
-            )
-            if not eligibility.eligible:
-                return {
-                    "response": f"You are not eligible for this request: {eligibility.reason}.",
-                    "active_domain": "leave",
-                    "leave_context": context if route.intent == "apply_leave" else {},
-                }
-            if route.intent == "leave_eligibility":
-                return {
-                    "response": (
-                        f"You are eligible. The request uses {self._number(eligibility.working_days)} "
-                        f"working day(s), and you have {self._number(eligibility.available_days)} available."
-                    ),
-                    "active_domain": "leave",
-                    "leave_context": {},
-                }
-            summary = (
-                f"Apply for {self._number(eligibility.working_days)} working day(s) of "
-                f"{route.leave_type.title()} leave from {route.start_date} to {route.end_date}"
-            )
-            action = self.pending.propose(
-                self.actor,
-                state["session_id"],
-                "apply_leave",
-                {
-                    "leave_type": route.leave_type,
-                    "start_date": route.start_date.isoformat(),
-                    "end_date": route.end_date.isoformat(),
-                    "reason": route.reason,
-                },
-                summary,
-            )
-            return {
-                "response": f"{action.summary}. Reply yes to confirm or cancel.",
-                "active_domain": "leave",
-                "leave_context": {},
-                "pending_summary": action.summary,
-            }
+        route: RouteDecision | None = state.get("route")
+        intent = route.intent if route else None
+        # Manager actions fail with 403 for employees before any model call.
+        if intent in {"approve_leave_request", "reject_leave_request", "manager_leave_requests"}:
+            require_role(self.actor, "MANAGER", "HR")
+        result = self.leave_agent.invoke(
+            session_id=state["session_id"],
+            user_message=state["user_message"],
+            conversation=state.get("messages", []),
+            leave_plan=state.get("leave_plan"),
+            llm_calls=state.get("llm_calls", 0),
+            intent=intent,
+        )
         return {
-            "response": "I can help with leave balance, eligibility, applications, holidays, and request history.",
+            "response": result["response"],
             "active_domain": "leave",
-            "leave_context": {},
+            "leave_plan": result.get("leave_plan"),
+            "sources": result.get("sources", []),
+            "pending_summary": result.get("pending_summary"),
+            "agent_activity": result.get("agent_activity", []),
+            "llm_calls": result.get("llm_calls", state.get("llm_calls", 0)),
         }
 
     def _handle_onboarding(self, state: AgentState) -> AgentState:
         route: RouteDecision = state["route"]
-        if route.intent == "onboarding_approvals":
-            requests = self.onboarding.get_pending_approvals(self.actor)
-            if not requests:
-                return {
-                    "response": "There are no onboarding requests pending approval.",
-                    "active_domain": "onboarding",
-                }
-            lines = [
-                f"#{item.id}: {item.candidate.name} — {item.candidate.designation}, "
-                f"joining {item.candidate.joining_date}"
-                for item in requests[:20]
-            ]
-            return {
-                "response": "Pending onboarding approvals:\n" + "\n".join(lines),
-                "active_domain": "onboarding",
-            }
-        if route.intent in {"approve_onboarding", "reject_onboarding"}:
-            if route.request_id is None:
-                return {
-                    "response": "Please provide the onboarding request ID.",
-                    "active_domain": "onboarding",
-                }
-            if route.intent == "reject_onboarding" and not route.reason:
-                return {
-                    "response": "Please provide a reason for rejecting the onboarding request.",
-                    "active_domain": "onboarding",
-                }
-            request = self.onboarding.prepare_review(self.actor, route.request_id)
-            if route.intent == "approve_onboarding":
-                action_type = "approve_onboarding"
-                arguments = {"request_id": request.id, "comment": route.reason}
-                summary = f"Approve onboarding request #{request.id} for {request.candidate.name}"
-            else:
-                action_type = "reject_onboarding"
-                arguments = {"request_id": request.id, "reason": route.reason}
-                summary = f"Reject onboarding request #{request.id} for {request.candidate.name}: {route.reason}"
-            action = self.pending.propose(
-                self.actor, state["session_id"], action_type, arguments, summary
-            )
-            return {
-                "response": f"{action.summary}. Reply yes to confirm or cancel.",
-                "active_domain": "onboarding",
-                "pending_summary": action.summary,
-            }
-        if route.intent == "onboarding_status":
-            if route.request_id is not None:
-                request = self.onboarding.get_onboarding_status(self.actor, route.request_id)
-            else:
-                query = self._trusted_onboarding_lookup(route, state["user_message"])
-                if query is None:
-                    return {
-                        "response": "Please provide the employee name, email, or onboarding request ID.",
-                        "active_domain": "onboarding",
-                    }
-                request = self.onboarding.find_onboarding_status(self.actor, query)
-            task_lines = [
-                f"{task.title}: {task.status.value.replace('_', ' ').title()}"
-                for task in request.tasks
-            ]
-            return {
-                "response": (
-                    f"{request.candidate.name} — {request.candidate.designation}\n"
-                    f"Joining: {request.candidate.joining_date}\n"
-                    f"Status: {request.status.value.replace('_', ' ').title()} "
-                    f"({request.completed_tasks}/{request.total_tasks} completed)\n"
-                    + "\n".join(task_lines)
-                ),
-                "active_domain": "onboarding",
-            }
-
-        require_role(self.actor, "MANAGER", "HR")
-
-        context = self._merge_onboarding_context(
-            state.get("onboarding_context", {}), route, state["user_message"]
+        # Role gates stay deterministic so unauthorized requests fail with 403 before any model call.
+        if route.intent in {"onboarding_approvals", "approve_onboarding", "reject_onboarding"}:
+            require_role(self.actor, "HR_ADMIN")
+        elif route.intent == "onboarding_status":
+            require_role(self.actor, "MANAGER", "HR", "HR_ADMIN")
+        else:
+            require_role(self.actor, "MANAGER", "HR")
+        form = state.get("onboarding_form")
+        draft = dict(state.get("onboarding_context", {}))
+        if not form and state.get("previous_domain") != "onboarding":
+            # A new onboarding conversation starts clean: a half-filled draft from an earlier,
+            # abandoned onboarding must not leak another candidate's details into this one.
+            draft = {}
+        if form:
+            return self._handle_onboarding_form(state, draft, form)
+        tools: OnboardingToolExecutor = self.onboarding_agent.tools  # type: ignore[assignment]
+        tools.turn_text = state["user_message"]
+        result = self.onboarding_agent.invoke(
+            session_id=state["session_id"],
+            user_message=state["user_message"],
+            conversation=state.get("messages", []),
+            active_plan=draft,
+            llm_calls=state.get("llm_calls", 0),
+            intent=route.intent,
         )
-        required = (
-            ("name", "employee name"),
-            ("email", "email"),
-            ("designation", "designation"),
-            ("department", "department"),
-            ("reporting_manager", "reporting manager"),
-            ("joining_date", "joining date"),
-            ("location", "location"),
-            ("employment_type", "employment type"),
-        )
-        missing = [label for field, label in required if not context.get(field)]
-        if missing:
-            return {
-                "response": (
-                    "Use the onboarding form below so I can collect the required employee details "
-                    f"({', '.join(missing)}) and ask for confirmation before creating the request."
-                ),
-                "active_domain": "onboarding",
-                "onboarding_context": context,
-            }
-
-        candidate = OnboardingCandidate(
-            name=context["name"],
-            email=context["email"],
-            designation=context["designation"],
-            department=context["department"],
-            reporting_manager=context["reporting_manager"],
-            joining_date=date.fromisoformat(context["joining_date"]),
-            location=context["location"],
-            employment_type=context["employment_type"],
-        )
-        plan = self.onboarding.prepare_plan(self.actor, candidate)
-        arguments = {
-            "name": plan.candidate.name,
-            "email": plan.candidate.email,
-            "designation": plan.candidate.designation,
-            "department": plan.candidate.department,
-            "reporting_manager": plan.candidate.reporting_manager,
-            "joining_date": plan.candidate.joining_date.isoformat(),
-            "location": plan.candidate.location,
-            "employment_type": plan.candidate.employment_type,
-        }
-        summary = (
-            f"Create onboarding for {plan.candidate.name} ({plan.candidate.designation}), "
-            f"joining {plan.candidate.joining_date}, with 4 provisioning requests"
-        )
-        action = self.pending.propose(
-            self.actor, state["session_id"], "create_onboarding", arguments, summary
-        )
-        task_lines = "\n".join(f"- {TASK_TITLES[item]}" for item in plan.task_types)
         return {
-            "response": (
-                "New employee onboarding\n"
-                f"Name: {plan.candidate.name}\n"
-                f"Email: {plan.candidate.email}\n"
-                "Account role: Employee\n"
-                f"Designation: {plan.candidate.designation}\n"
-                f"Department: {plan.candidate.department}\n"
-                f"Manager: {plan.candidate.reporting_manager}\n"
-                f"Joining date: {plan.candidate.joining_date}\n"
-                f"Location: {plan.candidate.location}\n"
-                f"Employment type: {plan.candidate.employment_type}\n\n"
-                f"Provisioning requests:\n{task_lines}\n\n"
-                "Reply yes to confirm or cancel."
-            ),
+            "response": result["response"],
             "active_domain": "onboarding",
-            "onboarding_context": context,
-            "pending_summary": action.summary,
+            "onboarding_context": result.get("active_plan") or {},
+            "pending_summary": result.get("pending_summary"),
+            "agent_activity": result.get("agent_activity", []),
+            "llm_calls": result.get("llm_calls", state.get("llm_calls", 0)),
+        }
+
+    def _handle_onboarding_form(
+        self, state: AgentState, draft: dict[str, str], form: dict[str, str]
+    ) -> AgentState:
+        """Structured form values go straight into the draft: no text parsing, no model call."""
+        tools: OnboardingToolExecutor = self.onboarding_agent.tools  # type: ignore[assignment]
+        updated, invalid, _ = tools.apply_fields(draft, form, require_stated=False)
+        missing = missing_fields(updated)
+        if invalid or missing:
+            problems = [f"{label}: {reason}" for label, reason in invalid.items()]
+            if missing:
+                problems.append("missing " + ", ".join(missing))
+            return {
+                "response": "Please check the onboarding form: " + "; ".join(problems) + ".",
+                "active_domain": "onboarding",
+                "onboarding_context": updated,
+            }
+        summary, reply = tools.propose(updated, state["session_id"])
+        return {
+            "response": reply,
+            "active_domain": "onboarding",
+            "onboarding_context": updated,
+            "pending_summary": summary,
         }
 
     @staticmethod
-    def _merge_onboarding_context(
-        existing: dict[str, str], route: RouteDecision, message: str
-    ) -> dict[str, str]:
-        context = dict(existing)
-        fields = {
-            "name": route.employee_name,
-            "designation": route.designation,
-            "department": route.department,
-            "reporting_manager": route.reporting_manager,
-            "location": route.location,
-            "employment_type": route.employment_type,
+    def _safe_onboarding_form(value: object) -> dict[str, str] | None:
+        if not isinstance(value, dict):
+            return None
+        form = {
+            key: str(item).strip()
+            for key, item in value.items()
+            if key in ONBOARDING_FIELDS and isinstance(item, (str, int)) and str(item).strip()
         }
-        for field, value in fields.items():
-            if value and HRAssistantOrchestrator._value_is_explicit(value, message):
-                context[field] = value.strip()
-        labelled_patterns = {
-            "name": r"(?:employee\s+)?name\s*:\s*([^,;\n]+)",
-            "designation": r"(?:designation|role)\s*:\s*([^,;\n]+)",
-            "department": r"department\s*:\s*([^,;\n]+)",
-            "reporting_manager": r"(?:reporting\s+manager|manager)\s*:\s*([^,;\n]+)",
-            "location": r"location\s*:\s*([^,;\n]+)",
-            "employment_type": r"employment\s+type\s*:\s*([^,;\n]+)",
-        }
-        for field, pattern in labelled_patterns.items():
-            match = re.search(pattern, message, re.I)
-            if match:
-                context[field] = match.group(1).strip()
-        email_match = re.search(
-            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", message, re.I
-        )
-        if email_match:
-            context["email"] = email_match.group(0).casefold()
-        iso_date_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", message)
-        if iso_date_match:
-            context["joining_date"] = iso_date_match.group(0)
-        elif route.joining_date is not None and HRAssistantOrchestrator._contains_date_reference(message):
-            context["joining_date"] = route.joining_date.isoformat()
-        return context
-
-    @staticmethod
-    def _trusted_onboarding_lookup(route: RouteDecision, message: str) -> str | None:
-        email_match = re.search(
-            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", message, re.I
-        )
-        if email_match:
-            return email_match.group(0)
-        if route.employee_name and HRAssistantOrchestrator._value_is_explicit(
-            route.employee_name, message
-        ):
-            return route.employee_name.strip()
-        return None
+        return form or None
 
     @staticmethod
     def _value_is_explicit(value: str, message: str) -> bool:
@@ -813,11 +771,73 @@ class HRAssistantOrchestrator:
         normalized_message = " ".join(re.sub(r"[^\w]+", " ", message.casefold()).split())
         return bool(normalized_value) and normalized_value in normalized_message
 
+    VEHICLE_FIELDS = ("registration_number", "vehicle_type", "make_model")
+
+    PARKING_AGENT_INTENTS = {
+        "parking_availability", "reserve_parking", "cancel_parking", "join_parking_waitlist", "parking",
+    }
+
     def _handle_parking(self, state: AgentState) -> AgentState:
         route: RouteDecision = state["route"]
         context = dict(state.get("parking_context", {}))
+        # The "register one?" offer only applies to the very next message.
+        context.pop("offer", None)
+
+        if (
+            route.intent in self.PARKING_AGENT_INTENTS
+            and context.get("mode") != "register_vehicle"
+            and self.actor.employee_id is not None
+            and not self.parking.list_vehicles(self.actor)
+        ):
+            # Slots are only for employees with a registered vehicle: check the vehicle list first.
+            context["offer"] = "register_vehicle"
+            return {
+                "response": (
+                    "You need a registered vehicle before you can check or reserve a parking slot, "
+                    "and you do not have one yet. Say \"yes\" or \"Register my vehicle\" to add one "
+                    f"(up to {self.parking.MAX_VEHICLES}); then I can show the free slots."
+                ),
+                "active_domain": "parking",
+                "parking_context": context,
+                "agent_activity": [
+                    {"tool": "get_vehicle", "label": "Checked registered vehicles: none yet", "status": "success"}
+                ],
+            }
+
+        if route.intent in self.PARKING_AGENT_INTENTS and context.get("mode") != "register_vehicle":
+            tools: ParkingToolExecutor = self.parking_agent.tools  # type: ignore[assignment]
+            tools.turn_text = state["user_message"]
+            result = self.parking_agent.invoke(
+                session_id=state["session_id"],
+                user_message=state["user_message"],
+                conversation=state.get("messages", []),
+                active_plan=state.get("parking_plan"),
+                llm_calls=state.get("llm_calls", 0),
+                intent=route.intent,
+            )
+            if not result.get("pending_summary") and self._claims_vehicle_registered(result["response"]):
+                # Only the confirmed register_vehicle action can save a vehicle; never let a model
+                # reply claim it did. Send the user to the real registration flow instead.
+                redirected = route.model_copy(update={"intent": "register_vehicle"})
+                return {
+                    **self._handle_parking({**state, "route": redirected, "parking_context": context}),
+                    "route": redirected,
+                }
+            return {
+                "response": result["response"],
+                "active_domain": "parking",
+                "parking_context": context,
+                "parking_plan": result.get("active_plan"),
+                "pending_summary": result.get("pending_summary"),
+                "agent_activity": result.get("agent_activity", []),
+                "llm_calls": result.get("llm_calls", state.get("llm_calls", 0)),
+            }
 
         if route.intent == "register_vehicle":
+            # Only a registration that is still being collected carries earlier values; a new
+            # "register / add / update my vehicle" request starts from what this message says.
+            if context.get("mode") != "register_vehicle":
+                context = {key: value for key, value in context.items() if key not in self.VEHICLE_FIELDS}
             context = self._merge_vehicle_context(
                 context, route, state["user_message"]
             )
@@ -831,10 +851,19 @@ class HRAssistantOrchestrator:
                 if not context.get(field)
             ]
             if missing:
+                understood = ", ".join(
+                    f"{label}: {context[field]}"
+                    for field, label in (("registration_number", "registration number"), ("vehicle_type", "vehicle type"), ("make_model", "make and model"))
+                    if context.get(field)
+                )
                 return {
                     "response": (
-                        "Use the vehicle registration form below so I can collect "
-                        f"{', '.join(missing)} and ask for confirmation before saving it."
+                        "Please fill in the vehicle registration form below with the registration number, "
+                        "vehicle type (car or motorcycle) and make and model"
+                        + (f" (so far I have {understood})" if understood else "")
+                        + ". I'll show a summary for confirmation before saving it. "
+                        f"A new registration number adds a vehicle (up to {self.parking.MAX_VEHICLES}); "
+                        "an existing one with new details updates it."
                     ),
                     "active_domain": "parking",
                     "parking_context": context,
@@ -853,10 +882,14 @@ class HRAssistantOrchestrator:
                 "make_model": make_model,
             }
             model = f" ({make_model})" if make_model else ""
-            summary = (
-                f"Register vehicle {registration} as a "
-                f"{vehicle_type.value.lower()}{model}"
-            )
+            if self.parking.is_registered(self.actor, registration):
+                summary = f"Update vehicle {registration} to a {vehicle_type.value.lower()}{model}"
+            else:
+                count = len(self.parking.list_vehicles(self.actor)) + 1
+                summary = (
+                    f"Register vehicle {registration} as a "
+                    f"{vehicle_type.value.lower()}{model} (vehicle {count} of {self.parking.MAX_VEHICLES})"
+                )
             action = self.pending.propose(
                 self.actor,
                 state["session_id"],
@@ -864,6 +897,10 @@ class HRAssistantOrchestrator:
                 arguments,
                 summary,
             )
+            # The values now live in the pending action; later turns start clean.
+            context = {
+                key: value for key, value in context.items() if key not in self.VEHICLE_FIELDS and key != "mode"
+            }
             return {
                 "response": f"{action.summary}. Reply yes to confirm or cancel.",
                 "active_domain": "parking",
@@ -877,14 +914,49 @@ class HRAssistantOrchestrator:
         if requested_date is not None:
             context["requested_date"] = requested_date.isoformat()
 
-        if route.intent == "parking_vehicle":
-            vehicle = self.parking.get_vehicle(self.actor)
-            description = f" ({vehicle.make_model})" if vehicle.make_model else ""
+        if route.intent == "remove_vehicle":
+            context.pop("mode", None)
+            compact = re.sub(r"[\s-]", "", state["user_message"]).upper()
+            named = [
+                item.registration_number
+                for item in self.parking.list_vehicles(self.actor)
+                if item.registration_number in compact
+            ]
+            vehicle = self.parking.prepare_vehicle_removal(
+                self.actor, named[0] if len(named) == 1 else route.vehicle_registration
+            )
+            model = f" ({vehicle.make_model})" if vehicle.make_model else ""
+            action = self.pending.propose(
+                self.actor,
+                state["session_id"],
+                "remove_vehicle",
+                {"registration_number": vehicle.registration_number},
+                f"Remove vehicle {vehicle.registration_number}, {vehicle.vehicle_type.value.lower()}{model}, "
+                "from your parking profile",
+            )
             return {
-                "response": (
-                    f"Your registered vehicle is {vehicle.registration_number}, "
-                    f"{vehicle.vehicle_type.value.lower()}{description}."
-                ),
+                "response": f"{action.summary}. Reply yes to confirm or cancel.",
+                "active_domain": "parking",
+                "parking_context": context,
+                "pending_summary": action.summary,
+            }
+
+        if route.intent == "parking_vehicle":
+            vehicles = self.parking.list_vehicles(self.actor)
+            if not vehicles:
+                response = "You do not have a registered vehicle yet. Say \"Register my vehicle\" to add one (up to two)."
+            else:
+                lines = [
+                    f"- {item.registration_number}, {item.vehicle_type.value.lower()}"
+                    + (f" ({item.make_model})" if item.make_model else "")
+                    for item in vehicles
+                ]
+                heading = "Your registered vehicle:" if len(vehicles) == 1 else "Your registered vehicles:"
+                response = heading + "\n" + "\n".join(lines) + f"\n\nYou can register up to {self.parking.MAX_VEHICLES}."
+            if len(vehicles) < self.parking.MAX_VEHICLES:
+                context["offer"] = "register_vehicle"
+            return {
+                "response": response,
                 "active_domain": "parking",
                 "parking_context": context,
             }
@@ -1144,7 +1216,76 @@ class HRAssistantOrchestrator:
             match = re.search(pattern, message, re.I)
             if match:
                 context[field] = match.group(1).strip()
+        if not context.get("registration_number"):
+            plate = HRAssistantOrchestrator.PLATE_PATTERN.search(message)
+            if plate:
+                context["registration_number"] = "".join(plate.groups()).upper()
+        if not context.get("vehicle_type"):
+            if re.search(r"\b(bike|motorcycle|motorbike|scooter|two[- ]wheeler)\b", message, re.I):
+                context["vehicle_type"] = "motorcycle"
+            elif re.search(r"\bcar\b", message, re.I):
+                context["vehicle_type"] = "car"
         return context
+
+    PLATE_PATTERN = re.compile(r"\b([A-Z]{2})[\s-]?(\d{1,2})[\s-]?([A-Z]{0,3})[\s-]?(\d{3,4})\b", re.I)
+    _AFFIRMATIVE = re.compile(r"^\s*(yes|yeah|yep|ya|ok(ay)?|sure|please|go ahead|do it)\b", re.I)
+    _REGISTER_IT = re.compile(
+        r"\b(register|add)\s+(it|one|that|this|another|a\s+(new\s+)?one|mine|my\s+(new\s+)?(one|bike|car))\b", re.I
+    )
+    _BOOKING_WORDS = re.compile(r"\b(book|reserve|slot|slots|availability|available|cancel|waitlist|tomorrow|today)\b", re.I)
+
+    @classmethod
+    def _is_vehicle_registration_follow_up(
+        cls, message: str, context: dict[str, str], decision: RouteDecision
+    ) -> bool:
+        """Short follow-ups that only make sense as vehicle registration while in the parking domain."""
+        if decision.domain not in {"parking", "general"} or decision.intent in {"remove_vehicle", "register_vehicle"}:
+            return False
+        if context.get("offer") == "register_vehicle" and (
+            cls._AFFIRMATIVE.search(message) or re.search(r"\b(register|add)\b", message, re.I)
+        ):
+            return True
+        if cls._REGISTER_IT.search(message):
+            return True
+        if (
+            context.get("mode") == "register_vehicle"
+            and decision.intent in {"parking", "parking_vehicle", "general"}
+            and not cls._BOOKING_WORDS.search(message)
+        ):
+            return True  # still collecting registration details ("it is a car")
+        # A bare registration number (e.g. "TN84P2145, Zeta") with no booking words is a registration.
+        return bool(cls.PLATE_PATTERN.search(message)) and not cls._BOOKING_WORDS.search(message)
+
+    _REVIEW_SWAP = {
+        "approve_leave_request": "approve_onboarding",
+        "reject_leave_request": "reject_onboarding",
+    }
+
+    def _contextual_review_target(self, decision: RouteDecision, state: AgentState) -> RouteDecision:
+        """"Approve request 16" names no workflow. An HR administrator (who reviews onboarding, not
+        leave) or a conversation that was just about onboarding means the onboarding request; a
+        manager who was just looking at leave means the leave request. Explicit words always win."""
+        message = state["user_message"].casefold()
+        says_leave = bool(re.search(r"\bleaves?\b", message))
+        says_onboarding = bool(re.search(r"\bonboard", message))
+        previous = state.get("previous_domain")
+        if decision.intent in self._REVIEW_SWAP and not says_leave:
+            if self.actor.role == "HR_ADMIN" or previous == "onboarding":
+                return decision.model_copy(update={"domain": "onboarding", "intent": self._REVIEW_SWAP[decision.intent]})
+        reverse = {value: key for key, value in self._REVIEW_SWAP.items()}
+        if decision.intent in reverse and not says_onboarding:
+            if self.actor.role in {"MANAGER", "HR"} and previous == "leave":
+                return decision.model_copy(update={"domain": "leave", "intent": reverse[decision.intent]})
+        return decision
+
+    @staticmethod
+    def _claims_vehicle_registered(reply: str) -> bool:
+        return bool(re.search(
+            r"\b(has|have) been (successfully )?(registered|added|saved)\b"
+            r"|\b(is|was) now registered\b|\bsuccessfully registered\b|\bregistered (it|your vehicle)\b",
+            reply,
+            re.I,
+        ))
 
     @staticmethod
     def _handle_unsupported_domain(state: AgentState) -> AgentState:
@@ -1182,12 +1323,16 @@ class HRAssistantOrchestrator:
         return self.llm.complete(tier, system=system, user=user, json_mode=json_mode), calls + 1
 
     def _routing_input(self, state: AgentState, today: str) -> str:
-        leave_context = json.dumps(state.get("leave_context", {}), sort_keys=True)
+        plan = state.get("leave_plan")
+        leave_context = json.dumps(
+            {"active_leave_plan": plan.get("summary")} if isinstance(plan, dict) else {},
+            sort_keys=True,
+        )
         onboarding_context = json.dumps(state.get("onboarding_context", {}), sort_keys=True)
         parking_context = json.dumps(state.get("parking_context", {}), sort_keys=True)
         return (
             f"Today's date is {today}.\n"
-            f"Current leave application context: {leave_context}\n"
+            f"Current leave context: {leave_context}\n"
             f"Current onboarding context: {onboarding_context}\n"
             f"Current parking context: {parking_context}\n"
             f"{self._history_text(state)}"
@@ -1227,10 +1372,12 @@ class HRAssistantOrchestrator:
         patterns = {
             "CASUAL": r"\b(casual(?:\s+leave)?|casula(?:\s+leave)?|cl)\b",
             "SICK": r"\b(sick(?:\s+leave)?|sl)\b",
-            "EARNED": r"\b(earned(?:\s+leave)?|privilege(?:\s+leave)?|el|pl)\b",
+            "EARNED": r"\b(earned(?:\s+leave)?|el)\b",
         }
         explicit_types = [leave_type for leave_type, pattern in patterns.items() if re.search(pattern, message, re.I)]
         explicit_type = explicit_types[0] if len(explicit_types) == 1 else None
+        # Privilege Leave (PL) is still a leave topic, but it is not Earned Leave.
+        mentions_privilege = bool(re.search(r"\b(privilege(?:\s+leave)?|pl)\b", message, re.I))
 
         personal = bool(re.search(r"\b(i|my|me)\b", normalized))
         balance_signal = bool(
@@ -1245,9 +1392,14 @@ class HRAssistantOrchestrator:
                 )
                 or "leave request" in normalized
             )
-            and ("leave" in normalized or explicit_type is not None)
+            and ("leave" in normalized or explicit_type is not None or mentions_privilege)
         )
-        eligibility_signal = personal and bool(re.search(r"\b(eligible|can\s+i|could\s+i|may\s+i)\b", normalized))
+        leave_topic_signal = "leave" in normalized or explicit_type is not None or mentions_privilege
+        eligibility_signal = personal and leave_topic_signal and bool(
+            re.search(r"\b(eligible|can\s+i|could\s+i|may\s+i)\b", normalized)
+        ) and not bool(
+            re.search(r"\b(apply|submit|file|raise)\b", normalized)
+        )
         policy_signal = any(
             phrase in normalized
             for phrase in (
@@ -1327,7 +1479,7 @@ class HRAssistantOrchestrator:
         )
         parking_signal = bool(
             re.search(
-                r"\b(parking|park|slot|reservation|booking|waitlist|waiting\s+list|vehicle|registration|car|motorcycle|bike)\b",
+                r"\b(parking|park|slots?|reservations?|bookings?|waitlist|waiting\s+list|vehicles?|registration|cars?|motorcycles?|bikes?)\b",
                 normalized,
             )
         ) or decision.domain == "parking"
@@ -1364,8 +1516,12 @@ class HRAssistantOrchestrator:
 
         parking_intent: str | None = None
         if parking_signal:
-            if re.search(r"\b(register|add|update|change|replace)\b", normalized) and re.search(
-                r"\b(vehicle|registration|car|motorcycle|bike)\b", normalized
+            if re.search(r"\b(remove|delete|deregister|unregister|de-register)\b", normalized) and re.search(
+                r"\b(vehicles?|cars?|motorcycles?|bikes?)\b", normalized
+            ):
+                parking_intent = "remove_vehicle"
+            elif re.search(r"\b(register|add|update|change|replace|edit)\b", normalized) and re.search(
+                r"\b(vehicles?|registration|cars?|motorcycles?|bikes?)\b", normalized
             ):
                 parking_intent = "register_vehicle"
             elif re.search(r"\b(correct|reverse|override)\b", normalized) and re.search(
@@ -1392,20 +1548,32 @@ class HRAssistantOrchestrator:
                 parking_intent = "cancel_parking"
             elif re.search(r"\b(waitlist|waiting\s+list|queue)\b", normalized):
                 parking_intent = "join_parking_waitlist"
-            elif re.search(r"\b(vehicle|registration)\b", normalized):
+            elif re.search(r"\b(vehicles?|registration)\b", normalized):
                 parking_intent = "parking_vehicle"
             elif re.search(r"\b(book|reserve)\b", normalized):
                 parking_intent = "reserve_parking"
             elif re.search(r"\b(available|availability|can\s+i|get\s+parking)\b", normalized):
                 parking_intent = "parking_availability"
             elif re.search(r"\b(show|view|list|status|what(?:'s|\s+is))\b", normalized) and re.search(
-                r"\b(reservation|booking)\b", normalized
+                r"\b(reservations?|bookings?)\b", normalized
             ):
                 parking_intent = "parking_reservations"
             else:
                 parking_intent = "parking"
 
         updates: dict[str, object] = {}
+        if (
+            decision.intent == "leave_eligibility"
+            and not leave_topic_signal
+        ):
+            updates.update(
+                domain="general",
+                intent="general",
+                confidence=max(decision.confidence, 0.95),
+                leave_type=None,
+                start_date=None,
+                end_date=None,
+            )
         if parking_intent:
             updates.update(
                 domain="parking",
@@ -1523,8 +1691,6 @@ class HRAssistantOrchestrator:
                 domain="leave", intent="holidays", confidence=max(decision.confidence, 0.98),
                 request_id=None, leave_type=None,
             )
-        elif apply_signal:
-            updates.update(domain="leave", intent="apply_leave", confidence=max(decision.confidence, 0.95))
         elif policy_signal:
             # A question about an organisation-wide rule can naturally use
             # "can I".  Prefer the explicit policy cue over that generic
@@ -1535,148 +1701,12 @@ class HRAssistantOrchestrator:
             )
         elif eligibility_signal:
             updates.update(domain="leave", intent="leave_eligibility", confidence=max(decision.confidence, 0.95))
+        elif apply_signal:
+            updates.update(domain="leave", intent="apply_leave", confidence=max(decision.confidence, 0.95))
         elif balance_signal and personal:
             updates.update(domain="leave", intent="leave_balance", confidence=max(decision.confidence, 0.95))
 
-        guarded_intent = updates.get("intent", decision.intent)
-        if guarded_intent in {"apply_leave", "leave_eligibility", "leave_balance"}:
-            updates["leave_type"] = explicit_type
-
-        if guarded_intent in {"apply_leave", "leave_eligibility", "calculate_leave_days", "holidays"}:
-            parsed_start, parsed_end = HRAssistantOrchestrator._extract_leave_dates(message, today)
-            if parsed_start and parsed_end:
-                updates.update(start_date=parsed_start, end_date=parsed_end)
-            elif not HRAssistantOrchestrator._contains_date_reference(message):
-                updates.update(start_date=None, end_date=None)
-
         return decision.model_copy(update=updates) if updates else decision
-
-    @staticmethod
-    def _extract_leave_dates(message: str, today: date | None = None) -> tuple[date | None, date | None]:
-        current = today or date.today()
-        normalized = message.casefold()
-        explicit_dates = HRAssistantOrchestrator._extract_explicit_leave_dates(message, current)
-        if len(explicit_dates) >= 2:
-            return explicit_dates[0], explicit_dates[1]
-
-        anchor = explicit_dates[0] if explicit_dates else HRAssistantOrchestrator._extract_single_leave_date(message, current)
-        duration_match = re.search(
-            r"\b(?:for\s+)?(\d{1,2})\s+(?:working\s+)?days?\s+(?:from|starting|start(?:ing)?\s+from)\b",
-            normalized,
-        )
-        trailing_duration_match = re.search(r"\bfor\s+(\d{1,2})\s+(?:working\s+)?days?\b", normalized)
-        duration = int((duration_match or trailing_duration_match).group(1)) if (duration_match or trailing_duration_match) else None
-        if duration and anchor:
-            return anchor, anchor + timedelta(days=duration - 1)
-        if anchor:
-            return anchor, anchor
-        return None, None
-
-    @staticmethod
-    def _extract_explicit_leave_dates(message: str, current: date) -> list[date]:
-        normalized = message.casefold()
-        month_values = {
-            "jan": 1, "january": 1,
-            "feb": 2, "february": 2,
-            "mar": 3, "march": 3,
-            "apr": 4, "april": 4,
-            "may": 5,
-            "jun": 6, "june": 6,
-            "jul": 7, "july": 7,
-            "aug": 8, "august": 8,
-            "sep": 9, "sept": 9, "september": 9,
-            "oct": 10, "october": 10,
-            "nov": 11, "november": 11,
-            "dec": 12, "december": 12,
-        }
-        month_pattern = "|".join(sorted(month_values, key=len, reverse=True))
-        candidates: list[tuple[int, date]] = []
-        for match in re.finditer(r"\b\d{4}-\d{2}-\d{2}\b", message):
-            candidates.append((match.start(), date.fromisoformat(match.group(0))))
-        for match in re.finditer(
-            rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
-            normalized,
-        ):
-            day = int(match.group(1))
-            month = month_values[match.group(2)]
-            year = int(match.group(3) or current.year)
-            candidates.append((match.start(), date(year, month, day)))
-        for match in re.finditer(
-            rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*|\s+)?(\d{{4}})?\b",
-            normalized,
-        ):
-            month = month_values[match.group(1)]
-            day = int(match.group(2))
-            year = int(match.group(3) or current.year)
-            candidates.append((match.start(), date(year, month, day)))
-        for match in re.finditer(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", normalized):
-            if match.start() > 0 and normalized[match.start() - 1] == "-":
-                continue
-            day = int(match.group(1))
-            month = int(match.group(2))
-            year = int(match.group(3) or current.year)
-            if year < 100:
-                year += 2000
-            try:
-                candidates.append((match.start(), date(year, month, day)))
-            except ValueError:
-                continue
-        return [item for _, item in sorted(candidates, key=lambda candidate: candidate[0])]
-
-    @staticmethod
-    def _extract_single_leave_date(message: str, current: date) -> date | None:
-        normalized = message.casefold()
-        tomorrow_pattern = r"(?:tomorrow|tomorow|tommorow|tommorrow)"
-        if re.search(rf"\bday after {tomorrow_pattern}\b", normalized):
-            return current + timedelta(days=2)
-        if re.search(rf"\b{tomorrow_pattern}\b", normalized):
-            return current + timedelta(days=1)
-        if re.search(r"\btoday\b", normalized):
-            return current
-
-        month_values = {
-            "jan": 1, "january": 1,
-            "feb": 2, "february": 2,
-            "mar": 3, "march": 3,
-            "apr": 4, "april": 4,
-            "may": 5,
-            "jun": 6, "june": 6,
-            "jul": 7, "july": 7,
-            "aug": 8, "august": 8,
-            "sep": 9, "sept": 9, "september": 9,
-            "oct": 10, "october": 10,
-            "nov": 11, "november": 11,
-            "dec": 12, "december": 12,
-        }
-        month_pattern = "|".join(sorted(month_values, key=len, reverse=True))
-        day_month = re.search(
-            rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
-            normalized,
-        )
-        month_day = re.search(
-            rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*|\s+)?(\d{{4}})?\b",
-            normalized,
-        )
-        if day_month:
-            day = int(day_month.group(1))
-            month = month_values[day_month.group(2)]
-            year = int(day_month.group(3) or current.year)
-            return date(year, month, day)
-        if month_day:
-            month = month_values[month_day.group(1)]
-            day = int(month_day.group(2))
-            year = int(month_day.group(3) or current.year)
-            return date(year, month, day)
-
-        numeric = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", normalized)
-        if numeric:
-            day = int(numeric.group(1))
-            month = int(numeric.group(2))
-            year = int(numeric.group(3) or current.year)
-            if year < 100:
-                year += 2000
-            return date(year, month, day)
-        return None
 
     @staticmethod
     def _contains_date_reference(message: str) -> bool:
@@ -1698,64 +1728,12 @@ class HRAssistantOrchestrator:
         return bool(re.search(f"(?:{month_or_weekday}|{relative_date}|{numeric_date})", message, re.I))
 
     @staticmethod
-    def _missing_leave_fields(route: RouteDecision) -> list[str]:
-        missing: list[str] = []
-        if route.intent in {"leave_eligibility", "apply_leave"} and not route.leave_type:
-            missing.append("the leave type")
-        if route.start_date is None:
-            missing.append("a start date")
-        if route.end_date is None:
-            missing.append("an end date")
-        return missing
-
-    @staticmethod
-    def _merge_leave_context(
-        existing: dict[str, str], route: RouteDecision, message: str
-    ) -> dict[str, str]:
-        context = dict(existing)
-        context["mode"] = "apply_leave"
-        explicit_type = HRAssistantOrchestrator._explicit_leave_type(message)
-        if explicit_type:
-            context["leave_type"] = explicit_type
-        elif route.leave_type:
-            context["leave_type"] = route.leave_type
-
-        parsed_start, parsed_end = HRAssistantOrchestrator._extract_leave_dates(message)
-        start_date = parsed_start or route.start_date
-        end_date = parsed_end or route.end_date
-        if start_date:
-            context["start_date"] = start_date.isoformat()
-        if end_date:
-            context["end_date"] = end_date.isoformat()
-
-        reason_match = re.search(r"\b(?:because|reason\s*:|due\s+to)\s+(.+)$", message, re.I)
-        if reason_match:
-            context["reason"] = reason_match.group(1).strip()
-        elif route.reason:
-            context["reason"] = route.reason
-        return context
-
-    @staticmethod
-    def _explicit_leave_type(message: str) -> str | None:
-        patterns = {
-            "CASUAL": r"\b(casual(?:\s+leave)?|casula(?:\s+leave)?|cl)\b",
-            "SICK": r"\b(sick(?:\s+leave)?|sl)\b",
-            "EARNED": r"\b(earned(?:\s+leave)?|privilege(?:\s+leave)?|el|pl)\b",
-        }
-        matches = [
-            leave_type
-            for leave_type, pattern in patterns.items()
-            if re.search(pattern, message, re.I)
-        ]
-        return matches[0] if len(matches) == 1 else None
-
-    @staticmethod
     def _message_is_only_leave_type(message: str) -> bool:
         normalized = " ".join(re.sub(r"[^\w]+", " ", message.casefold()).split())
         return normalized in {
             "casual", "casual leave", "casula", "casula leave", "cl",
             "sick", "sick leave", "sl",
-            "privilege", "privilege leave", "earned", "earned leave", "pl", "el",
+            "earned", "earned leave", "el",
         }
 
     @staticmethod
@@ -1779,33 +1757,18 @@ class HRAssistantOrchestrator:
         return value if value in {"leave", "policy", "onboarding", "parking", "general"} else None
 
     @staticmethod
-    def _safe_leave_context(value: object) -> dict[str, str]:
-        allowed = {"mode", "leave_type", "start_date", "end_date", "reason"}
-        if not isinstance(value, dict):
-            return {}
-        result = {
-            key: item
-            for key, item in value.items()
-            if key in allowed and isinstance(item, str) and item.strip()
-        }
-        if "leave_type" in result and result["leave_type"] not in {"CASUAL", "SICK", "EARNED"}:
-            result.pop("leave_type")
-        if result.get("mode") != "apply_leave":
-            result.pop("mode", None)
-        for field in ("start_date", "end_date"):
-            if field in result:
-                try:
-                    date.fromisoformat(result[field])
-                except ValueError:
-                    result.pop(field)
-        return result
+    def _safe_leave_plan(value: object) -> dict[str, object] | None:
+        """Keep a persisted plan only while it is well-formed and unexpired."""
+        inputs = stored_plan_inputs(value)
+        if inputs is None:
+            return None
+        expires_at = inputs.expires_at
+        now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
+        return value if expires_at > now else None  # type: ignore[return-value]
 
     @staticmethod
     def _safe_onboarding_context(value: object) -> dict[str, str]:
-        allowed = {
-            "name", "email", "designation", "department", "reporting_manager",
-            "joining_date", "location", "employment_type",
-        }
+        allowed = {*ONBOARDING_FIELDS, "plan_id", "fingerprint"}
         if not isinstance(value, dict):
             return {}
         return {
@@ -1813,6 +1776,22 @@ class HRAssistantOrchestrator:
             for key, item in value.items()
             if key in allowed and isinstance(item, str) and item.strip()
         }
+
+    @staticmethod
+    def _safe_parking_plan(value: object) -> dict[str, object] | None:
+        """Keep remembered parking dates and an unexpired parking plan."""
+        if not isinstance(value, dict) or not isinstance(value.get("dates"), list):
+            return None
+        try:
+            [date.fromisoformat(str(item)) for item in value["dates"]]
+            if value.get("expires_at"):
+                expires = datetime.fromisoformat(str(value["expires_at"]))
+                now = datetime.now(expires.tzinfo) if expires.tzinfo else datetime.now()
+                if expires <= now:
+                    return {"dates": value["dates"]}
+        except (TypeError, ValueError):
+            return None
+        return value
 
     @staticmethod
     def _safe_parking_context(value: object) -> dict[str, str]:
@@ -1824,6 +1803,7 @@ class HRAssistantOrchestrator:
             "registration_number",
             "vehicle_type",
             "make_model",
+            "offer",
         }
         result = {
             key: item.strip()

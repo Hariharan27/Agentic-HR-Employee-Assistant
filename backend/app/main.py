@@ -2,10 +2,11 @@ import logging
 import time
 from uuid import uuid4
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.api.dependencies import require_password_changed
 from app.api.routes.auth import router as auth_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.leave import router as leave_router
@@ -30,13 +31,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Everything except login, profile and password change requires a non-temporary password.
+_ACTIVE_PASSWORD = [Depends(require_password_changed)]
 app.include_router(auth_router)
-app.include_router(chat_router)
-app.include_router(leave_router)
-app.include_router(onboarding_router)
-app.include_router(onboarding_admin_router)
-app.include_router(parking_router)
-app.include_router(parking_admin_router)
+app.include_router(chat_router, dependencies=_ACTIVE_PASSWORD)
+app.include_router(leave_router, dependencies=_ACTIVE_PASSWORD)
+app.include_router(onboarding_router, dependencies=_ACTIVE_PASSWORD)
+app.include_router(onboarding_admin_router, dependencies=_ACTIVE_PASSWORD)
+app.include_router(parking_router, dependencies=_ACTIVE_PASSWORD)
+app.include_router(parking_admin_router, dependencies=_ACTIVE_PASSWORD)
 app.include_router(inbound_email_router)
 
 

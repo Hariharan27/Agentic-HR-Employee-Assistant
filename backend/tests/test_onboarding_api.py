@@ -75,6 +75,7 @@ def test_manager_can_preview_plan_without_creating_data(client, db_session):
         "LAPTOP",
         "ACCESS_CARD",
         "TEMPORARY_ACCESS_CARD",
+        "PAYROLL_SETUP",
     ]
     assert db_session.scalar(select(func.count()).select_from(OnboardingRequest)) == 0
 
@@ -142,7 +143,7 @@ def test_manager_can_read_status_by_id_or_employee_name(client, db_session):
     assert by_id.status_code == 200
     assert by_name.status_code == 200
     assert by_id.json()["id"] == by_name.json()["id"] == created.id
-    assert by_name.json()["total_tasks"] == 4
+    assert by_name.json()["total_tasks"] == 5
 
 
 def test_create_handler_produces_json_safe_arguments_and_rejects_missing_fields(db_session):
@@ -184,6 +185,33 @@ def test_hr_admin_queue_and_activated_employee_can_log_in(client, db_session):
 
     assert login_response.status_code == 200
     assert login_response.json()["role"] == "EMPLOYEE"
+    assert login_response.json()["must_change_password"] is True
+    temporary = activation.temporary_password
+    headers = _headers(login_response.json()["access_token"])
+
+    # Until the temporary password is changed, only the profile and password change work.
+    blocked = client.get("/api/v1/leave/requests", headers=headers)
+    assert blocked.status_code == 403
+    assert blocked.json()["error"]["code"] == "password_change_required"
+    assert client.get("/api/v1/auth/me", headers=headers).json()["must_change_password"] is True
+
+    weak = client.post("/api/v1/auth/change-password", headers=headers,
+                       json={"current_password": temporary, "new_password": "short1"})
+    assert weak.status_code == 400
+    assert "at least 10 characters" in weak.json()["error"]["message"]
+    wrong = client.post("/api/v1/auth/change-password", headers=headers,
+                        json={"current_password": "not-it", "new_password": "Nila!Desk-2026"})
+    assert wrong.status_code == 401
+
+    changed = client.post("/api/v1/auth/change-password", headers=headers,
+                          json={"current_password": temporary, "new_password": "Nila!Desk-2026"})
+    assert changed.status_code == 200
+    assert changed.json()["must_change_password"] is False
+    assert client.get("/api/v1/leave/requests", headers=headers).status_code == 200
+    old = client.post("/api/v1/auth/login", json={"username": activation.username, "password": temporary})
+    assert old.status_code == 401
+    relogin = client.post("/api/v1/auth/login", json={"username": activation.username, "password": "Nila!Desk-2026"})
+    assert relogin.json()["must_change_password"] is False
 
 
 def test_non_admin_cannot_read_onboarding_approval_queue(client):

@@ -13,6 +13,10 @@ class AuthorizationError(ApplicationError):
     code = "forbidden"
 
 
+class PasswordChangeRequiredError(AuthorizationError):
+    code = "password_change_required"
+
+
 class NotFoundError(ApplicationError):
     status_code = 404
     code = "not_found"
@@ -43,6 +47,11 @@ class PendingActionExpiredError(ApplicationError):
 class MissingPolicyEvidenceError(ApplicationError):
     status_code = 404
     code = "missing_policy_evidence"
+
+
+class IntegrationNotConfiguredError(ApplicationError):
+    status_code = 503
+    code = "integration_not_configured"
 
 
 class LLMServiceError(ApplicationError):

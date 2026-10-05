@@ -196,18 +196,35 @@ def run_cases(
     signatures: dict[tuple[str, int], list[tuple]] = defaultdict(list)
     with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout) as client:
         token_cache: dict[tuple[str, str], str] = {}
+        runnable = [case for case in cases if include_mutating or not case.mutating]
+        total_runs = len(runnable) * repeat
+        run_number = 0
+        run_started = time.perf_counter()
         for case in cases:
             if case.mutating and not include_mutating:
                 results.append({"case_id": case.id, "category": case.category, "skipped": True,
                                 "reason": "mutating case; pass --include-mutating to run"})
                 continue
             for repetition in range(repeat):
+                run_number += 1
+                case_started = time.perf_counter()
+                first_result = len(results)
                 session_id = f"eval-{case.id[:42]}-{repetition}-{uuid4().hex[:8]}"
                 headers = {}
                 if case.auth == "valid":
                     credentials = (case.username or username, case.password or password)
                     if credentials not in token_cache:
-                        token_cache[credentials] = login(client, *credentials)
+                        try:
+                            token_cache[credentials] = login(client, *credentials)
+                        except httpx.HTTPError as exc:
+                            # A backend restart must not abort the whole run: record and move on.
+                            results.append({
+                                "case_id": case.id, "category": case.category, "tags": case.tags,
+                                "repetition": repetition + 1, "turn": 1, "passed": False,
+                                "failures": [f"login failed: {exc}"], "latency_ms": 0,
+                            })
+                            print(f"[{run_number}/{total_runs}] FAIL {case.id} (login failed: {exc})", flush=True)
+                            continue
                     headers["Authorization"] = f"Bearer {token_cache[credentials]}"
                 elif case.auth == "invalid":
                     headers["Authorization"] = "Bearer invalid-evaluation-token"
@@ -250,6 +267,14 @@ def run_cases(
                             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                         })
                         break
+                case_results = results[first_result:]
+                ok = bool(case_results) and all(item.get("passed") for item in case_results)
+                elapsed = time.perf_counter() - run_started
+                print(
+                    f"[{run_number}/{total_runs}] {'PASS' if ok else 'FAIL'} {case.id} "
+                    f"(rep {repetition + 1}, {time.perf_counter() - case_started:.1f}s, total {elapsed / 60:.1f} min)",
+                    flush=True,
+                )
 
     executed = [result for result in results if not result.get("skipped")]
     passed = sum(bool(result.get("passed")) for result in executed)
@@ -329,7 +354,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, default=default_dataset)
     parser.add_argument("--base-url", default=os.getenv("EVAL_BASE_URL", "http://localhost:8000"))
     parser.add_argument("--username", default=os.getenv("EVAL_USERNAME", "employee"))
-    parser.add_argument("--password", default=os.getenv("EVAL_PASSWORD", "employee123"))
+    parser.add_argument("--password", default=os.getenv("EVAL_PASSWORD", "Advik!Desk-2026"))
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--case", action="append", default=[], help="Run only an exact case id")
     parser.add_argument("--category", action="append", default=[])

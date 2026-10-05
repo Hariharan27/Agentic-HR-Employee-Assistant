@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,7 +35,14 @@ class Settings(BaseSettings):
     complex_max_output_tokens: int = 1200
     complex_escalation_threshold: float = 0.70
     llm_max_retries: int = 1
-    llm_max_calls_per_request: int = 3
+    llm_max_calls_per_request: int = Field(default=8, ge=1, le=20)
+    leave_agent_max_iterations: int = Field(default=6, ge=1, le=12)
+    leave_agent_max_tool_calls: int = Field(default=8, ge=1, le=20)
+    # Use the provider's native tool calling instead of the JSON decision protocol.
+    # Keep False until `python -m app.llm.probe` confirms the model supports it.
+    leave_agent_native_tools: bool = False
+    # Extra model turns allowed to repair invalid output or an ungrounded answer.
+    leave_agent_max_repairs: int = Field(default=1, ge=0, le=3)
     parking_booking_horizon_days: int = Field(default=30, ge=1, le=365)
     parking_cancellation_cutoff_hour: int = Field(default=20, ge=0, le=23)
     parking_check_in_open_hour: int = Field(default=7, ge=0, le=23)
@@ -50,6 +57,14 @@ class Settings(BaseSettings):
     it_notification_email: str = "it@example.com"
     finance_notification_email: str = "finance@example.com"
     facilities_notification_email: str = "facilities@example.com"
+    # Shared secret the email provider sends as X-Inbound-Token on /api/v1/inbound/email.
+    # Empty disables the endpoint.
+    inbound_email_token: str = ""
+    # Optional Langfuse tracing (self-hosted or cloud); off unless all three are set.
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    # LANGFUSE_BASE_URL is the name the Langfuse SDK itself uses; either works.
+    langfuse_host: str = Field(default="", validation_alias=AliasChoices("LANGFUSE_HOST", "LANGFUSE_BASE_URL"))
     cors_origins: str = "http://localhost:5173"
     log_level: str = "INFO"
 

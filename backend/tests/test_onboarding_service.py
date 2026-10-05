@@ -51,9 +51,10 @@ def test_manager_creates_onboarding_with_only_core_provisioning_tasks(db_session
         OnboardingTaskType.LAPTOP,
         OnboardingTaskType.ACCESS_CARD,
         OnboardingTaskType.TEMPORARY_ACCESS_CARD,
+        OnboardingTaskType.PAYROLL_SETUP,
     )
     assert created.completed_tasks == 0
-    assert created.total_tasks == 4
+    assert created.total_tasks == 5
 
 
 def test_hr_can_create_onboarding(db_session):
@@ -102,7 +103,7 @@ def test_completing_all_tasks_completes_request(db_session):
             manager, created.id, task.id, OnboardingTaskStatus.COMPLETED
         )
 
-    assert updated.completed_tasks == 4
+    assert updated.completed_tasks == 5
     assert updated.status is OnboardingStatus.COMPLETED
 
 

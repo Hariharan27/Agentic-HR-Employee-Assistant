@@ -1,12 +1,16 @@
-from fastapi import APIRouter
+import hmac
+from typing import Annotated
 
-from app.api.dependencies import Database
+from fastapi import APIRouter, Header
+
+from app.api.dependencies import AppSettings, Database
 from app.api.schemas.notifications import InboundEmailRequest
 from app.application.notifications.inbound import InboundEmailProcessor
 from app.application.notifications.models import InboundEmail
 from app.application.onboarding.reply_interpreter import OnboardingReplyInterpreter
 from app.application.onboarding.service import OnboardingService
-from app.core.config import get_settings
+from app.core.config import Settings
+from app.core.exceptions import AuthenticationError, IntegrationNotConfiguredError
 from app.infrastructure.llm.mantle import MantleLLMGateway
 from app.infrastructure.repositories.onboarding import SQLAlchemyOnboardingRepository
 
@@ -17,12 +21,23 @@ router = APIRouter(
 )
 
 
+def verify_inbound_token(token: str | None, settings: Settings) -> None:
+    """Only the configured email provider may post department replies."""
+    expected = settings.inbound_email_token
+    if not expected:
+        raise IntegrationNotConfiguredError("Inbound email processing is not configured")
+    if not token or not hmac.compare_digest(token.encode(), expected.encode()):
+        raise AuthenticationError("Invalid inbound integration token")
+
+
 @router.post("/email")
 def process_inbound_email(
     body: InboundEmailRequest,
     db: Database,
+    settings: AppSettings,
+    x_inbound_token: Annotated[str | None, Header()] = None,
 ) -> dict:
-    settings = get_settings()
+    verify_inbound_token(x_inbound_token, settings)
 
     email = InboundEmail(
         sender=body.sender,

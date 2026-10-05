@@ -5,6 +5,7 @@ export type Profile = {
   name: string;
   email: string;
   role: "EMPLOYEE" | "MANAGER" | "HR" | "HR_ADMIN" | "PARKING_ADMIN";
+  must_change_password?: boolean;
 };
 
 export type Source = {
@@ -20,6 +21,31 @@ export type ChatResponse = {
   intent?: string | null;
   sources: Source[];
   pending_action?: string | null;
+  agent_activity: AgentActivity[];
+  onboarding_draft?: Record<string, string> | null;
+};
+
+export type OnboardingFormPayload = {
+  name: string;
+  email: string;
+  designation: string;
+  department: string;
+  reporting_manager: string;
+  joining_date: string;
+  location: string;
+  employment_type: string;
+};
+
+export type AgentActivity = {
+  tool: string;
+  label: string;
+  status: "success" | "error";
+};
+
+export type LiveStep = {
+  id: string;
+  label: string;
+  status: "running" | "success" | "error";
 };
 
 export type ChatMessage = {
@@ -28,8 +54,17 @@ export type ChatMessage = {
   text: string;
   sources?: Source[];
   intent?: string | null;
+  agentActivity?: AgentActivity[];
   showOnboardingForm?: boolean;
   showVehicleForm?: boolean;
+  /** "denied" renders the reply as a "not allowed for your role" card. */
+  kind?: "denied";
+};
+
+export type Vehicle = {
+  registration_number: string;
+  vehicle_type: "CAR" | "MOTORCYCLE";
+  make_model?: string | null;
 };
 
 export type LeaveRequest = {

@@ -38,6 +38,40 @@ class ApplyLeaveHandler:
         )
 
 
+class ApplyLeavePlanArguments(BaseModel):
+    leave_type: str = Field(min_length=1, max_length=32)
+    dates: list[date] = Field(min_length=1, max_length=62)
+    reason: str | None = Field(default=None, max_length=1000)
+    split_with: str | None = Field(default=None, max_length=32)
+    fingerprint: str = Field(min_length=8, max_length=64)
+
+
+class ApplyLeavePlanHandler:
+    """Confirm a leave plan: rebuild it, require it unchanged, create one request per segment."""
+
+    action_type = "apply_leave_plan"
+
+    def __init__(self, leave_service: LeaveService):
+        self.leave_service = leave_service
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return ApplyLeavePlanArguments.model_validate(arguments).model_dump(mode="json")
+        except PydanticValidationError as exc:
+            raise ValidationError("Invalid arguments for leave application") from exc
+
+    def execute(self, actor: AuthenticatedUser, arguments: dict[str, Any]):
+        validated = ApplyLeavePlanArguments.model_validate(arguments)
+        return self.leave_service.stage_leave_plan(
+            actor,
+            validated.leave_type,
+            validated.dates,
+            validated.fingerprint,
+            validated.reason,
+            validated.split_with,
+        )
+
+
 class LeaveRequestDecisionArguments(BaseModel):
     request_id: int = Field(gt=0)
     comment: str | None = Field(default=None, max_length=1000)
