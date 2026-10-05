@@ -113,6 +113,7 @@ class LeaveService:
         leave_type: str,
         dates: list[date] | tuple[date, ...],
         reason: str | None = None,
+        split_with: str | None = None,
     ) -> LeavePlan:
         """Validate explicit leave dates and group them into contiguous request segments.
 
@@ -136,17 +137,34 @@ class LeaveService:
         )
         working_dates = [day for day in requested if working(day)]
         requested_set = set(requested)
-        groups: list[list[date]] = []
-        for day in working_dates:
-            if groups:
-                previous = groups[-1][-1]
+
+        balances = {item.leave_type: item.available_days for item in self.get_leave_balance(actor)}
+        if parsed not in balances:
+            raise NotFoundError("No leave balance was found for the requested leave type")
+        available = balances[parsed]
+        secondary = self._parse_leave_type(split_with) if split_with else None
+        if secondary is parsed:
+            raise ValidationError("A split must combine two different leave types")
+        if secondary is not None and secondary not in balances:
+            raise NotFoundError(f"No {secondary.value.title()} leave balance was found")
+        # Requested type first, in date order; the remaining days use the agreed second type.
+        primary_count = len(working_dates) if secondary is None else int(min(available, len(working_dates)))
+        assigned = [
+            (day, parsed if index < primary_count else secondary)
+            for index, day in enumerate(working_dates)
+        ]
+
+        groups: list[list[tuple[date, LeaveType]]] = []
+        for day, kind in assigned:
+            if groups and groups[-1][-1][1] is kind:
+                previous = groups[-1][-1][0]
                 gap = [previous + timedelta(days=offset) for offset in range(1, (day - previous).days)]
                 if all(item in requested_set or not working(item) for item in gap):
-                    groups[-1].append(day)
+                    groups[-1].append((day, kind))
                     continue
-            groups.append([day])
+            groups.append([(day, kind)])
         segments = tuple(
-            PlanSegment(parsed, group[0], group[-1], Decimal(len(group))) for group in groups
+            PlanSegment(group[0][1], group[0][0], group[-1][0], Decimal(len(group))) for group in groups
         )
 
         problems: list[str] = []
@@ -167,19 +185,29 @@ class LeaveService:
             )
         if not segments:
             problems.append("The selected dates have no working days")
-        balances = self.get_leave_balance(actor, parsed.value)
-        available = balances[0].available_days
         for segment in segments:
             if self.repository.has_overlapping_request(actor.employee_id, segment.start_date, segment.end_date):
                 problems.append(
                     f"An active leave request overlaps {segment.start_date.isoformat()}"
                     + ("" if segment.start_date == segment.end_date else f" to {segment.end_date.isoformat()}")
                 )
-        total = sum((item.working_days for item in segments), Decimal("0"))
-        if total > available:
-            problems.append(
-                f"Insufficient {parsed.value.title()} balance: needs {total.normalize():f} day(s), "
-                f"{available.normalize():f} available"
+        days_by_type: dict[LeaveType, Decimal] = {}
+        for segment in segments:
+            days_by_type[segment.leave_type] = days_by_type.get(segment.leave_type, Decimal("0")) + segment.working_days
+        for kind, needed in days_by_type.items():
+            if needed > balances[kind]:
+                problems.append(
+                    f"Insufficient {kind.value.title()} balance: needs {needed.normalize():f} day(s), "
+                    f"{balances[kind].normalize():f} available"
+                )
+        split_options: tuple[tuple[LeaveType, Decimal], ...] = ()
+        primary_needed = days_by_type.get(parsed, Decimal("0"))
+        if secondary is None and primary_needed > available:
+            shortfall = primary_needed - available
+            split_options = tuple(
+                (kind, balances[kind])
+                for kind in LeaveType
+                if kind is not parsed and kind in balances and balances[kind] >= shortfall
             )
         normalized_reason = reason.strip() if reason and reason.strip() else None
         plan = LeavePlan(
@@ -190,6 +218,9 @@ class LeaveService:
             available_before=available,
             problems=tuple(problems),
             reason=normalized_reason,
+            split_with=secondary,
+            secondary_available=balances[secondary] if secondary is not None else None,
+            split_options=split_options,
         )
         return replace(
             plan,
@@ -205,9 +236,10 @@ class LeaveService:
         dates: list[date] | tuple[date, ...],
         expected_fingerprint: str,
         reason: str | None = None,
+        split_with: str | None = None,
     ) -> list[LeaveRequestData]:
         """Rebuild the confirmed plan, require it unchanged, and stage one request per segment."""
-        plan = self.build_leave_plan(actor, leave_type, dates, reason)
+        plan = self.build_leave_plan(actor, leave_type, dates, reason, split_with)
         if plan.fingerprint != expected_fingerprint:
             raise ConflictError(
                 "The leave details changed since this confirmation was prepared "

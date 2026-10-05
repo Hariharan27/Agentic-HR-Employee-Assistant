@@ -48,6 +48,11 @@ class BuildPlanArguments(ToolArguments):
     leave_type: str = Field(min_length=1, max_length=32)
     dates: list[date] = Field(min_length=1, max_length=MAX_RESOLVED_DAYS)
     reason: str | None = Field(default=None, max_length=1000)
+    split_with: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Second leave type for the days the first type cannot cover; only after the employee agrees.",
+    )
 
 
 class RequestListArguments(ToolArguments):
@@ -305,7 +310,7 @@ class LeaveToolExecutor:
 
     def _build_leave_plan(self, arguments: BuildPlanArguments, **_: Any) -> LeaveToolExecution:
         plan = self.leave.build_leave_plan(
-            self.actor, arguments.leave_type, arguments.dates, arguments.reason
+            self.actor, arguments.leave_type, arguments.dates, arguments.reason, arguments.split_with
         )
         data = plan.to_dict()
         return LeaveToolExecution(
@@ -401,19 +406,20 @@ class LeaveToolExecutor:
         **_: Any,
     ) -> LeaveToolExecution:
         inputs = stored_plan_inputs(active_plan)
-        if inputs is None or inputs[3] != arguments.plan_id:
+        if inputs is None or inputs.plan_id != arguments.plan_id:
             return self._error(
                 "prepare_leave_application",
                 "No active leave plan has that plan_id; build a leave plan for the requested dates first",
             )
-        leave_type, dates, reason, _, fingerprint, expires_at = inputs
-        if expires_at <= self.leave.now():
+        if inputs.expires_at <= self.leave.now():
             return self._error(
                 "prepare_leave_application",
                 "The leave plan expired; build it again for the requested dates",
             )
-        plan = self.leave.build_leave_plan(self.actor, leave_type, dates, reason)
-        if plan.compute_fingerprint() != fingerprint:
+        plan = self.leave.build_leave_plan(
+            self.actor, inputs.leave_type, inputs.dates, inputs.reason, inputs.split_with
+        )
+        if plan.compute_fingerprint() != inputs.fingerprint:
             data = plan.to_dict()
             return LeaveToolExecution(
                 "prepare_leave_application",
@@ -438,7 +444,8 @@ class LeaveToolExecutor:
                 "leave_type": plan.leave_type.value,
                 "dates": [item.isoformat() for item in plan.requested_dates],
                 "reason": plan.reason,
-                "fingerprint": fingerprint,
+                "split_with": plan.split_with.value if plan.split_with else None,
+                "fingerprint": inputs.fingerprint,
             },
             summary,
         )

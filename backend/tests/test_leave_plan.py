@@ -144,3 +144,39 @@ def test_holidays_follow_the_employee_location_calendar(db_session):
     assert [(item.day, item.name) for item in chennai.excluded_days] == [(date(2026, 10, 19), "Ayudha Poojai")]
     assert [(item.day, item.name) for item in bengaluru.excluded_days] == [(date(2026, 11, 10), "Diwali")]
     assert "holiday: Ayudha Poojai" in chennai.summary()
+
+
+def test_short_balance_lists_split_options_but_does_not_split_by_itself(db_session):
+    plan = service(db_session).build_leave_plan(employee(db_session), "CASUAL", dates("12 Oct to 16 Oct"))
+
+    assert not plan.eligible
+    assert [kind.value for kind, _ in plan.split_options] == ["EARNED", "SICK"]
+    assert {item.leave_type.value for item in plan.segments} == {"CASUAL"}
+    assert "You could cover the rest with Earned leave (9 available)" in plan.summary()
+
+
+def test_agreed_split_fills_requested_type_first_then_the_second_type(db_session):
+    leave = service(db_session)
+    actor = employee(db_session)
+
+    plan = leave.build_leave_plan(actor, "CASUAL", dates("12 Oct to 16 Oct"), split_with="EARNED")
+
+    assert plan.eligible
+    assert [(s.leave_type.value, s.start_date, s.end_date, s.working_days) for s in plan.segments] == [
+        ("CASUAL", date(2026, 10, 12), date(2026, 10, 15), Decimal("4")),
+        ("EARNED", date(2026, 10, 16), date(2026, 10, 16), Decimal("1")),
+    ]
+    assert plan.confirmation_summary().startswith(
+        "Apply for 5 working day(s): 4 Casual on 2026-10-12 to 2026-10-15 + 1 Earned on 2026-10-16 (Fri)"
+    )
+
+    created = leave.stage_leave_plan(actor, "CASUAL", plan.requested_dates, plan.fingerprint, split_with="EARNED")
+
+    assert [(item.leave_type.value, item.working_days) for item in created] == [("CASUAL", 4), ("EARNED", 1)]
+
+
+def test_split_with_the_same_type_is_rejected(db_session):
+    from app.core.exceptions import ValidationError
+
+    with pytest.raises(ValidationError, match="two different leave types"):
+        service(db_session).build_leave_plan(employee(db_session), "CASUAL", [date(2026, 10, 12)], split_with="CL")

@@ -20,7 +20,10 @@ class LeaveType(StrEnum):
             "CASUAL_LEAVE": cls.CASUAL,
             "SICK_LEAVE": cls.SICK,
         }
-        return aliases.get(normalized, cls(normalized))
+        # Look up the alias first: dict.get(key, cls(key)) would evaluate cls(key) eagerly and fail.
+        if normalized in aliases:
+            return aliases[normalized]
+        return cls(normalized)
 
 
 class LeaveStatus(StrEnum):

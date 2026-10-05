@@ -34,6 +34,9 @@ Leave dates and applications:
   prepare_leave_application with that plan_id. If the latest message changes dates or type, build
   a new plan first. Never prepare an application the employee has not seen as a plan.
 - After an eligible plan for a "can I" question, answer and offer to apply; do not prepare it.
+- If a plan is not eligible only because the balance is short and it lists split_options, offer
+  to cover the remaining days with one of those types. Only after the employee agrees, call
+  build_leave_plan again with the same dates and split_with set to the type they chose.
 - Only CASUAL, SICK and EARNED leave are managed here. Privilege Leave (PL) is a separate legacy
   balance, not Earned Leave: say it is handled in iAssistant and offer the other types.
 - For rule questions inside a leave conversation (carry forward, lapse, encashment, approval,

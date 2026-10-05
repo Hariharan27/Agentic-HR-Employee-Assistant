@@ -42,6 +42,7 @@ class ApplyLeavePlanArguments(BaseModel):
     leave_type: str = Field(min_length=1, max_length=32)
     dates: list[date] = Field(min_length=1, max_length=62)
     reason: str | None = Field(default=None, max_length=1000)
+    split_with: str | None = Field(default=None, max_length=32)
     fingerprint: str = Field(min_length=8, max_length=64)
 
 
@@ -67,6 +68,7 @@ class ApplyLeavePlanHandler:
             validated.dates,
             validated.fingerprint,
             validated.reason,
+            validated.split_with,
         )
 
 

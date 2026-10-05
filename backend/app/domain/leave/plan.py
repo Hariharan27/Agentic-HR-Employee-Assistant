@@ -39,6 +39,11 @@ class LeavePlan:
     available_before: Decimal
     problems: tuple[str, ...]
     reason: str | None = None
+    # A split the employee agreed to: remaining days use this second type.
+    split_with: LeaveType | None = None
+    secondary_available: Decimal | None = None
+    # When the requested type is short: other types that could cover the shortfall.
+    split_options: tuple[tuple[LeaveType, Decimal], ...] = ()
     plan_id: str = ""
     expires_at: datetime | None = None
     fingerprint: str = field(default="")
@@ -51,31 +56,43 @@ class LeavePlan:
     def eligible(self) -> bool:
         return not self.problems and bool(self.segments)
 
+    def days_by_type(self) -> dict[LeaveType, Decimal]:
+        totals: dict[LeaveType, Decimal] = {}
+        for item in self.segments:
+            totals[item.leave_type] = totals.get(item.leave_type, Decimal("0")) + item.working_days
+        return totals
+
     @property
     def available_after(self) -> Decimal:
-        return self.available_before - self.total_working_days
+        return self.available_before - self.days_by_type().get(self.leave_type, Decimal("0"))
 
     def compute_fingerprint(self) -> str:
         payload = {
             "type": self.leave_type.value,
+            "split_with": self.split_with.value if self.split_with else None,
             "segments": [
                 [s.leave_type.value, s.start_date.isoformat(), s.end_date.isoformat(), _number(s.working_days)]
                 for s in self.segments
             ],
             "excluded": [[e.day.isoformat(), e.reason] for e in self.excluded_days],
             "available": _number(self.available_before),
+            "secondary_available": _number(self.secondary_available) if self.secondary_available is not None else None,
             "problems": list(self.problems),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
-    def segment_text(self) -> str:
+    @staticmethod
+    def _segment_text(segments: tuple[PlanSegment, ...] | list[PlanSegment]) -> str:
         parts = []
-        for item in self.segments:
+        for item in segments:
             if item.start_date == item.end_date:
                 parts.append(f"{item.start_date.isoformat()} ({item.start_date.strftime('%a')})")
             else:
                 parts.append(f"{item.start_date.isoformat()} to {item.end_date.isoformat()}")
         return "; ".join(parts)
+
+    def segment_text(self) -> str:
+        return self._segment_text(self.segments)
 
     def excluded_text(self) -> str:
         return ", ".join(
@@ -84,14 +101,21 @@ class LeavePlan:
             for item in self.excluded_days
         )
 
+    def _by_type_text(self) -> str:
+        parts = []
+        for kind, days in self.days_by_type().items():
+            segments = [item for item in self.segments if item.leave_type is kind]
+            parts.append(f"{_number(days)} {kind.value.title()} on {self._segment_text(segments)}")
+        return " + ".join(parts)
+
     def summary(self) -> str:
         label = self.leave_type.value.title()
         if not self.segments:
             text = f"{label} leave: no working days in the requested dates."
+        elif self.split_with is not None:
+            text = f"Leave plan: {_number(self.total_working_days)} working day(s): {self._by_type_text()}."
         else:
-            text = (
-                f"{label} leave: {_number(self.total_working_days)} working day(s) on {self.segment_text()}."
-            )
+            text = f"{label} leave: {_number(self.total_working_days)} working day(s) on {self.segment_text()}."
         if self.excluded_days:
             text += f" Not counted: {self.excluded_text()}."
         if self.eligible:
@@ -99,14 +123,26 @@ class LeavePlan:
                 f" You are eligible. {label} balance {_number(self.available_before)} available, "
                 f"{_number(self.available_after)} after this leave."
             )
+            if self.split_with is not None and self.secondary_available is not None:
+                used = self.days_by_type().get(self.split_with, Decimal("0"))
+                text += (
+                    f" {self.split_with.value.title()} balance {_number(self.secondary_available)} available, "
+                    f"{_number(self.secondary_available - used)} after this leave."
+                )
         else:
             text += " You are not eligible: " + "; ".join(self.problems) + "."
+            if self.split_options:
+                text += " You could cover the rest with " + " or ".join(
+                    f"{kind.value.title()} leave ({_number(days)} available)" for kind, days in self.split_options
+                ) + "."
         return text
 
     def confirmation_summary(self) -> str:
         label = self.leave_type.value.title()
         days = _number(self.total_working_days)
-        if len(self.segments) == 1:
+        if self.split_with is not None:
+            text = f"Apply for {days} working day(s): {self._by_type_text()}"
+        elif len(self.segments) == 1:
             segment = self.segments[0]
             text = (
                 f"Apply for {days} working day(s) of {label} leave from "
@@ -122,6 +158,7 @@ class LeavePlan:
         return {
             "plan_id": self.plan_id,
             "leave_type": self.leave_type.value,
+            "split_with": self.split_with.value if self.split_with else None,
             "requested_dates": [item.isoformat() for item in self.requested_dates],
             "segments": [
                 {
@@ -132,6 +169,7 @@ class LeavePlan:
                 }
                 for item in self.segments
             ],
+            "days_by_type": {kind.value: _number(days) for kind, days in self.days_by_type().items()},
             "excluded_days": [
                 {"date": item.day.isoformat(), "reason": item.reason, **({"holiday": item.name} if item.name else {})}
                 for item in self.excluded_days
@@ -141,6 +179,9 @@ class LeavePlan:
             "available_after": _number(self.available_after),
             "eligible": self.eligible,
             "problems": list(self.problems),
+            "split_options": [
+                {"leave_type": kind.value, "available": _number(days)} for kind, days in self.split_options
+            ],
             "reason": self.reason,
             "summary": self.summary(),
             "fingerprint": self.fingerprint,
@@ -152,8 +193,21 @@ def plan_ttl() -> timedelta:
     return timedelta(minutes=30)
 
 
-def stored_plan_inputs(value: object) -> tuple[str, tuple[date, ...], str | None, str, str, datetime] | None:
-    """Validate a plan persisted on the conversation and return what is needed to rebuild it."""
+@dataclass(frozen=True, slots=True)
+class StoredPlan:
+    """What is needed to rebuild a plan persisted on the conversation."""
+
+    plan_id: str
+    leave_type: str
+    dates: tuple[date, ...]
+    reason: str | None
+    split_with: str | None
+    fingerprint: str
+    expires_at: datetime
+
+
+def stored_plan_inputs(value: object) -> StoredPlan | None:
+    """Validate a plan persisted on the conversation."""
     if not isinstance(value, dict):
         return None
     try:
@@ -162,9 +216,14 @@ def stored_plan_inputs(value: object) -> tuple[str, tuple[date, ...], str | None
         dates = tuple(sorted({date.fromisoformat(str(item)) for item in value["requested_dates"]}))
         fingerprint = str(value["fingerprint"])
         expires_at = datetime.fromisoformat(str(value["expires_at"]))
+        split_raw = value.get("split_with")
+        split_with = LeaveType.parse(str(split_raw)).value if split_raw else None
     except (KeyError, TypeError, ValueError):
         return None
     if not plan_id or not dates or not fingerprint:
         return None
     reason = value.get("reason")
-    return leave_type, dates, reason if isinstance(reason, str) and reason.strip() else None, plan_id, fingerprint, expires_at
+    return StoredPlan(
+        plan_id, leave_type, dates, reason if isinstance(reason, str) and reason.strip() else None,
+        split_with, fingerprint, expires_at,
+    )

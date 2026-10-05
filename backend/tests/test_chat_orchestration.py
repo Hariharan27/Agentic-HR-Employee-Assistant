@@ -2034,3 +2034,27 @@ def test_leave_rules_tool_returns_policy_rules_with_page_sources(db_session):
     assert rules["holidays_not_counted"]["enforced_by_system"] is True
     assert rules["earned_carry_forward"]["source"]["page"] == 2
     assert {source["document"] for source in execution.sources} == {"Revised Leave Policy - I2I.pdf"}
+
+
+def test_split_leave_is_offered_then_built_only_after_the_employee_agrees(db_session):
+    days = ["2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16"]
+    llm = FakeLLM([
+        route(intent="apply_leave", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": days}}]}),
+        json.dumps({"action": "final", "message": "You have 4 casual days, so 1 day is short. Shall I use 1 earned day for the rest?"}),
+        route(domain="general", intent="general"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": days, "split_with": "EARNED"}}]}),
+    ])
+    service = orchestrator(db_session, llm)
+
+    offer = service.chat("split", "apply casual leave from 12 Oct to 16 Oct")
+    assert offer.pending_action is None
+    # The scripted turn rebuilds the plan with split_with; the simulated model then prepares it.
+    proposal = service.chat("split", "yes, use earned leave for the rest")
+
+    assert "4 Casual on 2026-10-12 to 2026-10-15 + 1 Earned on 2026-10-16" in proposal.pending_action
+    confirmed = service.chat("split", "yes")
+    assert "were submitted successfully" in confirmed.message
+    assert sorted((item.leave_type, item.working_days) for item in db_session.scalars(select(LeaveRequest)).all()) == [
+        ("CASUAL", 4), ("EARNED", 1)
+    ]

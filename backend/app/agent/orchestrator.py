@@ -1554,7 +1554,7 @@ class HRAssistantOrchestrator:
         inputs = stored_plan_inputs(value)
         if inputs is None:
             return None
-        expires_at = inputs[5]
+        expires_at = inputs.expires_at
         now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
         return value if expires_at > now else None  # type: ignore[return-value]
 
