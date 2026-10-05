@@ -196,12 +196,19 @@ def run_cases(
     signatures: dict[tuple[str, int], list[tuple]] = defaultdict(list)
     with httpx.Client(base_url=base_url.rstrip("/"), timeout=timeout) as client:
         token_cache: dict[tuple[str, str], str] = {}
+        runnable = [case for case in cases if include_mutating or not case.mutating]
+        total_runs = len(runnable) * repeat
+        run_number = 0
+        run_started = time.perf_counter()
         for case in cases:
             if case.mutating and not include_mutating:
                 results.append({"case_id": case.id, "category": case.category, "skipped": True,
                                 "reason": "mutating case; pass --include-mutating to run"})
                 continue
             for repetition in range(repeat):
+                run_number += 1
+                case_started = time.perf_counter()
+                first_result = len(results)
                 session_id = f"eval-{case.id[:42]}-{repetition}-{uuid4().hex[:8]}"
                 headers = {}
                 if case.auth == "valid":
@@ -250,6 +257,14 @@ def run_cases(
                             "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                         })
                         break
+                case_results = results[first_result:]
+                ok = bool(case_results) and all(item.get("passed") for item in case_results)
+                elapsed = time.perf_counter() - run_started
+                print(
+                    f"[{run_number}/{total_runs}] {'PASS' if ok else 'FAIL'} {case.id} "
+                    f"(rep {repetition + 1}, {time.perf_counter() - case_started:.1f}s, total {elapsed / 60:.1f} min)",
+                    flush=True,
+                )
 
     executed = [result for result in results if not result.get("skipped")]
     passed = sum(bool(result.get("passed")) for result in executed)
