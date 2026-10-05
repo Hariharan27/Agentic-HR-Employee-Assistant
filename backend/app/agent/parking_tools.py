@@ -47,6 +47,10 @@ class BuildPlanArguments(ToolArguments):
         default_factory=dict,
         description="For dates where the chosen slot is taken: another slot code or 'waitlist', as the user chose",
     )
+    vehicle: str | None = Field(
+        default=None, max_length=32,
+        description="Registration number of the vehicle the user chose; only needed when they have two",
+    )
 
 
 class PlanIdArguments(ToolArguments):
@@ -84,7 +88,7 @@ class ParkingToolExecutor:
             "Turn the user's date words, copied as written ('tomorrow', 'Mon to Wed', '12 Oct'), into exact dates.",
             "Resolved parking dates",
         ),
-        "get_vehicle": (NoArguments, "The employee's registered vehicle.", "Checked registered vehicle"),
+        "get_vehicle": (NoArguments, "The employee's registered vehicles (at most two).", "Checked registered vehicles"),
         "list_parking_slots": (
             DatesArguments,
             "Every parking slot with its status (free or taken) on each date, the employee's own bookings, "
@@ -170,12 +174,15 @@ class ParkingToolExecutor:
         return self._ok("resolve_dates", data)
 
     def _get_vehicle(self, arguments: NoArguments, **_: Any):
-        vehicle = self.parking.get_vehicle(self.actor)
-        return self._ok("get_vehicle", {
-            "registration_number": vehicle.registration_number,
-            "vehicle_type": vehicle.vehicle_type.value,
-            "make_model": vehicle.make_model,
-        })
+        vehicles = self.parking.list_vehicles(self.actor)
+        return self._ok("get_vehicle", {"vehicles": [
+            {
+                "registration_number": vehicle.registration_number,
+                "vehicle_type": vehicle.vehicle_type.value,
+                "make_model": vehicle.make_model,
+            }
+            for vehicle in vehicles
+        ]})
 
     def _list_parking_slots(self, arguments: DatesArguments, *, active: dict[str, Any], **_: Any):
         board = self.parking.slot_board(self.actor, arguments.dates)
@@ -200,7 +207,16 @@ class ParkingToolExecutor:
                 "The employee must choose the slot themselves; ask which slot they want (not chosen: "
                 + ", ".join(unstated) + ")",
             )
-        plan = self.parking.build_parking_plan(self.actor, dates, arguments.slot, arguments.alternatives)
+        vehicle = arguments.vehicle or active.get("vehicle") or None
+        if arguments.vehicle and not _mentioned(arguments.vehicle, self.turn_text) and (
+            self.parking.normalize_registration(arguments.vehicle)
+            != self.parking.normalize_registration(str(active.get("vehicle") or ""))
+        ):
+            return self._error(
+                "build_parking_plan",
+                "The employee must choose the vehicle themselves; ask which registered vehicle to use",
+            )
+        plan = self.parking.build_parking_plan(self.actor, dates, arguments.slot, arguments.alternatives, vehicle)
         data = plan.to_dict()
         return self._ok("build_parking_plan", data, plan=data)
 
@@ -210,7 +226,9 @@ class ParkingToolExecutor:
             return self._error("prepare_parking", "No parking plan has that plan_id; build the plan first")
         if stored.expires_at <= self.parking.now():
             return self._error("prepare_parking", "The parking plan expired; check the slots again")
-        plan = self.parking.build_parking_plan(self.actor, stored.dates, stored.slot_code, stored.alternatives)
+        plan = self.parking.build_parking_plan(
+            self.actor, stored.dates, stored.slot_code, stored.alternatives, stored.vehicle
+        )
         if plan.compute_fingerprint() != stored.fingerprint:
             return self._error("prepare_parking", "Parking availability changed; check the slots again")
         if not plan.eligible:
@@ -223,6 +241,7 @@ class ParkingToolExecutor:
                 "slot_code": stored.slot_code,
                 "alternatives": {day.isoformat(): code for day, code in stored.alternatives.items()},
                 "fingerprint": stored.fingerprint,
+                "vehicle": stored.vehicle,
             },
             summary,
         )

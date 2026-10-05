@@ -105,6 +105,7 @@ class StoredParkingPlan:
     alternatives: dict[date, str]
     fingerprint: str
     expires_at: datetime
+    vehicle: str | None = None
 
 
 def stored_parking_plan(value: object) -> StoredParkingPlan | None:
@@ -118,6 +119,7 @@ def stored_parking_plan(value: object) -> StoredParkingPlan | None:
         stored = StoredParkingPlan(
             str(value["plan_id"]), str(value["slot_code"]), dates, alternatives,
             str(value["fingerprint"]), datetime.fromisoformat(str(value["expires_at"])),
+            str(value.get("vehicle") or "") or None,
         )
     except (KeyError, TypeError, ValueError):
         return None

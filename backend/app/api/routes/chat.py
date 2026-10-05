@@ -38,6 +38,7 @@ from app.application.parking.handlers import (
     MarkParkingNoShowHandler,
     OverrideParkingNoShowHandler,
     RegisterVehicleHandler,
+    RemoveVehicleHandler,
     ReserveParkingHandler,
     ReserveParkingPlanHandler,
 )
@@ -124,6 +125,7 @@ def build_orchestrator(
             ),
             "reject_onboarding": RejectOnboardingHandler(onboarding),
             "register_vehicle": RegisterVehicleHandler(parking),
+            "remove_vehicle": RemoveVehicleHandler(parking),
             "reserve_parking": ReserveParkingHandler(parking),
             "reserve_parking_plan": ReserveParkingPlanHandler(parking),
             "cancel_parking": CancelParkingHandler(parking),

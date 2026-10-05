@@ -25,6 +25,7 @@ from app.application.parking.handlers import (
     MarkParkingNoShowHandler,
     OverrideParkingNoShowHandler,
     RegisterVehicleHandler,
+    RemoveVehicleHandler,
     ReserveParkingHandler,
     ReserveParkingPlanHandler,
 )
@@ -607,6 +608,7 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, par
             ),
             "reject_onboarding": RejectOnboardingHandler(onboarding),
             "register_vehicle": RegisterVehicleHandler(parking),
+            "remove_vehicle": RemoveVehicleHandler(parking),
             "reserve_parking": ReserveParkingHandler(parking),
             "reserve_parking_plan": ReserveParkingPlanHandler(parking),
             "cancel_parking": CancelParkingHandler(parking),
@@ -2600,3 +2602,50 @@ def test_an_alternative_for_one_day_keeps_the_slot_the_employee_already_chose(db
 
     assert "must choose the slot themselves" not in str(execution.data.get("error", ""))
     assert unchosen.ok is False and "must choose the slot themselves" in unchosen.data["error"]
+
+
+def test_employee_removes_vehicle_after_confirmation(db_session):
+    employee_vehicle, _, _ = five_slots(db_session)
+    service = orchestrator(db_session, FakeLLM([
+        route(domain="parking", intent="general"),
+        route(domain="general", intent="general"),
+    ]))
+
+    proposal = service.chat("remove-vehicle", "Remove my vehicle")
+    assert proposal.intent == "remove_vehicle"
+    assert proposal.pending_action.startswith(f"Remove vehicle {employee_vehicle.registration_number}")
+    assert db_session.get(Vehicle, employee_vehicle.id).active is True
+
+    confirmed = service.chat("remove-vehicle", "yes")
+    assert "was removed from your parking profile" in confirmed.message
+    db_session.expire_all()
+    assert db_session.get(Vehicle, employee_vehicle.id).active is False
+
+
+def test_vehicle_with_an_upcoming_booking_cannot_be_removed(db_session):
+    employee_vehicle, _, slots = five_slots(db_session)
+    db_session.add(ParkingReservation(employee_id=actor(db_session).employee_id, vehicle_id=employee_vehicle.id,
+                                      slot_id=slots[0].id, reservation_date=date(2026, 10, 8), status="RESERVED"))
+    db_session.commit()
+
+    with pytest.raises(ConflictError, match="Cancel them first"):
+        orchestrator(db_session, FakeLLM([route(domain="parking", intent="general")])).chat(
+            "remove-blocked", "Delete my car from parking"
+        )
+
+
+def test_two_vehicles_are_listed_and_a_booking_asks_which_one(db_session):
+    employee_vehicle, _, _ = five_slots(db_session)
+    db_session.add(Vehicle(employee_id=actor(db_session).employee_id, registration_number="TN09ZZ4321",
+                           vehicle_type="MOTORCYCLE", make_model="TVS Jupiter", active=True))
+    db_session.commit()
+    service = orchestrator(db_session, FakeLLM([route(domain="parking", intent="parking_vehicle")]))
+
+    listing = service.chat("two-vehicles", "Show my vehicles")
+    assert listing.message.startswith("Your registered vehicles:")
+    assert employee_vehicle.registration_number in listing.message and "TN09ZZ4321" in listing.message
+
+    plan = service.parking.build_parking_plan(actor(db_session), [date(2026, 10, 8)], "B-21")
+    assert not plan.eligible and "Which one should I use" in plan.problems[0]
+    chosen = service.parking.build_parking_plan(actor(db_session), [date(2026, 10, 8)], "B-21", None, "tn09 zz 4321")
+    assert chosen.eligible and chosen.vehicle == "TN09ZZ4321"

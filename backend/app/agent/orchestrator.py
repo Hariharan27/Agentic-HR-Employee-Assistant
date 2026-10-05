@@ -44,6 +44,7 @@ Return exactly one JSON object with these fields:
   manager_leave_requests, approve_leave_request, reject_leave_request, cancel_leave_request,
   leave_request_history, calculate_leave_days, holidays, start_onboarding, onboarding_status,
   onboarding_approvals, approve_onboarding, reject_onboarding, parking_vehicle, register_vehicle,
+  remove_vehicle,
   parking_availability, reserve_parking, parking_reservations, cancel_parking,
   join_parking_waitlist, parking_admin_reservations, check_in_parking,
   admin_cancel_parking, mark_parking_no_show, override_parking_no_show,
@@ -88,7 +89,8 @@ and the dedicated approve_onboarding or reject_onboarding intents for reviewing 
 request. Extract only onboarding values explicitly stated by the user; never guess a name, email,
 role, department, manager, date, location, or employment type. Existing values are supplied
 separately and should not be repeated as newly extracted fields.
-Use register_vehicle when an employee wants to add, register, replace, or update their vehicle.
+Use register_vehicle when an employee wants to add, register, replace, or update their vehicle,
+and remove_vehicle when they want to remove, delete, or deregister it.
 Extract vehicle values only when explicitly supplied. Use parking_vehicle to view the employee's
 registered vehicle. Use parking_availability when the user
 asks whether parking is available, reserve_parking when they ask to book, parking_reservations to
@@ -384,8 +386,15 @@ class HRAssistantOrchestrator:
         elif action_type == "register_vehicle":
             model = f" ({created.make_model})" if created.make_model else ""
             response = (
-                f"Vehicle {created.registration_number} was registered successfully as a "
+                f"Vehicle {created.registration_number} was updated: {created.vehicle_type.value.lower()}{model}."
+                if action.summary.startswith("Update vehicle")
+                else f"Vehicle {created.registration_number} was registered successfully as a "
                 f"{created.vehicle_type.value.lower()}{model}. You can now reserve parking."
+            )
+        elif action_type == "remove_vehicle":
+            response = (
+                f"Vehicle {created.registration_number} was removed from your parking profile. "
+                "Register a vehicle again before booking parking."
             )
         elif action_type == "reserve_parking":
             response = (
@@ -443,6 +452,7 @@ class HRAssistantOrchestrator:
     def _action_domain(action_type: str) -> str:
         if action_type in {
             "register_vehicle",
+            "remove_vehicle",
             "reserve_parking",
             "reserve_parking_plan",
             "cancel_parking",
@@ -755,7 +765,9 @@ class HRAssistantOrchestrator:
                 return {
                     "response": (
                         "Use the vehicle registration form below so I can collect "
-                        f"{', '.join(missing)} and ask for confirmation before saving it."
+                        f"{', '.join(missing)} and ask for confirmation before saving it. "
+                        f"A new registration number adds a vehicle (up to {self.parking.MAX_VEHICLES}); "
+                        "an existing one with new details updates it."
                     ),
                     "active_domain": "parking",
                     "parking_context": context,
@@ -774,10 +786,14 @@ class HRAssistantOrchestrator:
                 "make_model": make_model,
             }
             model = f" ({make_model})" if make_model else ""
-            summary = (
-                f"Register vehicle {registration} as a "
-                f"{vehicle_type.value.lower()}{model}"
-            )
+            if self.parking.is_registered(self.actor, registration):
+                summary = f"Update vehicle {registration} to a {vehicle_type.value.lower()}{model}"
+            else:
+                count = len(self.parking.list_vehicles(self.actor)) + 1
+                summary = (
+                    f"Register vehicle {registration} as a "
+                    f"{vehicle_type.value.lower()}{model} (vehicle {count} of {self.parking.MAX_VEHICLES})"
+                )
             action = self.pending.propose(
                 self.actor,
                 state["session_id"],
@@ -798,14 +814,47 @@ class HRAssistantOrchestrator:
         if requested_date is not None:
             context["requested_date"] = requested_date.isoformat()
 
-        if route.intent == "parking_vehicle":
-            vehicle = self.parking.get_vehicle(self.actor)
-            description = f" ({vehicle.make_model})" if vehicle.make_model else ""
+        if route.intent == "remove_vehicle":
+            context.pop("mode", None)
+            compact = re.sub(r"[\s-]", "", state["user_message"]).upper()
+            named = [
+                item.registration_number
+                for item in self.parking.list_vehicles(self.actor)
+                if item.registration_number in compact
+            ]
+            vehicle = self.parking.prepare_vehicle_removal(
+                self.actor, named[0] if len(named) == 1 else route.vehicle_registration
+            )
+            model = f" ({vehicle.make_model})" if vehicle.make_model else ""
+            action = self.pending.propose(
+                self.actor,
+                state["session_id"],
+                "remove_vehicle",
+                {"registration_number": vehicle.registration_number},
+                f"Remove vehicle {vehicle.registration_number}, {vehicle.vehicle_type.value.lower()}{model}, "
+                "from your parking profile",
+            )
             return {
-                "response": (
-                    f"Your registered vehicle is {vehicle.registration_number}, "
-                    f"{vehicle.vehicle_type.value.lower()}{description}."
-                ),
+                "response": f"{action.summary}. Reply yes to confirm or cancel.",
+                "active_domain": "parking",
+                "parking_context": context,
+                "pending_summary": action.summary,
+            }
+
+        if route.intent == "parking_vehicle":
+            vehicles = self.parking.list_vehicles(self.actor)
+            if not vehicles:
+                response = "You do not have a registered vehicle yet. Say \"Register my vehicle\" to add one (up to two)."
+            else:
+                lines = [
+                    f"- {item.registration_number}, {item.vehicle_type.value.lower()}"
+                    + (f" ({item.make_model})" if item.make_model else "")
+                    for item in vehicles
+                ]
+                heading = "Your registered vehicle:" if len(vehicles) == 1 else "Your registered vehicles:"
+                response = heading + "\n" + "\n".join(lines) + f"\n\nYou can register up to {self.parking.MAX_VEHICLES}."
+            return {
+                "response": response,
                 "active_domain": "parking",
                 "parking_context": context,
             }
@@ -1259,7 +1308,7 @@ class HRAssistantOrchestrator:
         )
         parking_signal = bool(
             re.search(
-                r"\b(parking|park|slot|reservation|booking|waitlist|waiting\s+list|vehicle|registration|car|motorcycle|bike)\b",
+                r"\b(parking|park|slots?|reservations?|bookings?|waitlist|waiting\s+list|vehicles?|registration|cars?|motorcycles?|bikes?)\b",
                 normalized,
             )
         ) or decision.domain == "parking"
@@ -1296,8 +1345,12 @@ class HRAssistantOrchestrator:
 
         parking_intent: str | None = None
         if parking_signal:
-            if re.search(r"\b(register|add|update|change|replace)\b", normalized) and re.search(
-                r"\b(vehicle|registration|car|motorcycle|bike)\b", normalized
+            if re.search(r"\b(remove|delete|deregister|unregister|de-register)\b", normalized) and re.search(
+                r"\b(vehicles?|cars?|motorcycles?|bikes?)\b", normalized
+            ):
+                parking_intent = "remove_vehicle"
+            elif re.search(r"\b(register|add|update|change|replace|edit)\b", normalized) and re.search(
+                r"\b(vehicles?|registration|cars?|motorcycles?|bikes?)\b", normalized
             ):
                 parking_intent = "register_vehicle"
             elif re.search(r"\b(correct|reverse|override)\b", normalized) and re.search(
@@ -1324,7 +1377,7 @@ class HRAssistantOrchestrator:
                 parking_intent = "cancel_parking"
             elif re.search(r"\b(waitlist|waiting\s+list|queue)\b", normalized):
                 parking_intent = "join_parking_waitlist"
-            elif re.search(r"\b(vehicle|registration)\b", normalized):
+            elif re.search(r"\b(vehicles?|registration)\b", normalized):
                 parking_intent = "parking_vehicle"
             elif re.search(r"\b(book|reserve)\b", normalized):
                 parking_intent = "reserve_parking"

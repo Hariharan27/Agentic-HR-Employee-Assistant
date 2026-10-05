@@ -31,14 +31,26 @@ class SQLAlchemyParkingRepository:
     def __init__(self, db: Session):
         self.db = db
 
+    def list_active_vehicles(self, employee_id: int) -> list[VehicleData]:
+        rows = self.db.scalars(
+            select(Vehicle)
+            .where(Vehicle.employee_id == employee_id, Vehicle.active.is_(True))
+            .order_by(Vehicle.id)
+        ).all()
+        return [self._to_vehicle(row) for row in rows]
+
     def get_active_vehicle(self, employee_id: int) -> VehicleData | None:
-        row = self.db.scalar(
-            select(Vehicle).where(
-                Vehicle.employee_id == employee_id,
-                Vehicle.active.is_(True),
-            )
-        )
-        return self._to_vehicle(row) if row else None
+        vehicles = self.list_active_vehicles(employee_id)
+        return vehicles[0] if vehicles else None
+
+    def deactivate_vehicle(self, vehicle_id: int) -> VehicleData | None:
+        """Soft-remove: past reservations keep pointing at the vehicle row for the audit trail."""
+        row = self.db.get(Vehicle, vehicle_id)
+        if row is None or not row.active:
+            return None
+        row.active = False
+        self.db.flush()
+        return self._to_vehicle(row)
 
     def get_vehicle_by_registration(self, registration_number: str) -> VehicleData | None:
         row = self.db.scalar(
@@ -53,7 +65,13 @@ class SQLAlchemyParkingRepository:
         vehicle_type: str,
         make_model: str | None,
     ) -> VehicleData:
-        row = self.db.scalar(select(Vehicle).where(Vehicle.employee_id == employee_id))
+        """Add a vehicle, or update/reactivate the employee's vehicle with this registration."""
+        row = self.db.scalar(
+            select(Vehicle).where(
+                Vehicle.employee_id == employee_id,
+                Vehicle.registration_number == registration_number,
+            )
+        )
         if row is None:
             row = Vehicle(
                 employee_id=employee_id,
@@ -64,7 +82,6 @@ class SQLAlchemyParkingRepository:
             )
             self.db.add(row)
         else:
-            row.registration_number = registration_number
             row.vehicle_type = vehicle_type
             row.make_model = make_model
             row.active = True

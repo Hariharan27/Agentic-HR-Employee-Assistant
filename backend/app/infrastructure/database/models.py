@@ -234,9 +234,8 @@ class Vehicle(Base):
     __tablename__ = "vehicles"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    employee_id: Mapped[int] = mapped_column(
-        ForeignKey("employees.id", ondelete="CASCADE"), unique=True
-    )
+    # Up to two vehicles per employee (enforced by ParkingService); registrations are unique.
+    employee_id: Mapped[int] = mapped_column(ForeignKey("employees.id", ondelete="CASCADE"), index=True)
     registration_number: Mapped[str] = mapped_column(String(32), unique=True)
     vehicle_type: Mapped[str] = mapped_column(String(24))
     make_model: Mapped[str | None] = mapped_column(String(120), nullable=True)

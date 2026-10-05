@@ -85,27 +85,42 @@ def test_employee_can_read_vehicle_and_database_availability(db_session):
     assert [slot.code for slot in availability.available_slots] == ["B-22"]
 
 
-def test_employee_can_register_and_update_vehicle(db_session):
+def test_employee_can_register_two_vehicles_and_update_one(db_session):
     service = _service(db_session)
     employee = _actor(db_session)
 
-    created = service.register_vehicle(
-        employee, "tn-01 aa 1001", "car", "Hyundai i20"
-    )
-    updated = service.register_vehicle(
-        employee, "tn01aa1002", "motorcycle", "Royal Enfield Hunter"
-    )
+    first = service.register_vehicle(employee, "tn-01 aa 1001", "car", "Hyundai i20")
+    second = service.register_vehicle(employee, "tn01aa1002", "motorcycle", "Royal Enfield Hunter")
+    updated = service.register_vehicle(employee, "TN01AA1001", "car", "Hyundai Verna")
 
-    assert created.registration_number == "TN01AA1001"
-    assert updated.id == created.id
-    assert updated.registration_number == "TN01AA1002"
-    assert updated.vehicle_type.value == "MOTORCYCLE"
-    assert updated.make_model == "Royal Enfield Hunter"
-    assert db_session.scalar(
-        select(func.count()).select_from(Vehicle).where(
-            Vehicle.employee_id == employee.employee_id
-        )
-    ) == 1
+    assert first.registration_number == "TN01AA1001"
+    assert second.id != first.id
+    assert updated.id == first.id and updated.make_model == "Hyundai Verna"
+    assert [item.registration_number for item in service.list_vehicles(employee)] == ["TN01AA1001", "TN01AA1002"]
+    with pytest.raises(ConflictError, match="already have 2 registered vehicles"):
+        service.register_vehicle(employee, "TN01AA1003", "car", None)
+    with pytest.raises(ValidationError, match="Which one should I use"):
+        service.get_vehicle(employee)
+    assert service.get_vehicle(employee, "tn01 aa1002").id == second.id
+
+
+def test_a_vehicle_with_an_upcoming_booking_cannot_be_updated_or_removed(db_session):
+    vehicle, _, slots = _setup_parking(db_session)
+    service = _service(db_session)
+    employee = _actor(db_session)
+    spare = service.register_vehicle(employee, "TN01AA1002", "motorcycle", None)
+    slot = slots[0]
+    db_session.add(ParkingReservation(employee_id=employee.employee_id, vehicle_id=vehicle.id, slot_id=slot.id,
+                                      reservation_date=date(2026, 10, 9), status="RESERVED"))
+    db_session.commit()
+
+    with pytest.raises(ConflictError, match="Cancel them first, then update"):
+        service.register_vehicle(employee, "TN01AA1001", "car", "Hyundai Verna")
+    with pytest.raises(ConflictError, match="Cancel them first, then remove"):
+        service.stage_vehicle_removal(employee, "TN01AA1001")
+    removed = service.stage_vehicle_removal(employee, "TN01AA1002")
+    assert removed.id == spare.id and removed.active is False
+    assert [item.registration_number for item in service.list_vehicles(employee)] == ["TN01AA1001"]
 
 
 def test_vehicle_registration_is_employee_only_and_validated(db_session):

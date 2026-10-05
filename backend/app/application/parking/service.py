@@ -47,13 +47,58 @@ class ParkingService:
         self.timezone = ZoneInfo(settings.app_timezone)
         self.now = now or (lambda: datetime.now(UTC))
 
-    def get_vehicle(self, actor: AuthenticatedUser) -> VehicleData:
-        vehicle = self.repository.get_active_vehicle(actor.employee_id)
-        if vehicle is None:
+    MAX_VEHICLES = 2
+
+    @staticmethod
+    def normalize_registration(value: str) -> str:
+        return re.sub(r"[\s-]+", "", value or "").upper()
+
+    def list_vehicles(self, actor: AuthenticatedUser) -> list[VehicleData]:
+        return self.repository.list_active_vehicles(actor.employee_id)
+
+    def get_vehicle(self, actor: AuthenticatedUser, registration_number: str | None = None) -> VehicleData:
+        """The employee's vehicle: the named one, or the only one. Two vehicles and no name → ask."""
+        vehicles = self.list_vehicles(actor)
+        if not vehicles:
             raise NotFoundError(
-                "No active vehicle is registered for your employee account. Contact Workplace Operations."
+                "No active vehicle is registered for your employee account. Register a vehicle first."
             )
-        return vehicle
+        if registration_number:
+            wanted = self.normalize_registration(registration_number)
+            match = next((item for item in vehicles if item.registration_number == wanted), None)
+            if match is None:
+                raise NotFoundError(
+                    f"{wanted} is not one of your registered vehicles ("
+                    + ", ".join(item.registration_number for item in vehicles) + ")."
+                )
+            return match
+        if len(vehicles) == 1:
+            return vehicles[0]
+        raise ValidationError(
+            "You have two registered vehicles ("
+            + " and ".join(item.registration_number for item in vehicles)
+            + "). Which one should I use?"
+        )
+
+    def upcoming_bookings(self, actor: AuthenticatedUser, vehicle: VehicleData) -> list[ParkingReservationData]:
+        """Reserved or checked-in bookings from today on that use this vehicle."""
+        today = self._local_now().date()
+        return [
+            item
+            for item in self.repository.list_reservations(actor.employee_id)
+            if item.vehicle_id == vehicle.id
+            and item.reservation_date >= today
+            and item.status in {ParkingReservationStatus.RESERVED, ParkingReservationStatus.CHECKED_IN}
+        ]
+
+    def _require_no_upcoming(self, actor: AuthenticatedUser, vehicle: VehicleData, action: str) -> None:
+        upcoming = self.upcoming_bookings(actor, vehicle)
+        if upcoming:
+            bookings = ", ".join(f"#{item.id} on {item.reservation_date}" for item in upcoming[:5])
+            raise ConflictError(
+                f"Vehicle {vehicle.registration_number} has upcoming parking bookings ({bookings}). "
+                f"Cancel them first, then {action} the vehicle."
+            )
 
     def prepare_vehicle_registration(
         self,
@@ -90,7 +135,22 @@ class ParkingService:
         existing = self.repository.get_vehicle_by_registration(normalized_registration)
         if existing is not None and existing.employee_id != actor.employee_id:
             raise ConflictError("This vehicle registration is already assigned to another employee.")
+        vehicles = self.list_vehicles(actor)
+        current = next((item for item in vehicles if item.registration_number == normalized_registration), None)
+        if current is not None:
+            # Updating details is allowed only while no booking depends on the vehicle.
+            self._require_no_upcoming(actor, current, "update")
+        elif len(vehicles) >= self.MAX_VEHICLES:
+            raise ConflictError(
+                f"You already have {self.MAX_VEHICLES} registered vehicles ("
+                + ", ".join(item.registration_number for item in vehicles)
+                + "). Remove one before adding another."
+            )
         return normalized_registration, parsed_type, normalized_model
+
+    def is_registered(self, actor: AuthenticatedUser, registration_number: str) -> bool:
+        wanted = self.normalize_registration(registration_number)
+        return any(item.registration_number == wanted for item in self.list_vehicles(actor))
 
     def register_vehicle(
         self,
@@ -128,11 +188,30 @@ class ParkingService:
             normalized_model,
         )
 
+    def prepare_vehicle_removal(
+        self, actor: AuthenticatedUser, registration_number: str | None = None
+    ) -> VehicleData:
+        """The vehicle can be removed only when none of its bookings are still ahead."""
+        require_role(actor, "EMPLOYEE")
+        vehicle = self.get_vehicle(actor, registration_number)
+        self._require_no_upcoming(actor, vehicle, "remove")
+        return vehicle
+
+    def stage_vehicle_removal(self, actor: AuthenticatedUser, registration_number: str) -> VehicleData:
+        vehicle = self.prepare_vehicle_removal(actor, registration_number)
+        removed = self.repository.deactivate_vehicle(vehicle.id)
+        if removed is None:
+            raise NotFoundError("That vehicle is no longer registered.")
+        return removed
+
     def check_availability(
         self, actor: AuthenticatedUser, requested_date: date
     ) -> ParkingAvailability:
         self._validate_booking_date(requested_date)
-        vehicle = self.get_vehicle(actor)
+        vehicles = self.list_vehicles(actor)
+        if not vehicles:
+            raise NotFoundError("No active vehicle is registered for your employee account. Register a vehicle first.")
+        vehicle = vehicles[0]
         slots = tuple(self.repository.list_available_slots(requested_date))
         return ParkingAvailability(requested_date, vehicle, slots)
 
@@ -177,11 +256,15 @@ class ParkingService:
             raise
 
     def stage_reservation(
-        self, actor: AuthenticatedUser, requested_date: date, slot_id: int
+        self,
+        actor: AuthenticatedUser,
+        requested_date: date,
+        slot_id: int,
+        vehicle_registration: str | None = None,
     ) -> ParkingReservationData:
         self._validate_booking_date(requested_date)
         self._validate_booking_eligibility(actor)
-        vehicle = self.get_vehicle(actor)
+        vehicle = self.get_vehicle(actor, vehicle_registration)
         existing = self.repository.get_active_reservation(
             actor.employee_id, requested_date, for_update=True
         )
@@ -267,6 +350,7 @@ class ParkingService:
         dates: list[date] | tuple[date, ...],
         slot_code: str,
         alternatives: dict[date, str] | None = None,
+        vehicle_registration: str | None = None,
     ) -> ParkingPlan:
         """One chosen slot for every date; taken dates need an agreed alternative slot or the waitlist."""
         requested = tuple(sorted(set(dates)))
@@ -282,8 +366,12 @@ class ParkingService:
         alternatives = {day: code.strip().upper() for day, code in (alternatives or {}).items()}
         if waitlist_only:
             alternatives = {day: "WAITLIST" for day in requested}
-        vehicle = self.get_vehicle(actor)
         problems: list[str] = []
+        try:
+            vehicle_text = self.get_vehicle(actor, vehicle_registration).registration_number
+        except ValidationError as exc:  # two vehicles and none chosen yet
+            vehicle_text = ""
+            problems.append(str(exc))
         lines: list[ParkingPlanLine] = []
         choices: list[tuple[date, tuple[str, ...]]] = []
         try:
@@ -330,7 +418,7 @@ class ParkingService:
             lines=tuple(lines),
             problems=tuple(problems),
             choices=tuple(choices),
-            vehicle=vehicle.registration_number,
+            vehicle=vehicle_text,
         )
         return replace(
             plan,
@@ -346,9 +434,10 @@ class ParkingService:
         slot_code: str,
         alternatives: dict[date, str] | None,
         expected_fingerprint: str,
+        vehicle_registration: str | None = None,
     ) -> list[object]:
         """Rebuild the confirmed plan, require it unchanged, then reserve or waitlist each date."""
-        plan = self.build_parking_plan(actor, dates, slot_code, alternatives)
+        plan = self.build_parking_plan(actor, dates, slot_code, alternatives, vehicle_registration)
         if plan.fingerprint != expected_fingerprint:
             raise ConflictError(
                 "Parking availability changed since this confirmation was prepared. "
@@ -359,9 +448,9 @@ class ParkingService:
         results: list[object] = []
         for line in plan.actionable:
             if line.action == "reserve":
-                results.append(self.stage_reservation(actor, line.day, line.slot_id))
+                results.append(self.stage_reservation(actor, line.day, line.slot_id, plan.vehicle or None))
             else:
-                results.append(self.stage_join_waitlist(actor, line.day))
+                results.append(self.stage_join_waitlist(actor, line.day, plan.vehicle or None))
         return results
 
     def prepare_cancellation(
@@ -437,11 +526,11 @@ class ParkingService:
             raise
 
     def stage_join_waitlist(
-        self, actor: AuthenticatedUser, requested_date: date
+        self, actor: AuthenticatedUser, requested_date: date, vehicle_registration: str | None = None
     ) -> ParkingWaitlistData:
         self._validate_booking_date(requested_date)
         self._validate_booking_eligibility(actor)
-        vehicle = self.get_vehicle(actor)
+        vehicle = self.get_vehicle(actor, vehicle_registration)
         if self.repository.get_active_reservation(
             actor.employee_id, requested_date, for_update=True
         ) is not None:
