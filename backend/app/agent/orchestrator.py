@@ -665,7 +665,7 @@ class HRAssistantOrchestrator:
         }
         summary = (
             f"Create onboarding for {plan.candidate.name} ({plan.candidate.designation}), "
-            f"joining {plan.candidate.joining_date}, with 4 provisioning requests"
+            f"joining {plan.candidate.joining_date}, with {len(plan.task_types)} provisioning requests"
         )
         action = self.pending.propose(
             self.actor, state["session_id"], "create_onboarding", arguments, summary

@@ -45,6 +45,11 @@ class MissingPolicyEvidenceError(ApplicationError):
     code = "missing_policy_evidence"
 
 
+class IntegrationNotConfiguredError(ApplicationError):
+    status_code = 503
+    code = "integration_not_configured"
+
+
 class LLMServiceError(ApplicationError):
     status_code = 503
     code = "llm_service_unavailable"

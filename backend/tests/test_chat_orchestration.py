@@ -2058,3 +2058,13 @@ def test_split_leave_is_offered_then_built_only_after_the_employee_agrees(db_ses
     assert sorted((item.leave_type, item.working_days) for item in db_session.scalars(select(LeaveRequest)).all()) == [
         ("CASUAL", 4), ("EARNED", 1)
     ]
+
+
+def test_onboarding_confirmation_counts_the_planned_provisioning_tasks(db_session):
+    service = orchestrator(
+        db_session, FakeLLM([complete_onboarding_route()]), current_actor=actor(db_session, "manager")
+    )
+
+    proposal = service.chat("onboarding-task-count", complete_onboarding_message())
+
+    assert "with 5 provisioning requests" in proposal.pending_action

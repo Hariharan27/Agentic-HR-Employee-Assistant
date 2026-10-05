@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     it_notification_email: str = "it@example.com"
     finance_notification_email: str = "finance@example.com"
     facilities_notification_email: str = "facilities@example.com"
+    # Shared secret the email provider sends as X-Inbound-Token on /api/v1/inbound/email.
+    # Empty disables the endpoint.
+    inbound_email_token: str = ""
     cors_origins: str = "http://localhost:5173"
     log_level: str = "INFO"
 
