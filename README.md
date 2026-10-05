@@ -19,6 +19,7 @@ and Parking Administrator attendance workflows end to end.
 - Leave application, cancellation, manager approval, rejection, and request history
 - Onboarding in chat or by form (one shared draft) with independent HR administrator approval,
   atomic account activation and one-time credentials
+- Up to two vehicles per employee (list, update, remove; blocked while a booking uses the vehicle)
 - Parking with all five slots listed for the employee to choose, waitlist, and Parking Admin
   attendance workflows (check-in, late cancellation, no-show, completion, override)
 - Explicit confirmation before every database mutation, revalidated at confirmation time

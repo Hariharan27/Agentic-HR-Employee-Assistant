@@ -45,8 +45,8 @@ The Parking Administrator is a separate operational role and does not approve le
 - Apply for Casual, Sick, or Earned Leave.
 - View personal leave requests and their explicit request IDs.
 - Cancel an eligible personal leave request.
-- Register or update one active personal vehicle.
-- View the registered vehicle.
+- Register up to two personal vehicles, list them, update a vehicle's details, and remove one.
+  Updating or removing a vehicle is refused while an upcoming booking uses it.
 - Check parking availability.
 - Reserve and cancel personal parking bookings.
 - Join the parking waitlist when all regular slots are occupied.
@@ -184,7 +184,7 @@ Employee asks "Register my vehicle"
   → registration number is normalized and validated
   → duplicate ownership is rejected
   → employee confirms the action
-  → one active vehicle is stored
+  → the vehicle is stored (at most two active vehicles per employee)
   → parking reservation becomes available
 ```
 

@@ -64,7 +64,8 @@ class ParkingPlan:
     def summary(self) -> str:
         text = "Parking plan:\n" + "\n".join(f"- {self._line_text(line)}" for line in self.lines)
         if self.problems:
-            text += "\nNot ready: " + "; ".join(self.problems) + "."
+            text += "\nNot ready: " + "; ".join(self.problems)
+            text += "" if text.endswith(("?", ".")) else "."
         else:
             text += f"\nVehicle: {self.vehicle}."
         return text

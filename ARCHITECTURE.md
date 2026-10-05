@@ -332,8 +332,10 @@ active slot with free/taken per date; regular slots first, accessible B-25 last)
 free alternatives, and the employee picks another slot or the waitlist), `prepare_parking`
 (pending `reserve_parking_plan`, rebuilt and fingerprint-checked at confirmation) and
 `prepare_parking_cancellation`. A slot code or "waitlist" is accepted only when the employee wrote
-it, so the assistant never chooses a slot. Vehicle registration, the reservation list and Parking
-Admin actions keep their deterministic handlers.
+it, so the assistant never chooses a slot. With two registered vehicles the plan asks which one,
+and the chosen registration travels through the plan, the confirmation and the reservation.
+Vehicle registration, listing, update and removal (refused while an upcoming booking uses the
+vehicle), the reservation list and Parking Admin actions keep their deterministic handlers.
 
 ## 9. Policy RAG
 
@@ -401,7 +403,7 @@ Cost and stability controls include:
 | `leave_request_events` | Immutable lifecycle/audit entries |
 | `holidays` | Regional holiday calendars excluded from working-day calculations |
 | `onboarding_requests`, `onboarding_tasks` | Onboarding request, approval state and provisioning tasks |
-| `vehicles` | One registered active vehicle per employee for the parking MVP |
+| `vehicles` | Up to two active vehicles per employee (service rule; migration 0011); unique registration numbers; soft-removed with `active = false` |
 | `parking_slots` | Database-backed workplace parking inventory |
 | `parking_reservations` | Reservation and attendance lifecycle state |
 | `parking_reservation_events` | Auditable reservation status transitions and reasons |
