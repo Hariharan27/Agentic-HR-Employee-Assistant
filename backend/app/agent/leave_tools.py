@@ -13,7 +13,9 @@ from app.application.pending.service import PendingActionCoordinator
 from app.core.exceptions import ApplicationError, ValidationError
 from app.core.security import AuthenticatedUser
 from app.domain.leave.dates import MAX_RESOLVED_DAYS, describe_day, resolve_leave_dates
+from app.domain.leave.entities import LeaveType
 from app.domain.leave.plan import stored_plan_inputs
+from app.domain.leave.policy_rules import POLICY_DOCUMENT, rules_for
 from app.rag.service import PolicyKnowledgeService
 
 logger = logging.getLogger("app.leave_tools")
@@ -54,6 +56,10 @@ class RequestListArguments(ToolArguments):
 
 class RequestHistoryArguments(ToolArguments):
     request_id: int = Field(gt=0)
+
+
+class LeaveRulesArguments(ToolArguments):
+    leave_type: str | None = Field(default=None, max_length=32)
 
 
 class PolicySearchArguments(ToolArguments):
@@ -105,6 +111,7 @@ class LeaveToolExecutor:
         "calculate_leave_days": DateRangeArguments,
         "get_my_leave_requests": RequestListArguments,
         "get_leave_request_history": RequestHistoryArguments,
+        "get_leave_rules": LeaveRulesArguments,
         "search_leave_policy": PolicySearchArguments,
         "get_managed_leave_requests": ManagedRequestsArguments,
         "prepare_leave_application": PrepareApplicationArguments,
@@ -144,7 +151,11 @@ class LeaveToolExecutor:
             "calculate_leave_days": "Calculate deterministic working leave days in a date range.",
             "get_my_leave_requests": "List the authenticated employee's leave requests.",
             "get_leave_request_history": "Get the authorized audit history for one leave request.",
-            "search_leave_policy": "Retrieve grounded leave-policy passages and source metadata.",
+            "get_leave_rules": (
+                "Get the leave policy's stated rules (entitlement, credit, carry forward, lapse, "
+                "encashment, notice period, approval, holidays) for one leave type or all, with page sources."
+            ),
+            "search_leave_policy": "Retrieve grounded leave-policy passages and source metadata for anything get_leave_rules does not cover.",
             "get_managed_leave_requests": "List leave requests the authenticated manager or HR user may manage.",
             "prepare_leave_application": "Prepare the active, eligible leave plan (by plan_id) for explicit user confirmation; never submits it.",
             "prepare_leave_cancellation": "Validate and prepare cancellation for explicit confirmation; never cancels it.",
@@ -221,6 +232,7 @@ class LeaveToolExecutor:
             "calculate_leave_days": "Calculated working leave days",
             "get_my_leave_requests": "Retrieved leave requests",
             "get_leave_request_history": "Retrieved leave request history",
+            "get_leave_rules": "Checked leave rules",
             "search_leave_policy": "Consulted leave policy",
             "get_managed_leave_requests": "Retrieved managed leave requests",
             "prepare_leave_application": "Prepared leave application",
@@ -339,6 +351,29 @@ class LeaveToolExecutor:
                 ],
             },
             self._base_label("get_leave_request_history"),
+        )
+
+    def _get_leave_rules(self, arguments: LeaveRulesArguments, **_: Any) -> LeaveToolExecution:
+        leave_type = None
+        if arguments.leave_type:
+            normalized = arguments.leave_type.strip().upper().replace(" ", "_")
+            if normalized not in {"PL", "PRIVILEGE", "PRIVILEGE_LEAVE"}:
+                try:
+                    leave_type = LeaveType.parse(arguments.leave_type)
+                except ValueError:
+                    return self._error("get_leave_rules", "Unsupported leave type. Supported values: CASUAL, SICK, EARNED")
+        rules = rules_for(leave_type)
+        pages = sorted({rule.page for rule in rules})
+        sources = [
+            {"document": POLICY_DOCUMENT, "page": page, "section": None, "category": "leave", "score": 1.0}
+            for page in pages
+        ]
+        return LeaveToolExecution(
+            "get_leave_rules",
+            True,
+            {"leave_type": leave_type.value if leave_type else None, "rules": [rule.to_dict() for rule in rules]},
+            self._base_label("get_leave_rules"),
+            sources=sources,
         )
 
     def _search_leave_policy(

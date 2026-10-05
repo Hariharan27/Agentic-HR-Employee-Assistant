@@ -1168,10 +1168,12 @@ class HRAssistantOrchestrator:
         patterns = {
             "CASUAL": r"\b(casual(?:\s+leave)?|casula(?:\s+leave)?|cl)\b",
             "SICK": r"\b(sick(?:\s+leave)?|sl)\b",
-            "EARNED": r"\b(earned(?:\s+leave)?|privilege(?:\s+leave)?|el|pl)\b",
+            "EARNED": r"\b(earned(?:\s+leave)?|el)\b",
         }
         explicit_types = [leave_type for leave_type, pattern in patterns.items() if re.search(pattern, message, re.I)]
         explicit_type = explicit_types[0] if len(explicit_types) == 1 else None
+        # Privilege Leave (PL) is still a leave topic, but it is not Earned Leave.
+        mentions_privilege = bool(re.search(r"\b(privilege(?:\s+leave)?|pl)\b", message, re.I))
 
         personal = bool(re.search(r"\b(i|my|me)\b", normalized))
         balance_signal = bool(
@@ -1186,9 +1188,9 @@ class HRAssistantOrchestrator:
                 )
                 or "leave request" in normalized
             )
-            and ("leave" in normalized or explicit_type is not None)
+            and ("leave" in normalized or explicit_type is not None or mentions_privilege)
         )
-        leave_topic_signal = "leave" in normalized or explicit_type is not None
+        leave_topic_signal = "leave" in normalized or explicit_type is not None or mentions_privilege
         eligibility_signal = personal and leave_topic_signal and bool(
             re.search(r"\b(eligible|can\s+i|could\s+i|may\s+i)\b", normalized)
         ) and not bool(
@@ -1523,7 +1525,7 @@ class HRAssistantOrchestrator:
         return normalized in {
             "casual", "casual leave", "casula", "casula leave", "cl",
             "sick", "sick leave", "sl",
-            "privilege", "privilege leave", "earned", "earned leave", "pl", "el",
+            "earned", "earned leave", "el",
         }
 
     @staticmethod

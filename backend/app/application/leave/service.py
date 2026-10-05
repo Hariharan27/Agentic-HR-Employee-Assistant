@@ -24,8 +24,9 @@ from app.domain.leave.entities import (
 from app.domain.leave.plan import ExcludedDay, LeavePlan, PlanSegment, plan_ttl
 from app.domain.leave.rules import calculate_working_days, validate_date_range
 
+from app.domain.leave.policy_rules import SICK_BACKDATE_DAYS
+
 MAX_PLAN_DAYS = 62
-SICK_BACKDATE_DAYS = 7
 
 
 class LeaveService:
@@ -44,6 +45,12 @@ class LeaveService:
 
     @staticmethod
     def _parse_leave_type(value: str) -> LeaveType:
+        if value.strip().upper().replace(" ", "_") in {"PL", "PRIVILEGE", "PRIVILEGE_LEAVE"}:
+            raise ValidationError(
+                "Privilege Leave (PL) is a separate legacy balance kept after the EL conversion and is "
+                "not managed in PeopleDesk; check or apply PL in iAssistant. PeopleDesk handles "
+                "CASUAL, SICK and EARNED leave"
+            )
         try:
             return LeaveType.parse(value)
         except ValueError as exc:
@@ -137,6 +144,13 @@ class LeaveService:
                 f"{parsed.value.title()} leave cannot start before {earliest.isoformat()}"
                 if parsed is LeaveType.SICK
                 else f"{parsed.value.title()} leave cannot be applied for past dates ({working_dates[0].isoformat()})"
+            )
+        later_years = sorted({day.year for day in working_dates if day.year > today.year})
+        if later_years:
+            problems.append(
+                "Leave entitlements follow the calendar year, so dates in "
+                + ", ".join(str(year) for year in later_years)
+                + " can be applied once that year's leave is credited"
             )
         if not segments:
             problems.append("The selected dates have no working days")

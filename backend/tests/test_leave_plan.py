@@ -106,3 +106,18 @@ def test_staging_refuses_a_plan_whose_facts_changed(db_session):
 
     with pytest.raises(ConflictError, match="changed since this confirmation"):
         leave.stage_leave_plan(actor, "CASUAL", plan.requested_dates, plan.fingerprint)
+
+
+def test_dates_in_a_later_calendar_year_wait_for_that_year_credit(db_session):
+    plan = service(db_session).build_leave_plan(employee(db_session), "CASUAL", [date(2027, 1, 4)])
+
+    assert not plan.eligible
+    assert "calendar year" in plan.problems[0] and "2027" in plan.problems[0]
+
+
+@pytest.mark.parametrize("value", ["PL", "privilege", "Privilege Leave"])
+def test_privilege_leave_is_not_treated_as_earned_leave(db_session, value):
+    from app.core.exceptions import ValidationError
+
+    with pytest.raises(ValidationError, match="Privilege Leave \\(PL\\) is a separate legacy balance"):
+        service(db_session).build_leave_plan(employee(db_session), value, [date(2026, 10, 6)])

@@ -17,9 +17,8 @@ class LeaveType(StrEnum):
             "SL": cls.SICK,
             "EL": cls.EARNED,
             "EARNED_LEAVE": cls.EARNED,
-            "PRIVILEGE": cls.EARNED,
-            "PRIVILEGE_LEAVE": cls.EARNED,
-            "PL": cls.EARNED,
+            "CASUAL_LEAVE": cls.CASUAL,
+            "SICK_LEAVE": cls.SICK,
         }
         return aliases.get(normalized, cls(normalized))
 

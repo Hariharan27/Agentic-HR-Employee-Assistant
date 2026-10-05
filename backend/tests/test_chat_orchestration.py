@@ -274,7 +274,7 @@ class FakeLLM:
         patterns = {
             "CASUAL": r"\b(?:casual|casula|cl)\b",
             "SICK": r"\b(?:sick|sl)\b",
-            "EARNED": r"\b(?:earned|privilege|el|pl)\b",
+            "EARNED": r"\b(?:earned|el)\b",
         }
         for leave_type, pattern in patterns.items():
             if re.search(pattern, text.casefold()):
@@ -2014,3 +2014,23 @@ def test_leave_replies_are_plain_text(db_session):
     result = orchestrator(db_session, llm).chat("plain-text", "How much casual leave do I have?")
 
     assert result.message == "You currently have 4 casual leave days available."
+
+
+def test_route_decision_does_not_map_privilege_leave_to_earned():
+    decision = RouteDecision.model_validate_json(route(intent="leave_balance", leave_type="PL"))
+
+    assert decision.leave_type is None
+
+
+def test_leave_rules_tool_returns_policy_rules_with_page_sources(db_session):
+    service = orchestrator(db_session, FakeLLM([]))
+
+    execution = service.leave_agent.tools.execute(
+        "get_leave_rules", {"leave_type": "EARNED"}, session_id="rules"
+    )
+
+    rules = {item["rule"]: item for item in execution.data["rules"]}
+    assert "earned_carry_forward" in rules and "entitlement_casual" not in rules
+    assert rules["holidays_not_counted"]["enforced_by_system"] is True
+    assert rules["earned_carry_forward"]["source"]["page"] == 2
+    assert {source["document"] for source in execution.sources} == {"Revised Leave Policy - I2I.pdf"}
