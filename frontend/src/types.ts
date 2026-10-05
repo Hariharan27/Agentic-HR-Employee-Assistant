@@ -5,6 +5,7 @@ export type Profile = {
   name: string;
   email: string;
   role: "EMPLOYEE" | "MANAGER" | "HR" | "HR_ADMIN" | "PARKING_ADMIN";
+  must_change_password?: boolean;
 };
 
 export type Source = {

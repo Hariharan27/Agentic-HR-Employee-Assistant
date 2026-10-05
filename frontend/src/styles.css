@@ -213,3 +213,5 @@ nav button:hover, nav button.nav-active { color: white; background: rgba(255,255
 
 @media (max-width: 1050px) { .content-grid { grid-template-columns: 1fr; }.request-panel { display: none; } }
 @media (max-width: 760px) { .login-page { grid-template-columns: 1fr; }.login-story { min-height: 38vh; padding: 40px 28px; }.login-story h1 { font-size: 38px; }.lead, .trust-row { display: none; }.login-card { padding: 45px 0; }.app-shell { grid-template-columns: 1fr; }.sidebar { height: auto; position: static; padding: 13px 18px; flex-direction: row; align-items: center; }.brand { border: 0; padding: 0; }.profile-card { margin: 0 0 0 auto; background: transparent; }.sidebar nav, .side-note { display: none; }.logout { width: auto; }.workspace { padding: 18px 12px; }.workspace > header { margin: 0 8px 12px; }.role-pill { display: none; }.content-grid { height: calc(100vh - 112px); }.messages { padding: 22px 15px; }.message { max-width: 90%; } }
+
+.link-button { margin-top: 12px; border: 0; background: transparent; color: #526a62; font-size: 12px; text-decoration: underline; cursor: pointer; }

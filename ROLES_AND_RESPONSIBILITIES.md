@@ -126,7 +126,8 @@ written in chat cannot override that trusted identity.
 - Cannot use onboarding to create a privileged role.
 - Does not manage parking attendance.
 
-The temporary password is shown only once after approval and should be shared securely.
+The temporary password is shown only once after approval and should be shared securely. The
+employee must replace it with their own password on first sign-in before anything else works.
 
 ## Parking Administrator
 
@@ -207,11 +208,11 @@ attendance and operational exceptions, not the employee's HR hierarchy.
 
 | Role | Username | Password |
 |---|---|---|
-| Employee | `employee` | `employee123` |
-| Manager | `manager` | `manager123` |
-| HR | `hr` | `hr12345` |
-| HR Administrator | `hradmin` | `hradmin123` |
-| Parking Administrator | `parkingadmin` | `parkingadmin123` |
+| Employee | `employee` | `Advik!Desk-2026` |
+| Manager | `manager` | `Saanvika!Desk-2026` |
+| HR | `hr` | `Hariharan!Desk-2026` |
+| HR Administrator | `hradmin` | `Alaguselvi!Desk-2026` |
+| Parking Administrator | `parkingadmin` | `Dhaswanth!Desk-2026` |
 
 These credentials are for local demonstration only. Newly onboarded employees receive dynamically
 generated credentials when their onboarding request is approved.

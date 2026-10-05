@@ -174,3 +174,16 @@ def test_weekday_labelled_range_stays_one_range():
 
     assert result.shape == "range"
     assert (iso(result)[0], iso(result)[-1]) == ("2026-10-12", "2026-10-16")
+
+
+def test_between_two_ordinal_days_of_one_month_is_a_range():
+    resolution = resolve_leave_dates("between 20th and 31st December", date(2026, 10, 6))
+
+    assert resolution.shape == "range"
+    assert resolution.dates[0] == date(2026, 12, 20) and resolution.dates[-1] == date(2026, 12, 31)
+
+
+def test_a_list_of_ordinal_days_is_still_separate_days():
+    resolution = resolve_leave_dates("6th, 8th and 9th November", date(2026, 10, 6))
+
+    assert resolution.shape == "separate"

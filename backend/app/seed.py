@@ -41,7 +41,7 @@ DEMO_USERS = (
             "joining_date": date(2023, 1, 9),
         },
         "username": "employee",
-        "password": "employee123",
+        "password": "Advik!Desk-2026",
         "role": "EMPLOYEE",
     },
     {
@@ -57,7 +57,7 @@ DEMO_USERS = (
             "joining_date": date(2020, 6, 1),
         },
         "username": "manager",
-        "password": "manager123",
+        "password": "Saanvika!Desk-2026",
         "role": "MANAGER",
     },
     {
@@ -73,7 +73,7 @@ DEMO_USERS = (
             "joining_date": date(2021, 4, 12),
         },
         "username": "hr",
-        "password": "hr12345",
+        "password": "Hariharan!Desk-2026",
         "role": "HR",
     },
     {
@@ -89,7 +89,7 @@ DEMO_USERS = (
             "joining_date": date(2020, 2, 10),
         },
         "username": "hradmin",
-        "password": "hradmin123",
+        "password": "Alaguselvi!Desk-2026",
         "role": "HR_ADMIN",
     },
     {
@@ -105,7 +105,7 @@ DEMO_USERS = (
             "joining_date": date(2021, 8, 16),
         },
         "username": "parkingadmin",
-        "password": "parkingadmin123",
+        "password": "Dhaswanth!Desk-2026",
         "role": "PARKING_ADMIN",
     },
 )
@@ -312,6 +312,7 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
         elif reset_demo:
             user.username = item["username"]
             user.password_hash = hash_password(item["password"])
+            user.must_change_password = False
             user.role = item["role"]
             user.employee_id = employee.id
         users[item["role"]] = user

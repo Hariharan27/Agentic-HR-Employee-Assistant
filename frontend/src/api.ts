@@ -21,13 +21,20 @@ async function request<T>(path: string, options: RequestInit = {}, token?: strin
 }
 
 export async function login(username: string, password: string) {
-  return request<{ access_token: string; role: string }>("/api/v1/auth/login", {
+  return request<{ access_token: string; role: string; must_change_password?: boolean }>("/api/v1/auth/login", {
     method: "POST",
     body: JSON.stringify({ username, password }),
   });
 }
 
 export const getProfile = (token: string) => request<Profile>("/api/v1/auth/me", {}, token);
+
+export const changePassword = (token: string, currentPassword: string, newPassword: string) =>
+  request<Profile>(
+    "/api/v1/auth/change-password",
+    { method: "POST", body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }) },
+    token,
+  );
 
 export const sendChat = (token: string, message: string, sessionId?: string, onboardingForm?: OnboardingFormPayload) =>
   request<ChatResponse>(

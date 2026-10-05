@@ -13,6 +13,10 @@ class AuthorizationError(ApplicationError):
     code = "forbidden"
 
 
+class PasswordChangeRequiredError(AuthorizationError):
+    code = "password_change_required"
+
+
 class NotFoundError(ApplicationError):
     status_code = 404
     code = "not_found"

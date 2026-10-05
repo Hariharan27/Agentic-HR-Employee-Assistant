@@ -12,3 +12,6 @@ dist/
 backend/tmp/
 backend/evals/reports/
 *.ses
+
+# Files the Claude desktop app saves into this folder
+Claude outputs/

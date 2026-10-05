@@ -127,13 +127,14 @@ migrations and performs non-destructive, idempotent seeding.
 
 | Role | Username | Password |
 |---|---|---|
-| Employee | `employee` | `employee123` |
-| Manager | `manager` | `manager123` |
-| HR | `hr` | `hr12345` |
-| HR Administrator | `hradmin` | `hradmin123` |
-| Parking Administrator | `parkingadmin` | `parkingadmin123` |
+| Employee | `employee` | `Advik!Desk-2026` |
+| Manager | `manager` | `Saanvika!Desk-2026` |
+| HR | `hr` | `Hariharan!Desk-2026` |
+| HR Administrator | `hradmin` | `Alaguselvi!Desk-2026` |
+| Parking Administrator | `parkingadmin` | `Dhaswanth!Desk-2026` |
 
-These credentials are intentionally non-sensitive and exist only for local demonstration.
+These credentials exist only for local demonstration. Accounts activated through onboarding get a
+one-time temporary password and must set their own on first sign-in.
 
 Reset the five demo identities to a predictable state before recording:
 
@@ -147,7 +148,8 @@ activated from them. It restores the documented passwords and leave balances, th
 slots, and the employee account's registered vehicle (TN01AR1001). Newly onboarded employees
 register their own vehicle in chat. Policy vectors, schema, and unrelated employees are not changed.
 
-Follow [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the end-to-end assessment walkthrough and
+Follow [DEMO_FLOW.md](DEMO_FLOW.md) for the paste-ready demo flow (or open
+[DEMO_FLOW.html](DEMO_FLOW.html) for Copy buttons), [DEMO_SCRIPT.md](DEMO_SCRIPT.md) for the narrated walkthrough and
 [ROLES_AND_RESPONSIBILITIES.md](ROLES_AND_RESPONSIBILITIES.md) for the authorization hierarchy.
 
 ## Implemented agent flow

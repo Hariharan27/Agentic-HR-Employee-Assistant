@@ -354,7 +354,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, default=default_dataset)
     parser.add_argument("--base-url", default=os.getenv("EVAL_BASE_URL", "http://localhost:8000"))
     parser.add_argument("--username", default=os.getenv("EVAL_USERNAME", "employee"))
-    parser.add_argument("--password", default=os.getenv("EVAL_PASSWORD", "employee123"))
+    parser.add_argument("--password", default=os.getenv("EVAL_PASSWORD", "Advik!Desk-2026"))
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--case", action="append", default=[], help="Run only an exact case id")
     parser.add_argument("--category", action="append", default=[])

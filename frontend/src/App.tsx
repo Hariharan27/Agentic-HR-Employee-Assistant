@@ -1,14 +1,14 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { getOnboardingStatus, getParkingAdminReservations, getPendingOnboardingApprovals, getProfile, getReportingManagers, login, sendChatStream } from "./api";
+import { changePassword, getOnboardingStatus, getParkingAdminReservations, getPendingOnboardingApprovals, getProfile, getReportingManagers, login, sendChatStream } from "./api";
 import { RichText } from "./RichText";
 import type { ChatMessage, LiveStep, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager, Source } from "./types";
 
 const demoAccounts = {
-  EMPLOYEE: { username: "employee", password: "employee123" },
-  MANAGER: { username: "manager", password: "manager123" },
-  HR: { username: "hr", password: "hr12345" },
-  HR_ADMIN: { username: "hradmin", password: "hradmin123" },
-  PARKING_ADMIN: { username: "parkingadmin", password: "parkingadmin123" },
+  EMPLOYEE: { username: "employee", password: "Advik!Desk-2026" },
+  MANAGER: { username: "manager", password: "Saanvika!Desk-2026" },
+  HR: { username: "hr", password: "Hariharan!Desk-2026" },
+  HR_ADMIN: { username: "hradmin", password: "Alaguselvi!Desk-2026" },
+  PARKING_ADMIN: { username: "parkingadmin", password: "Dhaswanth!Desk-2026" },
 } as const;
 
 const quickPrompts: Record<Profile["role"], string[]> = {
@@ -102,8 +102,10 @@ function App() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [liveSteps, setLiveSteps] = useState<LiveStep[]>([]);
+  const [passwordForm, setPasswordForm] = useState({ current: "", next: "", confirm: "" });
+  const [passwordError, setPasswordError] = useState("");
   const [error, setError] = useState("");
-  const [loginForm, setLoginForm] = useState({ username: "employee", password: "employee123" });
+  const [loginForm, setLoginForm] = useState({ username: "employee", password: "Advik!Desk-2026" });
   const messageEnd = useRef<HTMLDivElement>(null);
 
   const suggestions = useMemo(() => (profile ? quickPrompts[profile.role] : []), [profile]);
@@ -178,6 +180,8 @@ function App() {
     setError("");
     try {
       const result = await login(loginForm.username, loginForm.password);
+      // A temporary password must be replaced first; keep it to pre-fill "current password".
+      setPasswordForm({ current: result.must_change_password ? loginForm.password : "", next: "", confirm: "" });
       sessionStorage.setItem("hr-token", result.access_token);
       setToken(result.access_token);
     } catch (nextError) {
@@ -444,6 +448,53 @@ function App() {
             <button className="primary" disabled={loading}>{loading ? "Signing in…" : "Sign in"}</button>
           </form>
           <p className="security-note">Demo credentials only · JWT authenticated session</p>
+        </section>
+      </main>
+    );
+  }
+
+  async function submitPasswordChange(event: FormEvent) {
+    event.preventDefault();
+    if (!token) return;
+    setPasswordError("");
+    if (passwordForm.next !== passwordForm.confirm) {
+      setPasswordError("The new passwords do not match.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const updated = await changePassword(token, passwordForm.current, passwordForm.next);
+      setPasswordForm({ current: "", next: "", confirm: "" });
+      setProfile(updated);
+    } catch (nextError) {
+      setPasswordError(nextError instanceof Error ? nextError.message : "The password could not be changed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (profile.must_change_password) {
+    return (
+      <main className="login-page">
+        <section className="login-story">
+          <div className="brand-mark">I</div>
+          <p className="eyebrow">IDEATOR PEOPLEDESK</p>
+          <h1>Welcome, {profile.name.split(" ")[0]}.</h1>
+          <p className="lead">Your account was just activated with a one-time password. Choose your own password to continue.</p>
+        </section>
+        <section className="login-card">
+          <p className="eyebrow dark">FIRST SIGN-IN</p>
+          <h2>Change your password</h2>
+          <p className="muted">At least 10 characters, with upper- and lower-case letters and a number.</p>
+          <form onSubmit={submitPasswordChange}>
+            <input type="text" name="username" autoComplete="username" value={profile.employee_code} readOnly hidden />
+            <label>Temporary password<input type="password" autoComplete="current-password" value={passwordForm.current} onChange={(event) => setPasswordForm({ ...passwordForm, current: event.target.value })} /></label>
+            <label>New password<input type="password" autoComplete="new-password" value={passwordForm.next} onChange={(event) => setPasswordForm({ ...passwordForm, next: event.target.value })} /></label>
+            <label>Confirm new password<input type="password" autoComplete="new-password" value={passwordForm.confirm} onChange={(event) => setPasswordForm({ ...passwordForm, confirm: event.target.value })} /></label>
+            {passwordError && <p className="error">{passwordError}</p>}
+            <button className="primary" disabled={loading || !passwordForm.current || !passwordForm.next}>{loading ? "Saving…" : "Save and continue"}</button>
+          </form>
+          <button type="button" className="link-button" onClick={logout}>Sign out</button>
         </section>
       </main>
     );

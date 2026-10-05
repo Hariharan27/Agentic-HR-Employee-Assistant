@@ -210,6 +210,7 @@ class SQLAlchemyOnboardingRepository:
             password_hash=password_hash,
             role="EMPLOYEE",
             employee_id=employee.id,
+            must_change_password=True,
         )
         self.db.add(user)
         self.db.flush()

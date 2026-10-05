@@ -46,12 +46,12 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
         )
         parking_admin = db.scalar(select(User).where(User.username == "parkingadmin"))
 
-        assert verify_password("employee123", employee_user.password_hash)
+        assert verify_password("Advik!Desk-2026", employee_user.password_hash)
         assert casual.total_days == Decimal("6")
         assert casual.used_days == Decimal("2")
         assert db.scalar(select(func.count()).select_from(LeaveRequest)) == 0
         assert parking_admin.role == "PARKING_ADMIN"
-        assert verify_password("parkingadmin123", parking_admin.password_hash)
+        assert verify_password("Dhaswanth!Desk-2026", parking_admin.password_hash)
         assert db.scalar(select(Vehicle.registration_number).where(Vehicle.employee_id == employee_user.employee_id)) == "TN01AR1001"
         assert db.scalar(select(func.count()).select_from(Vehicle)) == 1
         assert db.scalar(select(func.count()).select_from(ParkingSlot)) == 5
@@ -121,7 +121,7 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
         assert db.scalar(select(Vehicle.registration_number).where(Vehicle.employee_id == employee_user.employee_id)) == "TN01AR1001"
         assert db.scalar(select(func.count()).select_from(Vehicle)) == 1
         assert casual.used_days == Decimal("2")
-        assert verify_password("employee123", employee_user.password_hash)
+        assert verify_password("Advik!Desk-2026", employee_user.password_hash)
 
 
 def test_seed_loads_both_regional_2026_holiday_calendars_idempotently():

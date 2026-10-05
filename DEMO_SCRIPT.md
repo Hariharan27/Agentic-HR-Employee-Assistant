@@ -1,5 +1,8 @@
 # Ideator PeopleDesk — Full Capability Demo Script
 
+> For paste-ready, natural-language prompts in the same order, use [DEMO_FLOW.md](DEMO_FLOW.md), or
+> open [DEMO_FLOW.html](DEMO_FLOW.html) in a browser for Copy buttons and auto-filled IDs.
+
 This script walks through **every capability** in the order a real employee journey happens:
 
 1. **Onboarding** — HR creates a new employee (Nila), HR Admin activates the account, IT / Finance /
@@ -45,12 +48,12 @@ The department sender addresses are `it@example.com`, `finance@example.com` and
 
 | Act | Role | Person | Username | Password |
 |---|---|---|---|---|
-| 1, 4 | HR | Hariharan | `hr` | `hr12345` |
-| 1, 5 | HR Admin | Alaguselvi | `hradmin` | `hradmin123` |
-| 3 | Manager | Saanvika Sree | `manager` | `manager123` |
-| 0.7 | Existing employee (reports to Saanvika, has vehicle TN01AR1001) | Advik | `employee` | `employee123` |
+| 1, 4 | HR | Hariharan | `hr` | `Hariharan!Desk-2026` |
+| 1, 5 | HR Admin | Alaguselvi | `hradmin` | `Alaguselvi!Desk-2026` |
+| 3 | Manager | Saanvika Sree | `manager` | `Saanvika!Desk-2026` |
+| 0.7 | Existing employee (reports to Saanvika, has vehicle TN01AR1001) | Advik | `employee` | `Advik!Desk-2026` |
 | 2, 4 | New employee created in Act 1 | Nila Raman | generated | generated |
-| 5 | Parking Admin | Dhaswanth | `parkingadmin` | `parkingadmin123` |
+| 5 | Parking Admin | Dhaswanth | `parkingadmin` | `Dhaswanth!Desk-2026` |
 
 ### 0.3 Timing (parking rules are real)
 
@@ -88,7 +91,7 @@ recording day.
 ### 0.7 Off-camera staging with Advik (2 minutes, before Act 1)
 
 The manager needs a second request to reject, and the Parking Admin needs a booking to mark as a
-no-show. Sign in as **Employee** (`employee` / `employee123`):
+no-show. Sign in as **Employee** (`employee` / `Advik!Desk-2026`):
 
 1. ```text
    Apply casual leave on 2026-10-22 for a family function
@@ -106,7 +109,7 @@ no-show. Sign in as **Employee** (`employee` / `employee123`):
 
 ### 1.1 HR signs in and starts onboarding
 
-1. Sign in as **HR** (`hr` / `hr12345`). The profile shows Hariharan, role **HR**.
+1. Sign in as **HR** (`hr` / `Hariharan!Desk-2026`). The profile shows Hariharan, role **HR**.
 2. Type:
 
    ```text
@@ -174,7 +177,7 @@ joining date, or a location other than Chennai/Bengaluru is rejected with the re
 
 ### 1.4 HR Admin approves and activates the account
 
-1. Sign out and sign in as **HR Admin** (`hradmin` / `hradmin123`).
+1. Sign out and sign in as **HR Admin** (`hradmin` / `Alaguselvi!Desk-2026`).
 2. Type:
 
    ```text
@@ -333,8 +336,12 @@ request** for the manager.
 ### 2.1 First login
 
 1. Sign out. Type `<NILA_USERNAME>` and `<NILA_PASSWORD>`, then sign in.
-   Expected: the profile shows Nila Raman, role **EMPLOYEE**.
-2. ```text
+   Expected: the **Change your password** screen. The temporary password is pre-filled.
+2. Type `Nila!Desk-2026` in both new-password fields and click **Save and continue**.
+   Expected: PeopleDesk opens with Nila Raman, role **EMPLOYEE**. Point out: until the password is
+   changed, every other API answers 403 `password_change_required`, and the temporary password stops
+   working afterwards.
+3. ```text
    What can you help me with?
    ```
    Expected: a summary of policy, leave, onboarding and parking capabilities.
@@ -462,7 +469,7 @@ Expected: it still answers from the policy: casual leave cannot be carried forwa
 
 ## Act 3 — Manager side (Saanvika)
 
-1. Sign out and sign in as **Manager** (`manager` / `manager123`).
+1. Sign out and sign in as **Manager** (`manager` / `Saanvika!Desk-2026`).
 2. **Approval list.**
    ```text
    Show my pending approvals
@@ -507,7 +514,7 @@ Expected: it still answers from the policy: casual leave cannot be carried forwa
 Each employee can register **up to two vehicles**. A vehicle's details can be updated, and the
 vehicle removed, only while no upcoming booking uses it.
 
-1. Sign out and sign back in as Nila (`<NILA_USERNAME>` / `<NILA_PASSWORD>`).
+1. Sign out and sign back in as Nila (`<NILA_USERNAME>` / `Nila!Desk-2026`).
 2. **No vehicle yet.**
    ```text
    Show my vehicles
@@ -602,7 +609,7 @@ Optional parking extras:
 
 ## Act 5 — Parking Admin side (Dhaswanth) ⏰
 
-1. Sign in as **Parking Admin** (`parkingadmin` / `parkingadmin123`). The **Parking queue** panel
+1. Sign in as **Parking Admin** (`parkingadmin` / `Dhaswanth!Desk-2026`). The **Parking queue** panel
    opens.
 2. **Show the queue.**
    ```text
@@ -645,7 +652,7 @@ Optional parking extras:
 ## Optional extras (other roles)
 
 **HR, company-wide approvals.** Before Act 3, have Advik also apply `earned leave on 2026-10-27`.
-Then sign in as **HR** (`hr` / `hr12345`) and run `Show my approval queue`: HR sees requests across
+Then sign in as **HR** (`hr` / `Hariharan!Desk-2026`) and run `Show my approval queue`: HR sees requests across
 the company, not just direct reports. Run `Approve leave request #<id>` → **Confirm**.
 
 **Manager onboarding by form, then HR Admin rejection.**

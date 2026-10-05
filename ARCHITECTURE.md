@@ -415,6 +415,10 @@ application transactions support integrity and concurrency safety.
 ## 12. Security controls
 
 - Passwords use a modern one-way password hash.
+- Accounts activated by onboarding carry `must_change_password`; until the employee sets a new
+  password (`POST /api/v1/auth/change-password`: 10+ characters, mixed case, a digit, not the
+  username), every API except login, profile and password change answers 403
+  `password_change_required`.
 - JWT expiry and signature validation happen in FastAPI dependencies.
 - Employee identity is derived only from the validated token.
 - Service-layer checks enforce employee ownership and manager/HR roles.

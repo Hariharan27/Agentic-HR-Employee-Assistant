@@ -91,6 +91,8 @@ def resolve_leave_dates(
         gap = normalized[mentions[0].end : mentions[1].start]
         # "Monday 12 Oct to Friday 16 Oct": weekday labels do not change the connector.
         gap = re.sub(r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b[,]?", " ", gap)
+        # A day-of-month mention can end before its ordinal suffix ("20th and 31st December").
+        gap = re.sub(r"^(?:st|nd|rd|th)\b", "", gap)
         if _RANGE_CONNECTOR.match(gap) or (between and re.match(r"^\s*and\s*$", gap)):
             return _range(mentions[0].value, mentions[1].value)
 

@@ -10,6 +10,12 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     role: str
+    must_change_password: bool = False
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=1, max_length=256)
 
 
 class ProfileResponse(BaseModel):
@@ -19,4 +25,5 @@ class ProfileResponse(BaseModel):
     name: str
     email: str
     role: str
+    must_change_password: bool = False
 
