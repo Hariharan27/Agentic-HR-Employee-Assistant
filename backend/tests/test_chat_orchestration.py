@@ -2557,3 +2557,26 @@ def test_plural_parking_reservations_route_to_the_reservation_list():
     )
 
     assert guarded.intent == "parking_reservations"
+
+
+def test_reversed_range_count_explains_the_order_when_the_model_only_asks_back(db_session):
+    llm = FakeLLM([
+        route(intent="calculate_leave_days"),
+        json.dumps({"action": "final", "message": "Did you mean the other way round?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-reversed", "Calculate leave days from 2026-11-10 to 2026-11-01")
+
+    assert "End date must be on or after start date" in result.message
+
+
+def test_balance_question_is_answered_even_when_the_model_asks_for_a_type(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance"),
+        json.dumps({"action": "final", "message": "Which leave type?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("finalize-balance", "'; DROP TABLE x; -- What is my leave balance?")
+
+    assert result.message.startswith("Your leave balance:")
+    assert "only show your own" not in result.message

@@ -129,6 +129,9 @@ DEMO_PARKING_SLOTS = (
 LEGACY_DEMO_EMPLOYEE_CODES = ("E1001", "M1001", "H1001", "H1002")
 
 
+DEMO_EMPLOYEE_VEHICLE = ("TN01AR1001", "CAR", "Hyundai i20")
+
+
 def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[int]) -> None:
     onboarding_rows = db.execute(
         select(
@@ -377,6 +380,24 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
             slot.location = location
             slot.slot_type = slot_type
             slot.active = True
+
+    # The fallback employee account keeps one registered vehicle so parking can be tried (and
+    # evaluated) straight away. Newly onboarded employees still register theirs in chat.
+    registration, vehicle_type, make_model = DEMO_EMPLOYEE_VEHICLE
+    demo_employee = employees["EMPLOYEE"]
+    db.flush()
+    if db.scalar(select(Vehicle).where(Vehicle.employee_id == demo_employee.id)) is None and db.scalar(
+        select(Vehicle).where(Vehicle.registration_number == registration)
+    ) is None:
+        db.add(
+            Vehicle(
+                employee_id=demo_employee.id,
+                registration_number=registration,
+                vehicle_type=vehicle_type,
+                make_model=make_model,
+                active=True,
+            )
+        )
 
     regional_dates = {
         holiday_date for calendar in HOLIDAY_CALENDARS.values() for holiday_date, _ in calendar

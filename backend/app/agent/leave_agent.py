@@ -176,6 +176,11 @@ class LeaveAgent(ToolAgent):
         (re.compile(r"\b(?:earned|el)\b", re.I), "EARNED"),
     )
     _OTHER_TYPES = re.compile(r"\b(?:privilege|pl|maternity|paternity|adoption|lwp|comp[ -]?off)\b", re.I)
+    _OTHER_PERSON = re.compile(
+        r"\b[a-z]{1,2}\d{3,}\b|\b(?:colleague|teammate|someone else|other employee|another employee|my manager)\b"
+        r"|\bemployee\s+\w+'s\b",
+        re.I,
+    )
     _BARE_CANCEL = re.compile(r"^\s*(?:cancel|stop|discard|never ?mind|no)\W*$", re.I)
 
     @staticmethod
@@ -229,11 +234,15 @@ class LeaveAgent(ToolAgent):
         if intent == "leave_balance" and not self._OTHER_TYPES.search(text):
             item = self._latest(results, "get_leave_balance")
             prefix = ""
-            if item is None:
-                # The model declined (e.g. another employee's balance): show only the caller's own.
+            if item is None or item.get("status") != "success":
+                # The model asked back, declined or passed a bad argument: the caller's own balance
+                # is always answerable, so fetch it directly.
                 state = self.execute_inline(state, "get_leave_balance", {"leave_type": self.mentioned_type(text)})
                 item = self._latest(state.get("tool_results", []), "get_leave_balance")
-                prefix = "I can only show your own leave balance. "
+                if self._OTHER_PERSON.search(text):
+                    prefix = "I can only show your own leave balance. "
+                else:
+                    message = ""  # never keep a reply that skipped or misused the balance tool
             if item and item.get("status") == "success":
                 if not prefix and self.repairable(state, message):
                     return None  # let the model correct its own numbers first
@@ -259,11 +268,22 @@ class LeaveAgent(ToolAgent):
         if intent in self.PLAN_INTENTS and not self._OTHER_TYPES.search(text):
             return self._finalize_plan(state, str(intent), message)
 
+        if intent == "calculate_leave_days" and not self._latest(results, "calculate_leave_days"):
+            # The model asked back instead of counting: resolve the stated range and count it.
+            state = self.execute_inline(state, "resolve_dates", {"text": text[:300]})
+            resolved = self._latest(state.get("tool_results", []), "resolve_dates")
+            if resolved and resolved.get("status") != "success":
+                return {**state, "response": self.friendly_failure("resolve_dates", resolved.get("result", {}))}
+            dates = [item["date"] for item in (resolved or {}).get("result", {}).get("dates", [])]
+            if not dates:
+                return {**state, "response": "Please provide the start date and end date to count."}
+            state = self.execute_inline(state, "calculate_leave_days", {"start_date": dates[0], "end_date": dates[-1]})
+            results = state.get("tool_results", [])
         last = results[-1] if results else None
         if last and last.get("status") == "success" and last.get("tool") in {"calculate_leave_days", "get_holidays"}:
-            return {"response": self.present(last)}
+            return {**state, "response": self.present(last)}
         if last and last.get("status") != "success" and intent == "calculate_leave_days":
-            return {"response": self.friendly_failure(str(last.get("tool")), last.get("result", {}))}
+            return {**state, "response": self.friendly_failure(str(last.get("tool")), last.get("result", {}))}
         return None
 
     def _finalize_plan(self, state: AgentRunState, intent: str, message: str) -> AgentRunState | None:
