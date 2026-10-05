@@ -20,4 +20,6 @@ Claude outputs/
 frontend/tmp-preview/
 
 # Demo videos (too large for GitHub; share the video by link instead)
-video_cleanup/
+demo/
+*.mp4
+*.mov
