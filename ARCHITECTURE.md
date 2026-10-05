@@ -245,6 +245,19 @@ Pending actions are owned by both session and authenticated user, expire automat
 consumed atomically. Approval consumes balance only after confirmation. Replay attempts cannot
 execute the same action twice.
 
+### Leave Agent loop safeguards
+
+- Tool errors and repeated calls are returned to the model as results, so it can correct its
+  arguments or explain the factual reason; a second identical repeat ends the turn.
+- Invalid model output gets one repair turn that shows the model the validation error
+  (`LEAVE_AGENT_MAX_REPAIRS`).
+- Grounding check: every number in the final answer must appear in this turn's tool results,
+  the active plan, the conversation or today's date; otherwise the model regenerates once.
+- If repair fails, the reply is rendered only from tool results already returned (plan summary,
+  balance, request list or the tool error); the user's words are never pattern-matched to guess.
+- Native provider tool calling is used when `LEAVE_AGENT_NATIVE_TOOLS=true`; check support first
+  with `python -m app.llm.probe`. Otherwise the JSON decision protocol is used.
+
 ## 9. Policy RAG
 
 ### Ingestion

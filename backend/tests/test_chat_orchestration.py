@@ -1480,10 +1480,11 @@ def test_leave_agent_simple_balance_emits_only_balance_activity(db_session):
     assert result.agent_activity[0]["status"] == "success"
 
 
-def test_leave_agent_recovers_balance_when_final_model_output_is_malformed(db_session):
+def test_leave_agent_falls_back_to_tool_results_after_repeated_malformed_output(db_session):
     llm = FakeLLM([
         route(intent="leave_balance", leave_type="CASUAL"),
         json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "tool", "tool_calls": []}),
         json.dumps({"action": "tool", "tool_calls": []}),
     ])
 
@@ -1491,31 +1492,83 @@ def test_leave_agent_recovers_balance_when_final_model_output_is_malformed(db_se
         "agent-balance-recovery", "How much casual leave do I have?"
     )
 
-    assert "4 days" in result.message
+    assert "You have 4 days of Casual leave available" in result.message
     assert result.intent == "leave_balance"
-    assert result.agent_activity[0]["tool"] == "get_leave_balance"
+    assert [event["tool"] for event in result.agent_activity] == ["get_leave_balance"]
     assert result.pending_action is None
+    # one tool turn, one invalid turn, one repair turn (also invalid): no regex guessing
+    assert llm.calls.count(("standard", True)) == 3
 
 
-def test_leave_agent_replaces_generic_failure_for_plural_balance_query(db_session):
+def test_leave_agent_repairs_one_malformed_output_with_the_validation_error(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "final", "message": ""}),  # schema-invalid: final without a message
+        json.dumps({"action": "final", "message": "You have 4 Casual Leave days available."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-repair", "How much casual leave do I have?")
+
+    assert result.message == "You have 4 Casual Leave days available."
+
+
+def test_leave_agent_regenerates_an_answer_with_numbers_not_in_tool_results(db_session):
     llm = FakeLLM([
         route(intent="leave_balance"),
         json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {}}]}),
-        json.dumps({
-            "action": "final",
-            "message": "I couldn't safely complete that Leave request. Please try again with the leave type and dates.",
-        }),
+        json.dumps({"action": "final", "message": "You have 7 casual leave days left."}),
+        json.dumps({"action": "final", "message": "You have 4 casual leave days available."}),
     ])
 
-    result = orchestrator(db_session, llm).chat(
-        "agent-all-balances", "Show my leave balances"
-    )
+    result = orchestrator(db_session, llm).chat("agent-grounding", "Show my leave balances")
 
-    assert "Casual: 4 available" in result.message
-    assert "Sick:" in result.message
-    assert "Earned:" in result.message
-    assert "couldn't safely complete" not in result.message
-    assert result.pending_action is None
+    assert result.message == "You have 4 casual leave days available."
+
+
+def test_leave_agent_never_shows_an_answer_that_stays_ungrounded(db_session):
+    llm = FakeLLM([
+        route(intent="leave_balance"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}]}),
+        json.dumps({"action": "final", "message": "You have 7 casual leave days left."}),
+        json.dumps({"action": "final", "message": "You have 6 casual leave days left."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-grounding-fallback", "How much casual leave do I have?")
+
+    assert "You have 4 days of Casual leave available" in result.message
+    assert "7" not in result.message and "6 casual" not in result.message
+
+
+def test_leave_agent_feeds_tool_errors_back_so_the_model_can_correct_itself(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "VACATION", "dates": ["2026-10-12"]}}]}),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": ["2026-10-12"]}}]}),
+        json.dumps({"action": "final", "message": "Yes, 1 working day of casual leave on 2026-10-12 is fine; 3 days remain."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-tool-error", "Can I take casual leave on 12 October?")
+
+    assert [(event["tool"], event["status"]) for event in result.agent_activity] == [
+        ("build_leave_plan", "error"), ("build_leave_plan", "success")
+    ]
+    assert "3 days remain" in result.message
+
+
+def test_leave_agent_warns_once_about_a_repeated_tool_call_then_continues(db_session):
+    call = {"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}}
+    llm = FakeLLM([
+        route(intent="leave_balance", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [call]}),
+        json.dumps({"action": "tool", "tool_calls": [call]}),
+        json.dumps({"action": "final", "message": "You have 4 Casual Leave days available."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("agent-repeat", "How much casual leave do I have?")
+
+    assert result.message == "You have 4 Casual Leave days available."
+    assert [event["tool"] for event in result.agent_activity] == ["get_leave_balance"]
 
 
 def test_leave_agent_recovers_eligibility_when_final_model_output_is_malformed(db_session):
@@ -1638,7 +1691,7 @@ def test_leave_agent_surfaces_invalid_date_range_without_pending_action(db_sessi
         "agent-invalid-range", "Apply casual leave from 20 October to 10 October"
     )
 
-    assert "dates are invalid" in result.message
+    assert "End date must be on or after start date" in result.message
     assert result.pending_action is None
     assert db_session.scalars(select(LeaveRequest)).all() == []
 
@@ -1683,7 +1736,8 @@ def test_leave_agent_stops_at_configured_iteration_limit(db_session):
         settings=Settings(leave_agent_max_iterations=1, llm_max_calls_per_request=4),
     ).chat("agent-limit", "How much casual leave do I have?")
 
-    assert "safe execution limit" in result.message
+    assert "stopped early" in result.message
+    assert "4 days of Casual leave" in result.message
     assert result.pending_action is None
     assert result.agent_activity[0]["tool"] == "get_leave_balance"
 
@@ -1878,3 +1932,72 @@ def test_read_tools_never_change_the_active_plan(db_session):
     stored = json.loads(db_session.get(ConversationSession, "plan-stable").state_json)
 
     assert stored["leave_plan"]["requested_dates"] == ["2026-10-06", "2026-10-11"]
+
+
+
+class FakeToolCallingLLM(FakeLLM):
+    """Router via JSON, Leave Agent via scripted native tool-calling turns."""
+
+    def __init__(self, routes, turns):
+        super().__init__(routes)
+        self.turns = list(turns)
+        self.tool_requests = []
+
+    def complete_with_tools(self, tier, *, system, messages, tools):
+        self.calls.append((tier, "tools"))
+        self.tool_requests.append({"messages": messages, "tools": tools})
+        return self.turns.pop(0)
+
+
+def test_native_tool_calling_runs_the_same_plan_flow(db_session):
+    from app.llm.ports import LLMToolCall, LLMToolTurn
+
+    llm = FakeToolCallingLLM(
+        [route(intent="leave_eligibility", leave_type="CASUAL")],
+        [
+            LLMToolTurn(None, [LLMToolCall("c1", "resolve_dates", {"text": "Tuesday and Sunday"})]),
+            LLMToolTurn(None, [LLMToolCall("c2", "build_leave_plan", {"leave_type": "CASUAL", "dates": ["2026-10-06", "2026-10-11"]})]),
+            LLMToolTurn("Yes: 1 working day on 2026-10-06; Sunday 2026-10-11 is a weekly off. 3 days remain.", []),
+        ],
+    )
+    service = orchestrator(db_session, llm, settings=Settings(leave_agent_native_tools=True))
+
+    result = service.chat("native-tools", "can i take casual leave on Tuesday and Sunday")
+
+    assert "1 working day" in result.message
+    assert [event["tool"] for event in result.agent_activity] == ["resolve_dates", "build_leave_plan"]
+    last = llm.tool_requests[-1]["messages"]
+    assert [item["role"] for item in last] == ["user", "assistant", "tool", "assistant", "tool"]
+    assert last[2]["tool_call_id"] == "c1" and last[4]["tool_call_id"] == "c2"
+    assert {tool["function"]["name"] for tool in llm.tool_requests[0]["tools"]} >= {
+        "resolve_dates", "build_leave_plan", "prepare_leave_application"
+    }
+
+
+def test_mantle_gateway_native_tool_calling_contract():
+    captured = {}
+
+    def handler(request: httpx.Request):
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": None,
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "get_leave_balance", "arguments": "{\"leave_type\": \"CASUAL\"}"}}],
+        }}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    gateway = MantleLLMGateway(Settings(bedrock_api_key="test-key", llm_max_retries=0), client=client)
+
+    turn = gateway.complete_with_tools(
+        "standard",
+        system="agent",
+        messages=[{"role": "user", "content": "balance?"}],
+        tools=[{"type": "function", "function": {"name": "get_leave_balance", "description": "d", "parameters": {"type": "object"}}}],
+    )
+
+    assert turn.content is None
+    assert turn.tool_calls[0].name == "get_leave_balance"
+    assert turn.tool_calls[0].arguments == {"leave_type": "CASUAL"}
+    assert captured["body"]["tools"][0]["function"]["name"] == "get_leave_balance"
+    assert captured["body"]["tool_choice"] == "auto"
+    assert captured["body"]["messages"][0] == {"role": "system", "content": "agent"}

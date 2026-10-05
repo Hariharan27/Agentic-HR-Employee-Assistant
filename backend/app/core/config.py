@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     llm_max_calls_per_request: int = Field(default=8, ge=1, le=20)
     leave_agent_max_iterations: int = Field(default=6, ge=1, le=12)
     leave_agent_max_tool_calls: int = Field(default=8, ge=1, le=20)
+    # Use the provider's native tool calling instead of the JSON decision protocol.
+    # Keep False until `python -m app.llm.probe` confirms the model supports it.
+    leave_agent_native_tools: bool = False
+    # Extra model turns allowed to repair invalid output or an ungrounded answer.
+    leave_agent_max_repairs: int = Field(default=1, ge=0, le=3)
     parking_booking_horizon_days: int = Field(default=30, ge=1, le=365)
     parking_cancellation_cutoff_hour: int = Field(default=20, ge=0, le=23)
     parking_check_in_open_hour: int = Field(default=7, ge=0, le=23)
