@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { changePassword, getOnboardingStatus, getParkingAdminReservations, getPendingOnboardingApprovals, getProfile, getReportingManagers, login, sendChatStream } from "./api";
+import { HttpError, changePassword, getMyVehicles, getOnboardingStatus, getParkingAdminReservations, getPendingOnboardingApprovals, getProfile, getReportingManagers, login, sendChatStream } from "./api";
 import { RichText } from "./RichText";
-import type { ChatMessage, LiveStep, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager, Source } from "./types";
+import type { Vehicle, ChatMessage, LiveStep, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager, Source } from "./types";
 
 const demoAccounts = {
   EMPLOYEE: { username: "employee", password: "Advik!Desk-2026" },
@@ -13,30 +13,30 @@ const demoAccounts = {
 
 const quickPrompts: Record<Profile["role"], string[]> = {
   EMPLOYEE: [
-    "What is my leave balance?",
-    "What is the casual leave policy?",
-    "Register my vehicle",
-    "Reserve parking tomorrow",
+    "How many leaves do I have left?",
+    "Can I take a casual leave next Tuesday and Sunday?",
+    "If I don't use my casual leave, does it carry over to next year?",
+    "Which parking slots are free today?",
   ],
   MANAGER: [
-    "Start onboarding a new employee",
-    "What's Priya's onboarding status?",
     "Show my pending approvals",
+    "I need to onboard a new employee",
+    "How many leaves do I have left?",
   ],
   HR: [
-    "Start onboarding a new employee",
-    "What's Priya's onboarding status?",
+    "I need to onboard a new employee",
     "Show my approval queue",
+    "Can I work from home? What does the hybrid policy say?",
   ],
   HR_ADMIN: [
-    "Show pending onboarding approvals",
-    "What's Priya's onboarding status?",
-    "What is the employee onboarding policy?",
+    "Which onboarding requests are waiting for my approval?",
+    "What does the code of conduct say about conflicts of interest?",
+    "How many leaves do I have left?",
   ],
   PARKING_ADMIN: [
-    "Show parking admin queue for today",
-    "Check in parking reservation #",
-    "Mark parking reservation # as no-show",
+    "Show today's parking queue",
+    "Show parking admin queue for tomorrow",
+    "How many leaves do I have left?",
   ],
 };
 
@@ -78,12 +78,34 @@ function groupedSourceLabels(sources: Source[]) {
   });
 }
 
+const CHAT_KEY = "peopledesk-chat";
+
+type SavedChat = { token: string; sessionId?: string; messages: ChatMessage[]; pendingAction: string | null };
+
+function loadChat(token: string): SavedChat | null {
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(CHAT_KEY) || "null") as SavedChat | null;
+    return saved && token && saved.token === token ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveChat(token: string, sessionId: string | undefined, messages: ChatMessage[], pendingAction: string | null) {
+  try {
+    sessionStorage.setItem(CHAT_KEY, JSON.stringify({ token, sessionId, messages: messages.slice(-60), pendingAction }));
+  } catch {
+    // Storage can be unavailable (private mode); the chat still works without it.
+  }
+}
+
 function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem("hr-token") || "");
   const [profile, setProfile] = useState<Profile | null>(null);
-  const [sessionId, setSessionId] = useState<string>();
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const restored = useMemo(() => loadChat(sessionStorage.getItem("hr-token") || ""), []);
+  const [sessionId, setSessionId] = useState<string | undefined>(restored?.sessionId);
+  const [messages, setMessages] = useState<ChatMessage[]>(restored?.messages || []);
+  const [pendingAction, setPendingAction] = useState<string | null>(restored?.pendingAction || null);
   const [sidePanel, setSidePanel] = useState<"onboarding" | "parking">("onboarding");
   const [onboardingQuery, setOnboardingQuery] = useState("");
   const [onboardingStatus, setOnboardingStatus] = useState<OnboardingStatus | null>(null);
@@ -102,6 +124,7 @@ function App() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [liveSteps, setLiveSteps] = useState<LiveStep[]>([]);
+  const [myVehicles, setMyVehicles] = useState<Vehicle[]>([]);
   const [passwordForm, setPasswordForm] = useState({ current: "", next: "", confirm: "" });
   const [passwordError, setPasswordError] = useState("");
   const [error, setError] = useState("");
@@ -167,6 +190,12 @@ function App() {
       .catch(() => logout());
   }, [token]);
 
+  // Keep the conversation for this browser tab, so a refresh mid-demo keeps the session and its
+  // pending confirmation. Cleared on sign-out and "New chat".
+  useEffect(() => {
+    if (token) saveChat(token, sessionId, messages, pendingAction);
+  }, [token, sessionId, messages, pendingAction]);
+
   useEffect(() => {
     const target = messageEnd.current;
     if (target && typeof target.scrollIntoView === "function") {
@@ -193,6 +222,7 @@ function App() {
 
   function logout() {
     sessionStorage.removeItem("hr-token");
+    sessionStorage.removeItem(CHAT_KEY);
     setToken("");
     setProfile(null);
     setSessionId(undefined);
@@ -326,6 +356,7 @@ function App() {
   function renderVehicleForm() {
     return (
       <form className="onboarding-form chat-onboarding-form vehicle-form" onSubmit={(event) => void submitVehicleForm(event)}>
+        {myVehicles.length > 0 && <div className="vehicle-picks"><span>Your vehicles ({myVehicles.length} of 2). Pick one to update, or enter a new registration to add:</span>{myVehicles.map((vehicle) => <button type="button" key={vehicle.registration_number} className={vehicleForm.registrationNumber === vehicle.registration_number ? "active" : ""} onClick={() => setVehicleForm({ registrationNumber: vehicle.registration_number, vehicleType: vehicle.vehicle_type, makeModel: vehicle.make_model || "" })}>{vehicle.registration_number}{vehicle.make_model ? ` · ${vehicle.make_model}` : ""}</button>)}</div>}
         <label>Registration number<input value={vehicleForm.registrationNumber} onChange={(event) => updateVehicleForm("registrationNumber", event.target.value)} placeholder="TN01AB1234" autoCapitalize="characters" /></label>
         <label>Vehicle type<select value={vehicleForm.vehicleType} onChange={(event) => updateVehicleForm("vehicleType", event.target.value)}><option value="CAR">Car</option><option value="MOTORCYCLE">Motorcycle</option></select></label>
         <label>Make and model (optional)<input value={vehicleForm.makeModel} onChange={(event) => updateVehicleForm("makeModel", event.target.value)} placeholder="Hyundai i20" /></label>
@@ -402,7 +433,20 @@ function App() {
         setOnboardingFormError("");
         void refreshReportingManagers();
       }
-      if (showVehicleForm) setVehicleFormError("");
+      if (showVehicleForm) {
+        setVehicleFormError("");
+        // Pre-fill: list the employee's vehicles; an update request names (or has only) one of them.
+        void getMyVehicles(token).then((vehicles) => {
+          setMyVehicles(vehicles);
+          const compact = normalized.replace(/[\s-]/g, "").toUpperCase();
+          const named = vehicles.find((vehicle) => compact.includes(vehicle.registration_number));
+          const wantsUpdate = /\b(update|edit|change)\b/i.test(normalized);
+          const target = named || (wantsUpdate && vehicles.length === 1 ? vehicles[0] : undefined);
+          setVehicleForm(target
+            ? { registrationNumber: target.registration_number, vehicleType: target.vehicle_type, makeModel: target.make_model || "" }
+            : emptyVehicleForm);
+        }).catch(() => setMyVehicles([]));
+      }
       if (response.domain === "onboarding") {
         setSidePanel("onboarding");
         const requestId = response.message.match(/Onboarding request #(\d+)/i)?.[1];
@@ -414,11 +458,24 @@ function App() {
       }
       await refreshOnboardingApprovals();
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "The assistant could not respond");
+      if (nextError instanceof HttpError && nextError.status === 403 && nextError.code !== "password_change_required") {
+        setMessages((current) => [...current, { id: crypto.randomUUID(), role: "assistant", text: nextError.message, kind: "denied" }]);
+      } else {
+        setError(nextError instanceof Error ? nextError.message : "The assistant could not respond");
+      }
     } finally {
       setLoading(false);
       setLiveSteps([]);
     }
+  }
+
+  function startNewChat() {
+    setSessionId(undefined);
+    setMessages([]);
+    setPendingAction(null);
+    setError("");
+    setInput("");
+    saveChat(token, undefined, [], null);
   }
 
   if (!profile) {
@@ -428,7 +485,7 @@ function App() {
           <img className="brand-logo on-dark" src="/ideas2it-logo.svg" alt="ideas2it" />
           <p className="eyebrow">PEOPLEDESK BY IDEAS2IT</p>
           <h1>HR help for Ideators, without the waiting.</h1>
-          <p className="lead">Your secure ideas2it HR help desk, grounded in company policy and connected to real employee workflows.</p>
+          <p className="lead">Your secure Ideas2IT HR help desk, grounded in company policy and connected to real employee workflows.</p>
           <div className="trust-row"><span>Policy grounded</span><span>Authenticated</span><span>Auditable</span></div>
         </section>
         <section className="login-card">
@@ -505,24 +562,25 @@ function App() {
       <aside className="sidebar">
         <div className="brand"><img className="brand-logo small on-dark" src="/ideas2it-logo.svg" alt="ideas2it" /><div><strong>PeopleDesk</strong><span>by Ideas2IT</span></div></div>
         <div className="profile-card"><div className="avatar">{profile.name.split(" ").map((part) => part[0]).slice(0, 2).join("")}</div><div><strong>{profile.name}</strong><span>{profile.employee_code} · {profile.role.replaceAll("_", " ")}</span></div></div>
-        <nav><button className="nav-active"><span>✦</span> Assistant</button>{canManageOnboarding && <button onClick={() => setSidePanel("onboarding")}><span>◇</span> Onboarding</button>}{canManageParking && <button onClick={() => { setSidePanel("parking"); void refreshParkingReservations(); }}><span>▦</span> Parking</button>}</nav>
+        <nav><button className="new-chat" onClick={startNewChat} disabled={loading}><span>＋</span> New chat</button><button className="nav-active"><span>✦</span> Assistant</button>{canManageOnboarding && <button onClick={() => setSidePanel("onboarding")}><span>◇</span> Onboarding</button>}{canManageParking && <button onClick={() => { setSidePanel("parking"); void refreshParkingReservations(); }}><span>▦</span> Parking</button>}</nav>
         <div className="side-note"><span className="live-dot" />Connected to HR services</div>
         <button className="logout" onClick={logout}>Sign out</button>
       </aside>
 
       <section className="workspace">
-        <header><div><p className="eyebrow dark">IDEATOR HR HELP DESK</p><h2>How can PeopleDesk help today?</h2></div><div className="role-pill">{profile.role === "EMPLOYEE" ? "Employee self-service" : profile.role === "HR_ADMIN" ? "HR administration" : profile.role === "PARKING_ADMIN" ? "Parking administration" : "Manager & HR workspace"}</div></header>
+        <header><div><p className="eyebrow dark">PEOPLEDESK · IDEAS2IT HR</p><h2>How can PeopleDesk help today?</h2></div><div className="role-pill">{profile.role === "EMPLOYEE" ? "Employee self-service" : profile.role === "HR_ADMIN" ? "HR administration" : profile.role === "PARKING_ADMIN" ? "Parking administration" : "Manager & HR workspace"}</div></header>
         <div className={`content-grid${showSidePanel ? "" : " chat-only"}`}>
           <section className="chat-panel">
             <div className="messages">
               {messages.length === 0 && <div className="welcome"><img className="brand-logo welcome-logo" src="/ideas2it-logo.svg" alt="" /><h3>Hello, {profile.name.split(" ")[0]}</h3><p>Ask PeopleDesk about HR policies, balances, leave requests, or workplace parking.{profile.role === "HR_ADMIN" ? " You can also review onboarding requests and activate employee accounts." : canManageParking ? " You can monitor parking arrivals and confirm admin actions before anything changes." : canCreateOnboarding ? " You can also onboard and track new Ideators." : ""} I’ll show sources and confirm before changing anything.</p><div className="suggestions">{suggestions.map((prompt) => <button key={prompt} onClick={() => void submitMessage(prompt)}>{prompt}<span>→</span></button>)}</div></div>}
               {messages.map((message) => {
+                const lastAssistantId = [...messages].reverse().find((item) => item.role === "assistant")?.id;
                 const renderInlineOnboardingForm = canCreateOnboarding && shouldRenderOnboardingForm(message);
                 const renderInlineVehicleForm = profile.role === "EMPLOYEE" && shouldRenderVehicleForm(message);
-                return <article key={message.id} className={`message ${message.role}${message.intent?.includes("onboarding") ? " onboarding-message" : ""}${renderInlineOnboardingForm || renderInlineVehicleForm ? " with-form" : ""}`}><div className="message-label">{message.role === "assistant" ? "Ideator PeopleDesk" : "You"}{message.intent && <span>{message.intent.replaceAll("_", " ")}</span>}</div>{message.role === "assistant" ? <RichText text={message.text} /> : <p>{message.text}</p>}{message.agentActivity && message.agentActivity.length > 0 && <details className="agent-activity" open><summary>Agent activity <span>{message.agentActivity.length}</span></summary><ul>{message.agentActivity.map((activity, index) => <li key={`${activity.tool}-${index}`} className={activity.status}><span aria-hidden="true">{activity.status === "success" ? "✓" : "!"}</span>{activity.label}</li>)}</ul></details>}{renderInlineOnboardingForm && renderOnboardingForm()}{renderInlineVehicleForm && renderVehicleForm()}{message.sources && message.sources.length > 0 && <div className="sources"><strong>Based on</strong>{groupedSourceLabels(message.sources).map((label) => <span key={label}>{label}</span>)}</div>}</article>;
+                return <article key={message.id} className={`message ${message.role}${message.intent?.includes("onboarding") ? " onboarding-message" : ""}${renderInlineOnboardingForm || renderInlineVehicleForm ? " with-form" : ""}`}><div className="message-label">{message.role === "assistant" ? "PeopleDesk" : "You"}{message.intent && <span>{message.intent.replaceAll("_", " ")}</span>}</div>{message.kind === "denied" ? <div className="denied-card" role="alert"><strong>Not allowed for your role</strong><span>{message.text}</span><small>Checked from your sign-in before any AI step ran; nothing was changed.</small></div> : message.role === "assistant" ? <RichText text={message.text} /> : <p>{message.text}</p>}{pendingAction && message.role === "assistant" && message.id === lastAssistantId && <div className="inline-confirm"><button onClick={() => void submitMessage("cancel")} disabled={loading}>Cancel</button><button className="confirm" onClick={() => void submitMessage("yes")} disabled={loading}>Confirm</button></div>}{message.agentActivity && message.agentActivity.length > 0 && <details className="agent-activity" open><summary>Agent activity <span>{message.agentActivity.length}</span></summary><ul>{message.agentActivity.map((activity, index) => <li key={`${activity.tool}-${index}`} className={activity.status}><span aria-hidden="true">{activity.status === "success" ? "✓" : "!"}</span>{activity.label}</li>)}</ul></details>}{renderInlineOnboardingForm && renderOnboardingForm()}{renderInlineVehicleForm && renderVehicleForm()}{message.sources && message.sources.length > 0 && <div className="sources"><strong>Based on</strong>{groupedSourceLabels(message.sources).map((label) => <span key={label}>{label}</span>)}</div>}</article>;
               })}
               {loading && (liveSteps.length > 0
-                ? <article className="message assistant live-activity" aria-live="polite"><div className="message-label">Ideator PeopleDesk<span>working</span></div><ul>{liveSteps.map((step) => <li key={step.id} className={step.status}><span aria-hidden="true">{step.status === "running" ? "" : step.status === "success" ? "✓" : "!"}</span>{step.label}{step.status === "running" ? "…" : ""}</li>)}</ul></article>
+                ? <article className="message assistant live-activity" aria-live="polite"><div className="message-label">PeopleDesk<span>working</span></div><ul>{liveSteps.map((step) => <li key={step.id} className={step.status}><span aria-hidden="true">{step.status === "running" ? "" : step.status === "success" ? "✓" : "!"}</span>{step.label}{step.status === "running" ? "…" : ""}</li>)}</ul></article>
                 : <article className="message assistant typing"><span /><span /><span /></article>)}
               <div ref={messageEnd} />
             </div>

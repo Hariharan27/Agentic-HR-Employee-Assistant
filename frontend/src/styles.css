@@ -233,3 +233,21 @@ a { color: #1d4ed8; }
 .lead { color: rgba(255,255,255,.72); }
 .role-switcher { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .role-switcher button { padding: 10px 4px; font-size: 12px; white-space: nowrap; }
+
+/* Inline confirmation, denied card, vehicle picks, new chat */
+.inline-confirm { display: flex; gap: 8px; margin: 8px 4px 0; }
+.inline-confirm button { padding: 8px 14px; border: 1px solid #d4d4d0; border-radius: 8px; background: #fff; color: #333; font-size: 12px; font-weight: 600; }
+.inline-confirm button.confirm { border-color: #18181a; background: #18181a; color: #fff; }
+.inline-confirm button:disabled { opacity: .5; cursor: wait; }
+.denied-card { display: grid; gap: 4px; padding: 12px 14px; border: 1px solid #f1c9c4; border-left: 4px solid #b42318; border-radius: 4px 12px 12px 12px; background: #fef3f2; color: #7a271a; font-size: 13px; }
+.denied-card strong { color: #b42318; font-size: 13px; }
+.denied-card small { color: #a15c52; font-size: 11px; }
+.vehicle-picks { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 4px; }
+.vehicle-picks span { width: 100%; color: #5e5e5e; font-size: 11px; }
+.vehicle-picks button { padding: 6px 10px; border: 1px solid #d4d4d0; border-radius: 8px; background: #fff; color: #333; font-size: 11px; font-weight: 600; }
+.vehicle-picks button.active { border-color: #1d4ed8; background: #eef4fd; color: #1d4ed8; }
+nav button.new-chat { color: #fff; border: 1px solid rgba(255,255,255,.18); margin-bottom: 6px; }
+nav button.new-chat:hover { background: rgba(255,255,255,.1); }
+nav button.new-chat:disabled { opacity: .5; cursor: wait; }
+.onboarding-form .submit-onboarding, .submit-onboarding { border: 0; border-radius: 8px; padding: 11px; color: #fff; background: #18181a; font-size: 12px; font-weight: 600; }
+.submit-onboarding:disabled { opacity: .55; cursor: wait; }

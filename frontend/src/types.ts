@@ -57,6 +57,14 @@ export type ChatMessage = {
   agentActivity?: AgentActivity[];
   showOnboardingForm?: boolean;
   showVehicleForm?: boolean;
+  /** "denied" renders the reply as a "not allowed for your role" card. */
+  kind?: "denied";
+};
+
+export type Vehicle = {
+  registration_number: string;
+  vehicle_type: "CAR" | "MOTORCYCLE";
+  make_model?: string | null;
 };
 
 export type LeaveRequest = {

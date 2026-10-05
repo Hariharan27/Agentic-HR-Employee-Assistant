@@ -1,8 +1,8 @@
-import type { ChatResponse, LiveStep, LeaveRequest, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager } from "./types";
+import type { Vehicle, ChatResponse, LiveStep, LeaveRequest, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
-type ApiError = { error?: { message?: string }; detail?: string };
+type ApiError = { error?: { message?: string; code?: string }; detail?: string };
 
 async function request<T>(path: string, options: RequestInit = {}, token?: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -15,10 +15,19 @@ async function request<T>(path: string, options: RequestInit = {}, token?: strin
   });
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as ApiError;
-    throw new Error(payload.error?.message || payload.detail || `Request failed (${response.status})`);
+    throw new HttpError(payload.error?.message || payload.detail || `Request failed (${response.status})`, response.status, payload.error?.code);
   }
   return response.json() as Promise<T>;
 }
+
+/** An API error that keeps the HTTP status and error code (e.g. 403 forbidden). */
+export class HttpError extends Error {
+  constructor(message: string, public status: number, public code?: string) {
+    super(message);
+  }
+}
+
+export const getMyVehicles = (token: string) => request<Vehicle[]>("/api/v1/parking/me/vehicles", {}, token);
 
 export async function login(username: string, password: string) {
   return request<{ access_token: string; role: string; must_change_password?: boolean }>("/api/v1/auth/login", {
@@ -87,7 +96,7 @@ async function readChatStream(
   if (response.status === 404 || response.status === 405) throw new StreamUnavailable("No streaming endpoint");
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as ApiError;
-    throw new Error(payload.error?.message || payload.detail || `Request failed (${response.status})`);
+    throw new HttpError(payload.error?.message || payload.detail || `Request failed (${response.status})`, response.status, payload.error?.code);
   }
   if (!response.body) throw new StreamUnavailable("Streaming not supported");
 
@@ -112,7 +121,7 @@ async function readChatStream(
       const payload = JSON.parse(data);
       if (event === "step") onStep(payload as LiveStep);
       else if (event === "final") return payload as ChatResponse;
-      else if (event === "error") throw new Error(payload.message || "The assistant could not respond");
+      else if (event === "error") throw new HttpError(payload.message || "The assistant could not respond", payload.status || 500);
     }
     if (done) break;
   }

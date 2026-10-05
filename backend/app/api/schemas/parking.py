@@ -33,3 +33,9 @@ class ParkingSuspensionResponse(BaseModel):
     active: bool
     no_show_count: int
     suspended_until: date | None
+
+
+class VehicleResponse(BaseModel):
+    registration_number: str
+    vehicle_type: str
+    make_model: str | None = None

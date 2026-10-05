@@ -232,6 +232,7 @@ document, page, section, and category.
 
 - `GET /api/v1/health`
 - `POST /api/v1/auth/login`
+- `POST /api/v1/auth/change-password`
 - `GET /api/v1/auth/me`
 - `POST /api/v1/chat`
 - `POST /api/v1/chat/stream` (Server-Sent Events: `step` … `final`)
@@ -241,6 +242,7 @@ document, page, section, and category.
 - `GET /api/v1/manager/leave-requests`
 - `POST /api/v1/manager/leave-requests/{id}/approve`
 - `POST /api/v1/manager/leave-requests/{id}/reject`
+- `GET /api/v1/parking/me/vehicles`
 - `GET /api/v1/parking/me/suspension`
 - `GET /api/v1/parking/reservations/{id}/history`
 - `GET /api/v1/parking-admin/reservations`
