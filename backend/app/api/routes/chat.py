@@ -1,6 +1,8 @@
+from datetime import datetime
 from functools import lru_cache
 from typing import Annotated
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends
 
@@ -29,6 +31,7 @@ from app.application.parking.handlers import (
 from app.application.parking.service import ParkingService
 from app.application.pending.handlers import (
     ApplyLeaveHandler,
+    ApplyLeavePlanHandler,
     ApproveLeaveRequestHandler,
     CancelLeaveRequestHandler,
     RejectLeaveRequestHandler,
@@ -83,7 +86,10 @@ def chat(
     llm: LLM,
     policies: Policies,
 ) -> ChatResponse:
-    leave = LeaveService(SQLAlchemyLeaveRepository(db))
+    timezone = ZoneInfo(settings.app_timezone)
+    leave = LeaveService(
+        SQLAlchemyLeaveRepository(db), today=lambda: datetime.now(timezone).date()
+    )
     onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db))
     parking = ParkingService(SQLAlchemyParkingRepository(db), settings)
     email_service = EmailService(ConsoleEmailGateway())
@@ -91,6 +97,7 @@ def chat(
         SQLAlchemyPendingActionRepository(db),
         {
             "apply_leave": ApplyLeaveHandler(leave),
+            "apply_leave_plan": ApplyLeavePlanHandler(leave),
             "approve_leave_request": ApproveLeaveRequestHandler(leave),
             "reject_leave_request": RejectLeaveRequestHandler(leave),
             "cancel_leave_request": CancelLeaveRequestHandler(leave),

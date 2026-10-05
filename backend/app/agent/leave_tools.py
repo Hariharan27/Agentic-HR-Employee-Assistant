@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -11,7 +12,11 @@ from app.application.leave.service import LeaveService
 from app.application.pending.service import PendingActionCoordinator
 from app.core.exceptions import ApplicationError, ValidationError
 from app.core.security import AuthenticatedUser
+from app.domain.leave.dates import MAX_RESOLVED_DAYS, describe_day, resolve_leave_dates
+from app.domain.leave.plan import stored_plan_inputs
 from app.rag.service import PolicyKnowledgeService
+
+logger = logging.getLogger("app.leave_tools")
 
 
 def _number(value: Decimal) -> str:
@@ -33,8 +38,14 @@ class DateRangeArguments(ToolArguments):
     end_date: date
 
 
-class EligibilityArguments(DateRangeArguments):
+class ResolveDatesArguments(ToolArguments):
+    text: str = Field(min_length=1, max_length=300)
+
+
+class BuildPlanArguments(ToolArguments):
     leave_type: str = Field(min_length=1, max_length=32)
+    dates: list[date] = Field(min_length=1, max_length=MAX_RESOLVED_DAYS)
+    reason: str | None = Field(default=None, max_length=1000)
 
 
 class RequestListArguments(ToolArguments):
@@ -53,8 +64,8 @@ class ManagedRequestsArguments(ToolArguments):
     status: str | None = Field(default="PENDING", max_length=24)
 
 
-class PrepareApplicationArguments(EligibilityArguments):
-    reason: str | None = Field(default=None, max_length=1000)
+class PrepareApplicationArguments(ToolArguments):
+    plan_id: str = Field(min_length=1, max_length=40)
 
 
 class PrepareCancellationArguments(ToolArguments):
@@ -80,7 +91,7 @@ class LeaveToolExecution:
     label: str
     sources: list[dict[str, object]] = field(default_factory=list)
     pending_summary: str | None = None
-    context_update: dict[str, str] = field(default_factory=dict)
+    plan: dict[str, Any] | None = None
 
 
 class LeaveToolExecutor:
@@ -88,9 +99,10 @@ class LeaveToolExecutor:
 
     ARGUMENT_MODELS: ClassVar[dict[str, type[ToolArguments]]] = {
         "get_leave_balance": LeaveBalanceArguments,
+        "resolve_dates": ResolveDatesArguments,
+        "build_leave_plan": BuildPlanArguments,
         "get_holidays": DateRangeArguments,
         "calculate_leave_days": DateRangeArguments,
-        "check_leave_eligibility": EligibilityArguments,
         "get_my_leave_requests": RequestListArguments,
         "get_leave_request_history": RequestHistoryArguments,
         "search_leave_policy": PolicySearchArguments,
@@ -118,14 +130,23 @@ class LeaveToolExecutor:
     def definitions(cls) -> list[dict[str, Any]]:
         descriptions = {
             "get_leave_balance": "Get the authenticated employee's actual leave balance.",
+            "resolve_dates": (
+                "Turn the employee's date words, copied as written (e.g. 'Tuesday and Sunday', "
+                "'5th to 7th October', '3 days from 12 Oct'), into exact dates. Returns whether "
+                "they are separate days or one range, each date's weekday, and weekend/holiday flags."
+            ),
+            "build_leave_plan": (
+                "Validate a leave request for explicit dates (from resolve_dates) and one leave type. "
+                "Returns the plan: working days per segment, weekends/holidays not counted, balance "
+                "before/after, eligibility and problems. The newest plan becomes the active plan."
+            ),
             "get_holidays": "Get configured holidays in a date range.",
             "calculate_leave_days": "Calculate deterministic working leave days in a date range.",
-            "check_leave_eligibility": "Check the authenticated employee's eligibility for a leave range.",
             "get_my_leave_requests": "List the authenticated employee's leave requests.",
             "get_leave_request_history": "Get the authorized audit history for one leave request.",
             "search_leave_policy": "Retrieve grounded leave-policy passages and source metadata.",
             "get_managed_leave_requests": "List leave requests the authenticated manager or HR user may manage.",
-            "prepare_leave_application": "Validate and prepare an application for explicit user confirmation; never submits it.",
+            "prepare_leave_application": "Prepare the active, eligible leave plan (by plan_id) for explicit user confirmation; never submits it.",
             "prepare_leave_cancellation": "Validate and prepare cancellation for explicit confirmation; never cancels it.",
             "prepare_leave_approval": "Validate and prepare manager approval for explicit confirmation; never approves it.",
             "prepare_leave_rejection": "Validate and prepare manager rejection for explicit confirmation; never rejects it.",
@@ -140,7 +161,12 @@ class LeaveToolExecutor:
         ]
 
     def execute(
-        self, tool: str, arguments: dict[str, Any], *, session_id: str
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        session_id: str,
+        active_plan: dict[str, Any] | None = None,
     ) -> LeaveToolExecution:
         model = self.ARGUMENT_MODELS.get(tool)
         if model is None:
@@ -161,11 +187,12 @@ class LeaveToolExecutor:
 
         try:
             handler = getattr(self, f"_{tool}")
-            return handler(parsed, session_id=session_id)
+            return handler(parsed, session_id=session_id, active_plan=active_plan)
         except ApplicationError as exc:
             return self._error(tool, str(exc))
         except Exception:
             # Infrastructure details belong in server logs, never in the model or UI.
+            logger.exception("leave_tool_failed", extra={"tool": tool, "session_id": session_id})
             return self._error(tool, "The Leave service could not complete this operation")
 
     @staticmethod
@@ -188,9 +215,10 @@ class LeaveToolExecutor:
     def _base_label(tool: str) -> str:
         return {
             "get_leave_balance": "Checked leave balance",
+            "resolve_dates": "Resolved leave dates",
+            "build_leave_plan": "Checked leave eligibility",
             "get_holidays": "Checked holiday calendar",
             "calculate_leave_days": "Calculated working leave days",
-            "check_leave_eligibility": "Verified leave eligibility",
             "get_my_leave_requests": "Retrieved leave requests",
             "get_leave_request_history": "Retrieved leave request history",
             "search_leave_policy": "Consulted leave policy",
@@ -200,15 +228,6 @@ class LeaveToolExecutor:
             "prepare_leave_approval": "Prepared leave approval",
             "prepare_leave_rejection": "Prepared leave rejection",
         }.get(tool, "Executed Leave tool")
-
-    @staticmethod
-    def _context(arguments: ToolArguments) -> dict[str, str]:
-        values = arguments.model_dump(mode="json", exclude_none=True)
-        return {
-            key: str(values[key])
-            for key in ("leave_type", "start_date", "end_date", "reason")
-            if key in values
-        }
 
     def _get_leave_balance(
         self, arguments: LeaveBalanceArguments, **_: Any
@@ -231,7 +250,7 @@ class LeaveToolExecutor:
         if arguments.leave_type:
             label = f"Checked {arguments.leave_type.title()} Leave balance"
         return LeaveToolExecution(
-            "get_leave_balance", True, data, label, context_update=self._context(arguments)
+            "get_leave_balance", True, data, label
         )
 
     def _get_holidays(self, arguments: DateRangeArguments, **_: Any) -> LeaveToolExecution:
@@ -241,7 +260,6 @@ class LeaveToolExecutor:
             True,
             {"holidays": [item.isoformat() for item in holidays]},
             self._base_label("get_holidays"),
-            context_update=self._context(arguments),
         )
 
     def _calculate_leave_days(
@@ -253,29 +271,29 @@ class LeaveToolExecutor:
             True,
             {"working_days": _number(days)},
             self._base_label("calculate_leave_days"),
-            context_update=self._context(arguments),
         )
 
-    def _check_leave_eligibility(
-        self, arguments: EligibilityArguments, **_: Any
-    ) -> LeaveToolExecution:
-        result = self.leave.check_leave_eligibility(
-            self.actor, arguments.leave_type, arguments.start_date, arguments.end_date
+    def _resolve_dates(self, arguments: ResolveDatesArguments, **_: Any) -> LeaveToolExecution:
+        today = self.leave.today()
+        window_end = date(today.year + 1, 12, 31)
+        holidays = self.leave.get_holidays(date(today.year, 1, 1), window_end)
+        resolution = resolve_leave_dates(arguments.text, today, holidays)
+        data: dict[str, Any] = {
+            "today": today.isoformat(),
+            "shape": resolution.shape,
+            "dates": [describe_day(item, holidays) for item in resolution.dates],
+        }
+        if resolution.ambiguous:
+            data["question"] = resolution.question
+        return LeaveToolExecution("resolve_dates", True, data, self._base_label("resolve_dates"))
+
+    def _build_leave_plan(self, arguments: BuildPlanArguments, **_: Any) -> LeaveToolExecution:
+        plan = self.leave.build_leave_plan(
+            self.actor, arguments.leave_type, arguments.dates, arguments.reason
         )
+        data = plan.to_dict()
         return LeaveToolExecution(
-            "check_leave_eligibility",
-            True,
-            {
-                "eligible": result.eligible,
-                "leave_type": arguments.leave_type.upper(),
-                "start_date": arguments.start_date.isoformat(),
-                "end_date": arguments.end_date.isoformat(),
-                "requested_days": _number(result.working_days),
-                "available_days": _number(result.available_days),
-                "reason": result.reason,
-            },
-            self._base_label("check_leave_eligibility"),
-            context_update=self._context(arguments),
+            "build_leave_plan", True, data, self._base_label("build_leave_plan"), plan=data
         )
 
     def _get_my_leave_requests(
@@ -336,33 +354,53 @@ class LeaveToolExecutor:
         )
 
     def _prepare_leave_application(
-        self, arguments: PrepareApplicationArguments, *, session_id: str
+        self,
+        arguments: PrepareApplicationArguments,
+        *,
+        session_id: str,
+        active_plan: dict[str, Any] | None = None,
+        **_: Any,
     ) -> LeaveToolExecution:
-        eligibility = self.leave.check_leave_eligibility(
-            self.actor, arguments.leave_type, arguments.start_date, arguments.end_date
-        )
-        if not eligibility.eligible:
+        inputs = stored_plan_inputs(active_plan)
+        if inputs is None or inputs[3] != arguments.plan_id:
+            return self._error(
+                "prepare_leave_application",
+                "No active leave plan has that plan_id; build a leave plan for the requested dates first",
+            )
+        leave_type, dates, reason, _, fingerprint, expires_at = inputs
+        if expires_at <= self.leave.now():
+            return self._error(
+                "prepare_leave_application",
+                "The leave plan expired; build it again for the requested dates",
+            )
+        plan = self.leave.build_leave_plan(self.actor, leave_type, dates, reason)
+        if plan.compute_fingerprint() != fingerprint:
+            data = plan.to_dict()
             return LeaveToolExecution(
                 "prepare_leave_application",
                 False,
-                {
-                    "eligible": False,
-                    "requested_days": _number(eligibility.working_days),
-                    "available_days": _number(eligibility.available_days),
-                    "reason": eligibility.reason,
-                },
-                "Leave application was not eligible",
-                context_update=self._context(arguments),
+                {"error": "The leave details changed; review the updated plan with the employee", "updated_plan": data},
+                "Leave plan changed",
+                plan=data,
             )
-        summary = (
-            f"Apply for {_number(eligibility.working_days)} working day(s) of "
-            f"{arguments.leave_type.title()} leave from {arguments.start_date} to {arguments.end_date}"
-        )
+        if not plan.eligible:
+            return LeaveToolExecution(
+                "prepare_leave_application",
+                False,
+                {"eligible": False, "reason": "; ".join(plan.problems)},
+                "Leave application was not eligible",
+            )
+        summary = plan.confirmation_summary()
         action = self.pending.propose(
             self.actor,
             session_id,
-            "apply_leave",
-            arguments.model_dump(mode="json"),
+            "apply_leave_plan",
+            {
+                "leave_type": plan.leave_type.value,
+                "dates": [item.isoformat() for item in plan.requested_dates],
+                "reason": plan.reason,
+                "fingerprint": fingerprint,
+            },
             summary,
         )
         return LeaveToolExecution(
@@ -371,11 +409,10 @@ class LeaveToolExecutor:
             {"prepared": True, "summary": action.summary},
             self._base_label("prepare_leave_application"),
             pending_summary=action.summary,
-            context_update=self._context(arguments),
         )
 
     def _prepare_leave_cancellation(
-        self, arguments: PrepareCancellationArguments, *, session_id: str
+        self, arguments: PrepareCancellationArguments, *, session_id: str, **_: Any
     ) -> LeaveToolExecution:
         request = self.leave.prepare_leave_cancellation(self.actor, arguments.request_id)
         summary = f"Cancel your pending leave request #{request.id}"
@@ -395,7 +432,7 @@ class LeaveToolExecutor:
         )
 
     def _prepare_leave_approval(
-        self, arguments: PrepareApprovalArguments, *, session_id: str
+        self, arguments: PrepareApprovalArguments, *, session_id: str, **_: Any
     ) -> LeaveToolExecution:
         request = self.leave.prepare_leave_decision(self.actor, arguments.request_id)
         subject = request.employee_name or request.employee_code or f"employee #{request.employee_id}"
@@ -416,7 +453,7 @@ class LeaveToolExecutor:
         )
 
     def _prepare_leave_rejection(
-        self, arguments: PrepareRejectionArguments, *, session_id: str
+        self, arguments: PrepareRejectionArguments, *, session_id: str, **_: Any
     ) -> LeaveToolExecution:
         request = self.leave.prepare_leave_decision(self.actor, arguments.request_id)
         summary = f"Reject leave request #{request.id}: {arguments.reason}"

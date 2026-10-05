@@ -10,7 +10,7 @@ from pydantic import ValidationError as PydanticValidationError
 
 from app.agent.leave_agent import LeaveAgent
 from app.agent.leave_tools import LeaveToolExecutor
-from app.agent.state import AgentState, LEAVE_DRAFT_STATUSES, LeaveDraft
+from app.agent.state import AgentState
 from app.application.leave.service import LeaveService
 from app.application.onboarding.service import OnboardingService
 from app.application.parking.service import ParkingService
@@ -23,6 +23,7 @@ from app.core.exceptions import (
     PendingActionExpiredError,
 )
 from app.core.security import AuthenticatedUser, require_role
+from app.domain.leave.plan import stored_plan_inputs
 from app.domain.onboarding.entities import TASK_TITLES, OnboardingCandidate
 from app.domain.pending.entities import ConfirmationDecision
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
@@ -153,7 +154,7 @@ class HRAssistantOrchestrator:
             "user_message": message.strip(),
             "messages": history,
             "active_domain": self._safe_domain(stored.get("active_domain")),
-            "leave_context": self._safe_leave_context(stored.get("leave_context")),
+            "leave_plan": self._safe_leave_plan(stored.get("leave_plan")),
             "onboarding_context": self._safe_onboarding_context(
                 stored.get("onboarding_context")
             ),
@@ -180,7 +181,7 @@ class HRAssistantOrchestrator:
             {
                 "messages": updated_history,
                 "active_domain": result.get("active_domain"),
-                "leave_context": result.get("leave_context", {}),
+                "leave_plan": result.get("leave_plan"),
                 "onboarding_context": result.get("onboarding_context", {}),
                 "parking_context": result.get("parking_context", state.get("parking_context", {})),
             },
@@ -250,7 +251,7 @@ class HRAssistantOrchestrator:
                 "response": "The pending action has been cancelled. No changes were made.",
                 "active_domain": self._action_domain(action.action_type),
                 "pending_summary": None,
-                "leave_context": {},
+                "leave_plan": None,
                 "onboarding_context": {},
                 "parking_context": {},
             }
@@ -261,13 +262,14 @@ class HRAssistantOrchestrator:
                 "response": "This confirmation has expired. No changes were made; please start the action again.",
                 "active_domain": self._action_domain(action.action_type),
                 "pending_summary": None,
-                "leave_context": {},
+                "leave_plan": None,
                 "onboarding_context": {},
                 "parking_context": {},
             }
         except ApplicationError as exc:
             if action.action_type not in {
                 "apply_leave",
+                "apply_leave_plan",
                 "cancel_leave_request",
                 "approve_leave_request",
                 "reject_leave_request",
@@ -284,6 +286,20 @@ class HRAssistantOrchestrator:
         action_type = action.action_type
         if action_type == "approve_leave_request":
             response = f"Leave request #{created.id} was approved successfully."
+        elif action_type == "apply_leave_plan":
+            requests = list(created)
+            label = requests[0].leave_type.value.title()
+            if len(requests) == 1:
+                response = (
+                    f"Your {label} leave request for {self._number(requests[0].working_days)} "
+                    f"working day(s) was submitted successfully with request ID {requests[0].id}."
+                )
+            else:
+                response = f"Your {label} leave requests were submitted successfully: " + ", ".join(
+                    f"#{item.id} ({item.start_date} to {item.end_date}, "
+                    f"{self._number(item.working_days)} day(s))"
+                    for item in requests
+                ) + "."
         elif action_type == "reject_leave_request":
             response = f"Leave request #{created.id} was rejected successfully."
         elif action_type == "cancel_leave_request":
@@ -345,7 +361,7 @@ class HRAssistantOrchestrator:
             "response": response,
             "active_domain": self._action_domain(action_type),
             "pending_summary": None,
-            "leave_context": {},
+            "leave_plan": None,
             "onboarding_context": {},
             "parking_context": {},
         }
@@ -416,23 +432,29 @@ class HRAssistantOrchestrator:
             decision = decision.model_copy(
                 update={"domain": "parking", "intent": parking_intent, "confidence": 0.99}
             )
-        elif (
-            state.get("active_domain") == "leave"
-            and state.get("leave_context")
-            and (
+        elif state.get("active_domain") == "leave" and (
+            self._message_is_only_leave_type(state["user_message"])
+            or (
                 decision.domain == "general"
-                or self._message_is_only_leave_type(state["user_message"])
-                or self._extract_leave_dates(
-                    state["user_message"], date.fromisoformat(today)
-                ) != (None, None)
-                or (
-                    bool(re.search(r"\b(policy|holiday|holidays|rule|rules)\b", state["user_message"], re.I))
-                    and bool(re.search(r"\b(this|that|it|these|those|leave)\b", state["user_message"], re.I))
+                and (
+                    state.get("leave_plan")
+                    or self._contains_date_reference(state["user_message"])
                 )
             )
+            or (
+                state.get("leave_plan")
+                and bool(re.search(r"\b(policy|holiday|holidays|rule|rules)\b", state["user_message"], re.I))
+                and bool(re.search(r"\b(this|that|it|these|those|leave)\b", state["user_message"], re.I))
+            )
         ):
+            # Keep a leave conversation in the Leave Agent; the agent, not routing, decides what
+            # the follow-up means.
             decision = decision.model_copy(
-                update={"domain": "leave", "intent": "apply_leave", "confidence": 0.99}
+                update={
+                    "domain": "leave",
+                    "intent": decision.intent if decision.domain == "leave" else "apply_leave",
+                    "confidence": 0.99,
+                }
             )
         return {"route": decision, "active_domain": decision.domain, "llm_calls": calls}
 
@@ -505,55 +527,22 @@ class HRAssistantOrchestrator:
         return cleaned.strip()
 
     def _handle_leave(self, state: AgentState) -> AgentState:
-        context = self._merge_leave_context(
-            state.get("leave_context", {}),
-            state["route"],
-            state["user_message"],
-            datetime.now(ZoneInfo(self.settings.app_timezone)).date(),
-        )
-        route: RouteDecision = state["route"]
-        if route.intent in {"apply_leave", "leave_eligibility"}:
-            missing = self._missing_leave_draft_fields(context)
-            if missing:
-                prompt = (
-                    "Please provide the start and end dates."
-                    if missing == ["a start date", "an end date"]
-                    else f"Please provide {', '.join(missing)}."
-                )
-                return {
-                    "response": prompt,
-                    "active_domain": "leave",
-                    "leave_context": context if route.intent == "apply_leave" else {},
-                    "agent_activity": [],
-                }
         result = self.leave_agent.invoke(
             session_id=state["session_id"],
             user_message=state["user_message"],
             conversation=state.get("messages", []),
-            leave_context=context,
+            leave_plan=state.get("leave_plan"),
             llm_calls=state.get("llm_calls", 0),
         )
         return {
             "response": result["response"],
             "active_domain": "leave",
-            "leave_context": result.get("leave_context", context),
+            "leave_plan": result.get("leave_plan"),
             "sources": result.get("sources", []),
             "pending_summary": result.get("pending_summary"),
             "agent_activity": result.get("agent_activity", []),
             "llm_calls": result.get("llm_calls", state.get("llm_calls", 0)),
         }
-
-    @staticmethod
-    def _missing_leave_draft_fields(context: dict[str, str]) -> list[str]:
-        """Return stable user-facing slots before the LLM/tool workflow starts."""
-        missing: list[str] = []
-        if not context.get("leave_type"):
-            missing.append("the leave type")
-        if not context.get("start_date"):
-            missing.append("a start date")
-        if not context.get("end_date"):
-            missing.append("an end date")
-        return missing
 
     def _handle_onboarding(self, state: AgentState) -> AgentState:
         route: RouteDecision = state["route"]
@@ -1130,12 +1119,16 @@ class HRAssistantOrchestrator:
         return self.llm.complete(tier, system=system, user=user, json_mode=json_mode), calls + 1
 
     def _routing_input(self, state: AgentState, today: str) -> str:
-        leave_context = json.dumps(state.get("leave_context", {}), sort_keys=True)
+        plan = state.get("leave_plan")
+        leave_context = json.dumps(
+            {"active_leave_plan": plan.get("summary")} if isinstance(plan, dict) else {},
+            sort_keys=True,
+        )
         onboarding_context = json.dumps(state.get("onboarding_context", {}), sort_keys=True)
         parking_context = json.dumps(state.get("parking_context", {}), sort_keys=True)
         return (
             f"Today's date is {today}.\n"
-            f"Current leave application context: {leave_context}\n"
+            f"Current leave context: {leave_context}\n"
             f"Current onboarding context: {onboarding_context}\n"
             f"Current parking context: {parking_context}\n"
             f"{self._history_text(state)}"
@@ -1503,216 +1496,7 @@ class HRAssistantOrchestrator:
         elif balance_signal and personal:
             updates.update(domain="leave", intent="leave_balance", confidence=max(decision.confidence, 0.95))
 
-        guarded_intent = updates.get("intent", decision.intent)
-        if guarded_intent in {"apply_leave", "leave_eligibility", "leave_balance"}:
-            updates["leave_type"] = explicit_type
-
-        if guarded_intent in {"apply_leave", "leave_eligibility", "calculate_leave_days", "holidays"}:
-            parsed_start, parsed_end = HRAssistantOrchestrator._extract_leave_dates(message, today)
-            if parsed_start and parsed_end:
-                updates.update(start_date=parsed_start, end_date=parsed_end)
-            elif not HRAssistantOrchestrator._contains_date_reference(message):
-                updates.update(start_date=None, end_date=None)
-
         return decision.model_copy(update=updates) if updates else decision
-
-    @staticmethod
-    def _extract_leave_dates(message: str, today: date | None = None) -> tuple[date | None, date | None]:
-        current = today or date.today()
-        normalized = message.casefold()
-        explicit_dates = HRAssistantOrchestrator._extract_explicit_leave_dates(message, current)
-        if len(explicit_dates) >= 2:
-            return explicit_dates[0], explicit_dates[1]
-
-        weekday_dates = HRAssistantOrchestrator._extract_weekday_dates(message, current)
-        anchor = (
-            explicit_dates[0]
-            if explicit_dates
-            else weekday_dates[0]
-            if weekday_dates
-            else HRAssistantOrchestrator._extract_single_leave_date(message, current)
-        )
-        duration_match = re.search(
-            r"\b(?:for\s+)?(\d{1,2})\s+(?:working\s+)?days?\s+(?:from|starting|start(?:ing)?\s+from)\b",
-            normalized,
-        )
-        trailing_duration_match = re.search(r"\bfor\s+(\d{1,2})\s+(?:working\s+)?days?\b", normalized)
-        duration = int((duration_match or trailing_duration_match).group(1)) if (duration_match or trailing_duration_match) else None
-        if duration and anchor:
-            return anchor, HRAssistantOrchestrator._add_working_days(anchor, duration)
-        if len(weekday_dates) >= 2:
-            return weekday_dates[0], weekday_dates[-1]
-        if weekday_dates:
-            return weekday_dates[0], weekday_dates[0]
-        if anchor:
-            return anchor, anchor
-        return None, None
-
-    @staticmethod
-    def _add_working_days(start: date, number_of_days: int) -> date:
-        """Return the inclusive end date for a working-day duration."""
-        if number_of_days <= 1:
-            return start
-        current = start
-        remaining = number_of_days - 1
-        while remaining:
-            current += timedelta(days=1)
-            if current.weekday() < 5:
-                remaining -= 1
-        return current
-
-    @staticmethod
-    def _extract_weekday_dates(message: str, current: date) -> list[date]:
-        """Resolve weekday phrases without relying on the language model's calendar math."""
-        normalized = message.casefold()
-        weekdays = {
-            "monday": 0,
-            "tuesday": 1,
-            "wednesday": 2,
-            "thursday": 3,
-            "friday": 4,
-            "saturday": 5,
-            "sunday": 6,
-        }
-        pattern = r"\b(next\s+|this\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
-        matches = list(re.finditer(pattern, normalized))
-        if not matches:
-            return []
-
-        dates: list[date] = []
-        for index, match in enumerate(matches):
-            modifier = (match.group(1) or "").strip()
-            target_weekday = weekdays[match.group(2)]
-            if index == 0:
-                delta = (target_weekday - current.weekday()) % 7
-                if modifier == "next" or (delta == 0 and "next" in normalized[: match.start()]):
-                    delta = delta or 7
-                candidate = current + timedelta(days=delta)
-            else:
-                delta = (target_weekday - dates[-1].weekday()) % 7
-                if delta == 0:
-                    delta = 7
-                candidate = dates[-1] + timedelta(days=delta)
-            dates.append(candidate)
-        return dates
-
-    @staticmethod
-    def _extract_explicit_leave_dates(message: str, current: date) -> list[date]:
-        normalized = message.casefold()
-        month_values = {
-            "jan": 1, "january": 1,
-            "feb": 2, "february": 2,
-            "mar": 3, "march": 3,
-            "apr": 4, "april": 4,
-            "may": 5,
-            "jun": 6, "june": 6,
-            "jul": 7, "july": 7,
-            "aug": 8, "august": 8,
-            "sep": 9, "sept": 9, "september": 9,
-            "oct": 10, "october": 10,
-            "nov": 11, "november": 11,
-            "dec": 12, "december": 12,
-        }
-        month_pattern = "|".join(sorted(month_values, key=len, reverse=True))
-        candidates: list[tuple[int, date]] = []
-        for match in re.finditer(r"\b\d{4}-\d{2}-\d{2}\b", message):
-            candidates.append((match.start(), date.fromisoformat(match.group(0))))
-        for match in re.finditer(
-            rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s*(?:to|-)\s*(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
-            normalized,
-        ):
-            month = month_values[match.group(3)]
-            year = int(match.group(4) or current.year)
-            candidates.extend(
-                [
-                    (match.start(), date(year, month, int(match.group(1)))),
-                    (match.start() + 1, date(year, month, int(match.group(2)))),
-                ]
-            )
-        for match in re.finditer(
-            rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
-            normalized,
-        ):
-            day = int(match.group(1))
-            month = month_values[match.group(2)]
-            year = int(match.group(3) or current.year)
-            candidates.append((match.start(), date(year, month, day)))
-        for match in re.finditer(
-            rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*|\s+)?(\d{{4}})?\b",
-            normalized,
-        ):
-            month = month_values[match.group(1)]
-            day = int(match.group(2))
-            year = int(match.group(3) or current.year)
-            candidates.append((match.start(), date(year, month, day)))
-        for match in re.finditer(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", normalized):
-            if match.start() > 0 and normalized[match.start() - 1] == "-":
-                continue
-            day = int(match.group(1))
-            month = int(match.group(2))
-            year = int(match.group(3) or current.year)
-            if year < 100:
-                year += 2000
-            try:
-                candidates.append((match.start(), date(year, month, day)))
-            except ValueError:
-                continue
-        return [item for _, item in sorted(candidates, key=lambda candidate: candidate[0])]
-
-    @staticmethod
-    def _extract_single_leave_date(message: str, current: date) -> date | None:
-        normalized = message.casefold()
-        tomorrow_pattern = r"(?:tomorrow|tomorow|tommorow|tommorrow)"
-        if re.search(rf"\bday after {tomorrow_pattern}\b", normalized):
-            return current + timedelta(days=2)
-        if re.search(rf"\b{tomorrow_pattern}\b", normalized):
-            return current + timedelta(days=1)
-        if re.search(r"\btoday\b", normalized):
-            return current
-
-        month_values = {
-            "jan": 1, "january": 1,
-            "feb": 2, "february": 2,
-            "mar": 3, "march": 3,
-            "apr": 4, "april": 4,
-            "may": 5,
-            "jun": 6, "june": 6,
-            "jul": 7, "july": 7,
-            "aug": 8, "august": 8,
-            "sep": 9, "sept": 9, "september": 9,
-            "oct": 10, "october": 10,
-            "nov": 11, "november": 11,
-            "dec": 12, "december": 12,
-        }
-        month_pattern = "|".join(sorted(month_values, key=len, reverse=True))
-        day_month = re.search(
-            rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
-            normalized,
-        )
-        month_day = re.search(
-            rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*|\s+)?(\d{{4}})?\b",
-            normalized,
-        )
-        if day_month:
-            day = int(day_month.group(1))
-            month = month_values[day_month.group(2)]
-            year = int(day_month.group(3) or current.year)
-            return date(year, month, day)
-        if month_day:
-            month = month_values[month_day.group(1)]
-            day = int(month_day.group(2))
-            year = int(month_day.group(3) or current.year)
-            return date(year, month, day)
-
-        numeric = re.search(r"\b(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?\b", normalized)
-        if numeric:
-            day = int(numeric.group(1))
-            month = int(numeric.group(2))
-            year = int(numeric.group(3) or current.year)
-            if year < 100:
-                year += 2000
-            return date(year, month, day)
-        return None
 
     @staticmethod
     def _contains_date_reference(message: str) -> bool:
@@ -1732,84 +1516,6 @@ class HRAssistantOrchestrator:
             r"\d{1,2}(?:st|nd|rd|th))\b"
         )
         return bool(re.search(f"(?:{month_or_weekday}|{relative_date}|{numeric_date})", message, re.I))
-
-    @staticmethod
-    def _missing_leave_fields(route: RouteDecision) -> list[str]:
-        missing: list[str] = []
-        if route.intent in {"leave_eligibility", "apply_leave"} and not route.leave_type:
-            missing.append("the leave type")
-        if route.start_date is None:
-            missing.append("a start date")
-        if route.end_date is None:
-            missing.append("an end date")
-        return missing
-
-    @staticmethod
-    def _merge_leave_context(
-        existing: dict[str, str], route: RouteDecision, message: str, today: date | None = None
-    ) -> dict[str, str]:
-        context: LeaveDraft = {
-            key: value
-            for key, value in existing.items()
-            if key in {"mode", "status", "leave_type", "start_date", "end_date", "reason"}
-        }
-        if context.get("status") not in LEAVE_DRAFT_STATUSES:
-            context["status"] = "COLLECTING_DETAILS"
-        if route.intent not in {"apply_leave", "leave_eligibility", "calculate_leave_days", "holidays"} and not existing:
-            return dict(context)
-        explicit_type = HRAssistantOrchestrator._explicit_leave_type(message)
-        if explicit_type:
-            context["leave_type"] = explicit_type
-
-        # The router already resolves relative dates using the configured application timezone.
-        # Reuse that same clock here so a request near midnight cannot produce two different dates.
-        parsed_start, parsed_end = HRAssistantOrchestrator._extract_leave_dates(message, today)
-        if (
-            parsed_start is None
-            and parsed_end is None
-            and context.get("start_date")
-            and context.get("end_date")
-            and re.search(r"\b(?:next|following)\s+week\b", message, re.I)
-        ):
-            previous_start = date.fromisoformat(context["start_date"])
-            previous_end = date.fromisoformat(context["end_date"])
-            parsed_start = previous_start + timedelta(days=7)
-            parsed_end = previous_end + timedelta(days=7)
-        if parsed_start:
-            context["start_date"] = parsed_start.isoformat()
-        if parsed_end:
-            context["end_date"] = parsed_end.isoformat()
-
-        reason_match = re.search(r"\b(?:because|reason\s*:|due\s+to)\s+(.+)$", message, re.I)
-        if reason_match:
-            context["reason"] = reason_match.group(1).strip()
-
-        # Only an explicit application intent may enter the application lifecycle. A balance,
-        # policy, or eligibility question can contain dates and leave types without creating a
-        # draft that later turns an unrelated follow-up into a submission.
-        if route.intent == "apply_leave":
-            context["mode"] = "apply_leave"
-            required = ("leave_type", "start_date", "end_date")
-            context["status"] = (
-                "READY_FOR_VALIDATION"
-                if all(context.get(field) for field in required)
-                else "COLLECTING_DETAILS"
-            )
-        return context
-
-    @staticmethod
-    def _explicit_leave_type(message: str) -> str | None:
-        patterns = {
-            "CASUAL": r"\b(casual(?:\s+leave)?|casula(?:\s+leave)?|cl)\b",
-            "SICK": r"\b(sick(?:\s+leave)?|sl)\b",
-            "EARNED": r"\b(earned(?:\s+leave)?|privilege(?:\s+leave)?|el|pl)\b",
-        }
-        matches = [
-            leave_type
-            for leave_type, pattern in patterns.items()
-            if re.search(pattern, message, re.I)
-        ]
-        return matches[0] if len(matches) == 1 else None
 
     @staticmethod
     def _message_is_only_leave_type(message: str) -> bool:
@@ -1841,32 +1547,14 @@ class HRAssistantOrchestrator:
         return value if value in {"leave", "policy", "onboarding", "parking", "general"} else None
 
     @staticmethod
-    def _safe_leave_context(value: object) -> dict[str, str]:
-        allowed = {"mode", "status", "leave_type", "start_date", "end_date", "reason"}
-        if not isinstance(value, dict):
-            return {}
-        result = {
-            key: item
-            for key, item in value.items()
-            if key in allowed and isinstance(item, str) and item.strip()
-        }
-        if result.get("mode") != "apply_leave" and not any(
-            result.get(field) for field in ("leave_type", "start_date", "end_date", "reason")
-        ):
-            return {}
-        if "leave_type" in result and result["leave_type"] not in {"CASUAL", "SICK", "EARNED"}:
-            result.pop("leave_type")
-        if result.get("status") not in LEAVE_DRAFT_STATUSES:
-            result["status"] = "COLLECTING_DETAILS"
-        if result.get("mode") != "apply_leave":
-            result.pop("mode", None)
-        for field in ("start_date", "end_date"):
-            if field in result:
-                try:
-                    date.fromisoformat(result[field])
-                except ValueError:
-                    result.pop(field)
-        return result
+    def _safe_leave_plan(value: object) -> dict[str, object] | None:
+        """Keep a persisted plan only while it is well-formed and unexpired."""
+        inputs = stored_plan_inputs(value)
+        if inputs is None:
+            return None
+        expires_at = inputs[5]
+        now = datetime.now(expires_at.tzinfo) if expires_at.tzinfo else datetime.now()
+        return value if expires_at > now else None  # type: ignore[return-value]
 
     @staticmethod
     def _safe_onboarding_context(value: object) -> dict[str, str]:

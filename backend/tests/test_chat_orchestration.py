@@ -30,6 +30,7 @@ from app.application.parking.handlers import (
 from app.application.parking.service import ParkingService
 from app.application.pending.handlers import (
     ApplyLeaveHandler,
+    ApplyLeavePlanHandler,
     ApproveLeaveRequestHandler,
     CancelLeaveRequestHandler,
     RejectLeaveRequestHandler,
@@ -43,6 +44,7 @@ from app.core.exceptions import (
     ParkingUnavailableError,
 )
 from app.core.security import AuthenticatedUser
+from app.domain.leave.dates import resolve_leave_dates
 from app.domain.onboarding.entities import OnboardingCandidate
 from app.infrastructure.database.models import (
     ConversationSession,
@@ -66,6 +68,9 @@ from app.llm.models import ModelTier, RouteDecision
 from app.rag.models import PolicySearchResult
 from app.rag.service import PolicyContext
 from app.main import app
+
+
+TEST_TODAY = date(2026, 10, 5)  # a Monday; matches the parking clock below
 
 
 class FakeLLM:
@@ -95,6 +100,7 @@ class FakeLLM:
         return response
 
     def _legacy_leave_agent_response(self, prompt: str) -> str:
+        """Simulate a well-behaved Leave Agent model over the plan-based tools."""
         results = []
         marker = "Tool results so far:\n"
         if marker in prompt:
@@ -102,6 +108,35 @@ class FakeLLM:
                 results = json.loads(prompt.split(marker, 1)[1])
             except ValueError:
                 results = []
+        today_match = re.search(r"Current date: (\d{4}-\d{2}-\d{2})", prompt)
+        today = date.fromisoformat(today_match.group(1)) if today_match else date.today()
+        plan_match = re.search(r"Active leave plan: (.*)\n", prompt)
+        try:
+            active_plan = json.loads(plan_match.group(1)) if plan_match else None
+        except ValueError:
+            active_plan = None
+        message_match = re.search(r"Current user message: (.*)\n\nAvailable tools:", prompt, re.S)
+        message = message_match.group(1).strip() if message_match else ""
+        history_match = re.search(r"Recent conversation:\n(.*)\nCurrent user message:", prompt, re.S)
+        history_lines = history_match.group(1).splitlines() if history_match else []
+        # A finished or cancelled action starts a fresh request.
+        for index in range(len(history_lines) - 1, -1, -1):
+            line = history_lines[index].casefold()
+            if line.startswith("assistant:") and ("cancelled" in line or "submitted successfully" in line):
+                history_lines = history_lines[index + 1:]
+                break
+        earlier_user = [line[len("user: "):] for line in history_lines if line.startswith("user: ")]
+        intent = self._simulated_intent(message, active_plan, earlier_user)
+        leave_type = self._simulated_type(message)
+        if leave_type is None:
+            for earlier in reversed(earlier_user):
+                leave_type = self._simulated_type(earlier)
+                if leave_type:
+                    break
+        date_text = message if self._has_dates(message, today) else next(
+            (earlier for earlier in reversed(earlier_user) if self._has_dates(earlier, today)), None
+        )
+
         if results:
             latest = results[-1]
             data = latest.get("result", {})
@@ -111,12 +146,33 @@ class FakeLLM:
                     "message": data.get("error") or data.get("reason") or "The Leave operation failed.",
                 })
             tool = latest.get("tool")
+            if tool == "resolve_dates":
+                if intent in {"holidays", "calculate_leave_days"}:
+                    days = [item["date"] for item in data.get("dates", [])]
+                    if not days:
+                        return json.dumps({"action": "final", "message": "Please provide the start and end dates."})
+                    name = "get_holidays" if intent == "holidays" else "calculate_leave_days"
+                    return self._tool(name, start_date=min(days), end_date=max(days))
+                if not data.get("dates"):
+                    return json.dumps({"action": "final", "message": "Please provide the start and end dates."})
+                if leave_type is None:
+                    return json.dumps({"action": "final", "message": "Please provide the leave type."})
+                return self._tool(
+                    "build_leave_plan",
+                    leave_type=leave_type,
+                    dates=[item["date"] for item in data["dates"]],
+                    **({"reason": self._reason(message)} if self._reason(message) else {}),
+                )
+            if tool == "build_leave_plan":
+                if intent == "apply_leave" and data.get("eligible"):
+                    return self._tool("prepare_leave_application", plan_id=data["plan_id"])
+                return json.dumps({"action": "final", "message": data.get("summary", "")})
             if tool == "get_leave_balance":
                 lines = [
                     f"{item['leave_type'].title()}: {item['available_days']} available ({item['pending_days']} pending)"
                     for item in data.get("balances", [])
                 ]
-                message = "Your leave balance:\n" + "\n".join(lines)
+                message_text = "Your leave balance:\n" + "\n".join(lines)
             elif tool in {"get_my_leave_requests", "get_managed_leave_requests"}:
                 lines = [
                     f"Request ID #{item['request_id']}: {item.get('employee_name') or ''} {item['leave_type'].title()} "
@@ -124,133 +180,122 @@ class FakeLLM:
                     for item in data.get("requests", [])
                 ]
                 heading = "Pending leave approvals:" if tool == "get_managed_leave_requests" else "Your recent leave requests:"
-                message = heading + ("\n" + "\n".join(lines) if lines else " None.")
+                message_text = heading + ("\n" + "\n".join(lines) if lines else " None.")
             elif tool == "get_leave_request_history":
-                message = f"History for leave request #{data.get('request_id')}: " + ", ".join(
+                message_text = f"History for leave request #{data.get('request_id')}: " + ", ".join(
                     f"{item['to_status'].title()} by user #{item['actor_user_id']}"
                     for item in data.get("events", [])
                 )
             elif tool == "get_holidays":
                 holidays = data.get("holidays", [])
-                message = "Configured holidays in that range: " + ", ".join(holidays) + "." if holidays else "No configured holidays fall in that range."
+                message_text = "Configured holidays in that range: " + ", ".join(holidays) + "." if holidays else "No configured holidays fall in that range."
             elif tool == "calculate_leave_days":
-                message = f"That range contains {data.get('working_days')} working leave day(s)."
-            elif tool == "check_leave_eligibility":
-                message = (
-                    f"You are eligible. The request uses {data.get('requested_days')} working day(s), and you have {data.get('available_days')} available."
-                    if data.get("eligible") else f"You are not eligible for this request: {data.get('reason')}."
-                )
+                message_text = f"That range contains {data.get('working_days')} working leave day(s)."
             else:
-                message = "The Leave information was retrieved successfully."
-            return json.dumps({"action": "final", "message": message})
+                message_text = "The Leave information was retrieved successfully."
+            return json.dumps({"action": "final", "message": message_text})
 
-        route_data = self.last_route
-        message_match = re.search(r"Current user message: (.*)\n\nAvailable tools:", prompt, re.S)
-        message = message_match.group(1).strip() if message_match else ""
+        arguments: dict[str, object] = {}
+        request_match = re.search(r"#(\d+)|\brequest\s+(\d+)\b", message.casefold())
+        if request_match:
+            arguments["request_id"] = int(request_match.group(1) or request_match.group(2))
+        reason = self._reason(message)
+        if intent in {"apply_leave", "leave_eligibility"}:
+            if (
+                intent == "apply_leave"
+                and active_plan
+                and active_plan.get("eligible")
+                and not self._has_dates(message, today)
+                and leave_type in {None, active_plan.get("leave_type")}
+            ):
+                return self._tool("prepare_leave_application", plan_id=active_plan["plan_id"])
+            if leave_type is None:
+                return json.dumps({"action": "final", "message": "Please provide the leave type."})
+            if date_text is None:
+                return json.dumps({"action": "final", "message": "Please provide the start and end dates."})
+            return self._tool("resolve_dates", text=date_text)
+        if intent in {"holidays", "calculate_leave_days"}:
+            if date_text is None:
+                return json.dumps({"action": "final", "message": "Please provide the start and end dates."})
+            return self._tool("resolve_dates", text=date_text)
+        if intent == "leave_balance":
+            return self._tool("get_leave_balance", **({"leave_type": leave_type} if leave_type else {}))
+        if intent == "leave_requests":
+            return self._tool("get_my_leave_requests")
+        if intent == "manager_leave_requests":
+            return self._tool("get_managed_leave_requests")
+        if intent in {"leave_request_history", "cancel_leave_request", "approve_leave_request", "reject_leave_request"}:
+            if "request_id" not in arguments:
+                return json.dumps({"action": "final", "message": "Please provide the request id."})
+            if intent == "leave_request_history":
+                return self._tool("get_leave_request_history", request_id=arguments["request_id"])
+            if intent == "cancel_leave_request":
+                return self._tool("prepare_leave_cancellation", request_id=arguments["request_id"],
+                                  **({"reason": reason} if reason else {}))
+            if intent == "approve_leave_request":
+                return self._tool("prepare_leave_approval", request_id=arguments["request_id"],
+                                  **({"comment": reason} if reason else {}))
+            if not reason:
+                return json.dumps({"action": "final", "message": "Please provide a reason."})
+            return self._tool("prepare_leave_rejection", request_id=arguments["request_id"], reason=reason)
+        return json.dumps({"action": "final", "message": "Please clarify the Leave request."})
+
+    def _simulated_intent(self, message, active_plan, earlier_user):
         normalized = message.casefold()
-        context_match = re.search(r"Conversation context: (\{.*?\})\nRecent conversation:", prompt, re.S)
-        try:
-            context = json.loads(context_match.group(1)) if context_match else {}
-        except ValueError:
-            context = {}
         if re.search(r"\bapprove\b.*\b(?:leave\s+)?request\b", normalized):
-            intent = "approve_leave_request"
-        elif re.search(r"\breject\b.*\b(?:leave\s+)?request\b", normalized):
-            intent = "reject_leave_request"
-        elif re.search(r"\bcancel\b.*\b(?:my\s+)?(?:leave\s+)?request\b", normalized):
-            intent = "cancel_leave_request"
-        elif "pending approval" in normalized or "approval queue" in normalized:
-            intent = "manager_leave_requests"
-        elif "history" in normalized:
-            intent = "leave_request_history"
-        elif "holiday" in normalized and ("between" in normalized or "from" in normalized):
-            intent = "holidays"
-        elif "working day" in normalized or "calculate" in normalized:
-            intent = "calculate_leave_days"
-        elif "balance" in normalized or re.search(r"\bhow (?:many|much).*(?:leave|casual|sick|earned|\bcl\b|\bsl\b|\bel\b)", normalized):
-            intent = "leave_balance"
-        elif "leave request status" in normalized or re.search(r"\b(list|show|status|pending)\b.*\b(?:leave\s+)?requests?\b", normalized):
-            intent = "leave_requests"
-        elif re.search(r"\b(can i|eligible|eligibility)\b", normalized):
-            intent = "leave_eligibility"
-        elif context or re.search(r"\b(apply|create|take|want).*\bleave\b", normalized):
-            intent = "apply_leave"
-        else:
-            intent = route_data.get("intent")
+            return "approve_leave_request"
+        if re.search(r"\breject\b.*\b(?:leave\s+)?request\b", normalized):
+            return "reject_leave_request"
+        if re.search(r"\bcancel\b.*\b(?:my\s+)?(?:leave\s+)?request\b", normalized):
+            return "cancel_leave_request"
+        if "pending approval" in normalized or "approval queue" in normalized:
+            return "manager_leave_requests"
+        if "history" in normalized:
+            return "leave_request_history"
+        if "holiday" in normalized and ("between" in normalized or "from" in normalized):
+            return "holidays"
+        if "working day" in normalized or "calculate" in normalized:
+            return "calculate_leave_days"
+        if "balance" in normalized or re.search(r"\bhow (?:many|much).*(?:leave|casual|sick|earned|\bcl\b|\bsl\b|\bel\b)", normalized):
+            return "leave_balance"
+        if "leave request status" in normalized or re.search(r"\b(list|show|status|pending)\b.*\b(?:leave\s+)?requests?\b", normalized):
+            return "leave_requests"
+        if re.search(r"\b(apply|create|submit|raise|want|need|go ahead)\b", normalized):
+            return "apply_leave"
+        if re.search(r"\b(can i|could i|eligible|eligibility)\b", normalized):
+            return "leave_eligibility"
+        route_intent = self.last_route.get("intent")
+        if route_intent in {"apply_leave", "leave_eligibility"} or earlier_user:
+            return route_intent if route_intent in {"apply_leave", "leave_eligibility"} else "apply_leave"
+        return route_intent
 
-        arguments = {
-            key: value
-            for key, value in context.items()
-            if key in {"leave_type", "start_date", "end_date", "reason"}
-        }
-        explicit_types = {
+    @staticmethod
+    def _simulated_type(text):
+        patterns = {
             "CASUAL": r"\b(?:casual|casula|cl)\b",
             "SICK": r"\b(?:sick|sl)\b",
             "EARNED": r"\b(?:earned|privilege|el|pl)\b",
         }
-        for leave_type, pattern in explicit_types.items():
-            if re.search(pattern, normalized):
-                arguments["leave_type"] = leave_type
-                break
-        request_match = re.search(r"#(\d+)|\brequest\s+(\d+)\b", normalized)
-        if request_match:
-            arguments["request_id"] = int(request_match.group(1) or request_match.group(2))
-        reason_match = re.search(r"\bbecause\s+(.+)$", message, re.I)
-        if reason_match:
-            arguments["reason"] = reason_match.group(1).strip()
-        tool_by_intent = {
-            "leave_balance": "get_leave_balance",
-            "leave_requests": "get_my_leave_requests",
-            "manager_leave_requests": "get_managed_leave_requests",
-            "leave_request_history": "get_leave_request_history",
-            "holidays": "get_holidays",
-            "calculate_leave_days": "calculate_leave_days",
-            "leave_eligibility": "check_leave_eligibility",
-            "apply_leave": "prepare_leave_application",
-            "cancel_leave_request": "prepare_leave_cancellation",
-            "approve_leave_request": "prepare_leave_approval",
-            "reject_leave_request": "prepare_leave_rejection",
-        }
-        tool = tool_by_intent.get(intent)
-        if tool is None:
-            return json.dumps({"action": "final", "message": "Please clarify the Leave request."})
-        required = {
-            "prepare_leave_application": {"leave_type", "start_date", "end_date"},
-            "check_leave_eligibility": {"leave_type", "start_date", "end_date"},
-            "calculate_leave_days": {"start_date", "end_date"},
-            "get_holidays": {"start_date", "end_date"},
-            "get_leave_request_history": {"request_id"},
-            "prepare_leave_cancellation": {"request_id"},
-            "prepare_leave_approval": {"request_id"},
-            "prepare_leave_rejection": {"request_id", "reason"},
-        }.get(tool, set())
-        missing = required - arguments.keys()
-        if missing:
-            labels = ["leave type" if item == "leave_type" else item.replace("_", " ") for item in sorted(missing)]
-            request_text = "a reason" if missing == {"reason"} else ", ".join(labels)
-            return json.dumps({
-                "action": "final",
-                "message": "Please provide " + request_text + ".",
-                "context_update": {key: value for key, value in arguments.items() if key in {"leave_type", "start_date", "end_date", "reason"}},
-            })
-        if tool == "prepare_leave_approval" and "reason" in arguments:
-            arguments["comment"] = arguments.pop("reason")
-        allowed = {
-            "get_leave_balance": {"leave_type"},
-            "get_my_leave_requests": set(),
-            "get_managed_leave_requests": set(),
-            "get_leave_request_history": {"request_id"},
-            "get_holidays": {"start_date", "end_date"},
-            "calculate_leave_days": {"start_date", "end_date"},
-            "check_leave_eligibility": {"leave_type", "start_date", "end_date"},
-            "prepare_leave_application": {"leave_type", "start_date", "end_date", "reason"},
-            "prepare_leave_cancellation": {"request_id", "reason"},
-            "prepare_leave_approval": {"request_id", "comment"},
-            "prepare_leave_rejection": {"request_id", "reason"},
-        }[tool]
-        arguments = {key: value for key, value in arguments.items() if key in allowed}
-        return json.dumps({"action": "tool", "tool_calls": [{"name": tool, "arguments": arguments}]})
+        for leave_type, pattern in patterns.items():
+            if re.search(pattern, text.casefold()):
+                return leave_type
+        return None
 
+    @staticmethod
+    def _has_dates(text, today):
+        try:
+            return not resolve_leave_dates(text, today).ambiguous
+        except Exception:
+            return True
+
+    @staticmethod
+    def _reason(text):
+        match = re.search(r"\bbecause\s+(.+)$", text, re.I)
+        return match.group(1).strip() if match else None
+
+    @staticmethod
+    def _tool(name, **arguments):
+        return json.dumps({"action": "tool", "tool_calls": [{"name": name, "arguments": arguments}]})
 
 class FakePolicies:
     def search(self, question: str) -> PolicyContext:
@@ -350,7 +395,7 @@ def test_route_decision_normalizes_domain_from_intent():
 def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, parking_now=None):
     current_actor = current_actor or actor(db_session)
     settings = settings or Settings()
-    leave = LeaveService(SQLAlchemyLeaveRepository(db_session))
+    leave = LeaveService(SQLAlchemyLeaveRepository(db_session), today=lambda: TEST_TODAY)
     onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db_session))
     parking = ParkingService(
         SQLAlchemyParkingRepository(db_session),
@@ -361,6 +406,7 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, par
         SQLAlchemyPendingActionRepository(db_session),
         {
             "apply_leave": ApplyLeaveHandler(leave),
+            "apply_leave_plan": ApplyLeavePlanHandler(leave),
             "approve_leave_request": ApproveLeaveRequestHandler(leave),
             "reject_leave_request": RejectLeaveRequestHandler(leave),
             "cancel_leave_request": CancelLeaveRequestHandler(leave),
@@ -953,12 +999,13 @@ def test_leave_application_requires_confirmation_and_executes_on_yes(db_session)
     assert db_session.scalars(select(LeaveRequest)).all() == []
     assert db_session.scalar(select(PendingAction).where(PendingAction.session_id == "apply-session"))
 
+    calls_before_confirmation = len(llm.calls)
     confirmed = service.chat("apply-session", "yes")
 
     assert "submitted successfully" in confirmed.message
     assert len(db_session.scalars(select(LeaveRequest)).all()) == 1
     assert db_session.scalar(select(PendingAction).where(PendingAction.session_id == "apply-session")) is None
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == calls_before_confirmation  # confirmation never calls a model
 
 
 def test_pending_leave_can_be_cancelled_without_execution(db_session):
@@ -1104,72 +1151,6 @@ def test_leave_request_status_lists_requests_instead_of_applying_leave(db_sessio
     assert result.pending_action is None
 
 
-def test_leave_guard_extracts_textual_single_date():
-    decision = RouteDecision.model_validate_json(route(
-        intent="apply_leave",
-        leave_type="CASUAL",
-        start_date=None,
-        end_date=None,
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Apply casual leave on 5 October", today=date(2026, 10, 4)
-    )
-
-    assert guarded.start_date == date(2026, 10, 5)
-    assert guarded.end_date == date(2026, 10, 5)
-
-
-def test_leave_guard_extracts_duration_from_today():
-    decision = RouteDecision.model_validate_json(route(
-        intent="apply_leave",
-        leave_type="CASUAL",
-        start_date=None,
-        end_date=None,
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Apply casual leave for 5 days from today", today=date(2026, 10, 5)
-    )
-
-    assert guarded.start_date == date(2026, 10, 5)
-    assert guarded.end_date == date(2026, 10, 9)
-
-
-def test_leave_guard_extracts_duration_from_textual_start_date():
-    decision = RouteDecision.model_validate_json(route(
-        intent="apply_leave",
-        leave_type="EARNED",
-        start_date=None,
-        end_date=None,
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Apply earned leave from 5 October for 5 days", today=date(2026, 10, 4)
-    )
-
-    assert guarded.start_date == date(2026, 10, 5)
-    assert guarded.end_date == date(2026, 10, 9)
-
-
-def test_leave_guard_resolves_next_weekday_range():
-    decision = RouteDecision.model_validate_json(route(
-        intent="leave_eligibility",
-        leave_type="CASUAL",
-        start_date=None,
-        end_date=None,
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision,
-        "Can I take casual leave next Monday and Tuesday?",
-        today=date(2026, 10, 5),
-    )
-
-    assert guarded.start_date == date(2026, 10, 12)
-    assert guarded.end_date == date(2026, 10, 13)
-
-
 @pytest.mark.parametrize(
     ("message", "intent"),
     [
@@ -1201,29 +1182,6 @@ def test_leave_guard_does_not_route_non_leave_eligibility_to_leave():
 
     assert guarded.domain == "general"
     assert guarded.intent == "general"
-
-
-def test_leave_draft_status_only_enters_application_mode_for_apply_intent():
-    eligibility = RouteDecision.model_validate_json(route(
-        intent="leave_eligibility",
-        leave_type="CASUAL",
-        start_date="2026-10-12",
-        end_date="2026-10-13",
-    ))
-    eligibility_context = HRAssistantOrchestrator._merge_leave_context(
-        {}, eligibility, "Can I take casual leave next Monday and Tuesday?", date(2026, 10, 5)
-    )
-
-    assert eligibility_context["leave_type"] == "CASUAL"
-    assert "mode" not in eligibility_context
-
-    application = eligibility.model_copy(update={"intent": "apply_leave"})
-    application_context = HRAssistantOrchestrator._merge_leave_context(
-        {}, application, "Apply casual leave next Monday and Tuesday", date(2026, 10, 5)
-    )
-
-    assert application_context["mode"] == "apply_leave"
-    assert application_context["status"] == "READY_FOR_VALIDATION"
 
 
 def test_apply_leave_remembers_date_then_accepts_leave_type_follow_up(db_session):
@@ -1343,68 +1301,24 @@ def test_apply_leave_follow_up_preserves_textual_date_range_after_cancel(db_sess
 
 
 @pytest.mark.parametrize(
-    ("message", "expected_type", "expected_start", "expected_end"),
+    "message",
     [
-        ("please create casual leave request on 5 October", "CASUAL", date(2026, 10, 5), date(2026, 10, 5)),
-        ("I need sick leave tomorrow", "SICK", date(2026, 10, 5), date(2026, 10, 5)),
-        ("I need sick leave tommorrow", "SICK", date(2026, 10, 5), date(2026, 10, 5)),
-        ("raise privilege leave request from 5 October for 2 days", "EARNED", date(2026, 10, 5), date(2026, 10, 6)),
-        ("create leave from 13th october to 14th october", None, date(2026, 10, 13), date(2026, 10, 14)),
+        "please create casual leave request on 5 October",
+        "I need sick leave tomorrow",
+        "I need sick leave tommorrow",
+        "raise privilege leave request from 5 October for 2 days",
+        "create leave from 13th october to 14th october",
     ],
 )
-def test_apply_leave_guard_supports_varied_phrasings(
-    message, expected_type, expected_start, expected_end
-):
+def test_apply_leave_guard_supports_varied_phrasings(message):
     decision = RouteDecision.model_validate_json(route(domain="general", intent="general"))
 
     guarded = HRAssistantOrchestrator._apply_routing_guards(
         decision, message, today=date(2026, 10, 4)
     )
 
+    assert guarded.domain == "leave"
     assert guarded.intent == "apply_leave"
-    assert guarded.leave_type == expected_type
-    assert guarded.start_date == expected_start
-    assert guarded.end_date == expected_end
-
-
-@pytest.mark.parametrize(
-    ("message", "expected_start", "expected_end"),
-    [
-        ("Apply casual leave from next Monday for 3 working days", date(2026, 10, 12), date(2026, 10, 14)),
-        ("Apply casual leave from 9 October for 3 working days", date(2026, 10, 9), date(2026, 10, 13)),
-        ("Apply casual leave from 5th to 7th October", date(2026, 10, 5), date(2026, 10, 7)),
-    ],
-)
-def test_leave_guard_resolves_duration_and_range_phrases(
-    message, expected_start, expected_end
-):
-    decision = RouteDecision.model_validate_json(route(intent="apply_leave", leave_type="CASUAL"))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, message, today=date(2026, 10, 5)
-    )
-
-    assert guarded.start_date == expected_start
-    assert guarded.end_date == expected_end
-
-
-def test_leave_context_shifts_same_request_to_next_week():
-    decision = RouteDecision.model_validate_json(route(intent="apply_leave", leave_type="CASUAL"))
-    context = HRAssistantOrchestrator._merge_leave_context(
-        {
-            "mode": "apply_leave",
-            "status": "COLLECTING_DETAILS",
-            "leave_type": "CASUAL",
-            "start_date": "2026-10-12",
-            "end_date": "2026-10-13",
-        },
-        decision,
-        "same leave next week",
-        date(2026, 10, 5),
-    )
-
-    assert context["start_date"] == "2026-10-19"
-    assert context["end_date"] == "2026-10-20"
 
 
 def test_manager_can_switch_from_approval_queue_to_policy_question(db_session):
@@ -1475,35 +1389,6 @@ def test_policy_guard_routes_resignation_notice_question_to_rag(db_session):
 
     assert result.intent == "policy_question"
     assert result.sources[0]["document"] == "Revised Leave Policy - I2I.pdf"
-
-
-def test_iso_date_guard_preserves_user_supplied_order():
-    decision = RouteDecision.model_validate_json(route(
-        intent="calculate_leave_days",
-        start_date="2026-11-01",
-        end_date="2026-11-10",
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(
-        decision, "Calculate leave days from 2026-11-10 to 2026-11-01"
-    )
-
-    assert guarded.start_date.isoformat() == "2026-11-10"
-    assert guarded.end_date.isoformat() == "2026-11-01"
-
-
-def test_router_cannot_invent_dates_when_user_provides_none():
-    decision = RouteDecision.model_validate_json(route(
-        intent="apply_leave",
-        leave_type="SICK",
-        start_date="2026-10-04",
-        end_date="2026-10-04",
-    ))
-
-    guarded = HRAssistantOrchestrator._apply_routing_guards(decision, "Apply for sick leave")
-
-    assert guarded.start_date is None
-    assert guarded.end_date is None
 
 
 def test_apply_leave_guard_takes_priority_over_incidental_i_have_phrase():
@@ -1636,9 +1521,10 @@ def test_leave_agent_replaces_generic_failure_for_plural_balance_query(db_sessio
 def test_leave_agent_recovers_eligibility_when_final_model_output_is_malformed(db_session):
     llm = FakeLLM([
         route(intent="leave_eligibility", leave_type="CASUAL"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "resolve_dates", "arguments": {"text": "2026-11-04"}}]}),
         json.dumps({"action": "tool", "tool_calls": [{
-            "name": "check_leave_eligibility",
-            "arguments": {"leave_type": "CASUAL", "start_date": "2026-11-04", "end_date": "2026-11-04"},
+            "name": "build_leave_plan",
+            "arguments": {"leave_type": "CASUAL", "dates": ["2026-11-04"]},
         }]}),
         json.dumps({"action": "tool", "tool_calls": []}),
     ])
@@ -1661,7 +1547,7 @@ def test_leave_agent_can_chain_multiple_tools_and_ground_final_response(db_sessi
                 {"name": "get_leave_balance", "arguments": {"leave_type": "CASUAL"}},
                 {"name": "get_holidays", "arguments": {"start_date": "2026-10-12", "end_date": "2026-10-13"}},
                 {"name": "calculate_leave_days", "arguments": {"start_date": "2026-10-12", "end_date": "2026-10-13"}},
-                {"name": "check_leave_eligibility", "arguments": {"leave_type": "CASUAL", "start_date": "2026-10-12", "end_date": "2026-10-13"}},
+                {"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": ["2026-10-12", "2026-10-13"]}},
             ],
         }),
         json.dumps({"action": "final", "message": "You are eligible for 2 working days of Casual Leave."}),
@@ -1673,22 +1559,24 @@ def test_leave_agent_can_chain_multiple_tools_and_ground_final_response(db_sessi
 
     assert "eligible" in result.message
     assert [event["tool"] for event in result.agent_activity or []] == [
-        "get_leave_balance", "get_holidays", "calculate_leave_days", "check_leave_eligibility"
+        "get_leave_balance", "get_holidays", "calculate_leave_days", "build_leave_plan"
     ]
 
 
 def test_leave_agent_can_use_policy_rag_and_preserve_sources(db_session):
     llm = FakeLLM([
         route(intent="leave_eligibility"),
-        json.dumps({"action": "final", "message": "Please provide the leave dates.", "context_update": {"leave_type": "CASUAL"}}),
+        # Turn 1 is answered by the simulated model: resolve_dates -> build_leave_plan.
         route(intent="leave_eligibility"),
         json.dumps({"action": "tool", "tool_calls": [{"name": "search_leave_policy", "arguments": {"question": "Can leave be combined with a holiday?"}}]}),
         json.dumps({"action": "final", "message": "The policy passages retrieved for this question should be reviewed with the date calculation."}),
     ])
     service = orchestrator(db_session, llm)
 
-    service.chat("agent-policy", "Can I take casual leave next Monday?")
+    plan = service.chat("agent-policy", "Can I take casual leave next Monday?")
     result = service.chat("agent-policy", "Does the leave policy allow this around the holiday?")
+
+    assert "2026-10-12" in plan.message
 
     assert result.sources
     assert result.agent_activity[0]["tool"] == "search_leave_policy"
@@ -1697,9 +1585,9 @@ def test_leave_agent_can_use_policy_rag_and_preserve_sources(db_session):
 def test_leave_agent_context_then_apply_it_stays_behind_confirmation(db_session):
     llm = FakeLLM([
         route(intent="apply_leave"),
-        json.dumps({"action": "final", "message": "Please provide the start and end dates.", "context_update": {"leave_type": "CASUAL"}}),
+        json.dumps({"action": "final", "message": "Please provide the start and end dates."}),
         route(intent="apply_leave"),
-        json.dumps({"action": "tool", "tool_calls": [{"name": "prepare_leave_application", "arguments": {"leave_type": "CASUAL", "start_date": "2026-10-12", "end_date": "2026-10-12"}}]}),
+        # Turn 2: the simulated model resolves "October 12", builds the plan, then prepares it.
     ])
     service = orchestrator(db_session, llm)
 
@@ -1708,6 +1596,10 @@ def test_leave_agent_context_then_apply_it_stays_behind_confirmation(db_session)
 
     assert "start and end dates" in first.message
     assert "Reply yes to confirm" in proposal.message
+    assert "2026-10-12 to 2026-10-12" in proposal.message
+    assert [event["tool"] for event in proposal.agent_activity] == [
+        "resolve_dates", "build_leave_plan", "prepare_leave_application"
+    ]
     assert db_session.scalars(select(LeaveRequest)).all() == []
     assert db_session.scalar(select(PendingAction).where(PendingAction.session_id == "agent-context"))
 
@@ -1715,7 +1607,9 @@ def test_leave_agent_context_then_apply_it_stays_behind_confirmation(db_session)
 def test_leave_agent_insufficient_balance_explains_without_pending_action(db_session):
     llm = FakeLLM([
         route(intent="leave_eligibility"),
-        json.dumps({"action": "tool", "tool_calls": [{"name": "check_leave_eligibility", "arguments": {"leave_type": "CASUAL", "start_date": "2026-10-12", "end_date": "2026-10-20"}}]}),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "build_leave_plan", "arguments": {"leave_type": "CASUAL", "dates": [
+            "2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20"
+        ]}}]}),
         json.dumps({"action": "final", "message": "This is not eligible because the requested days exceed your available balance."}),
     ])
 
@@ -1734,12 +1628,8 @@ def test_leave_agent_surfaces_invalid_date_range_without_pending_action(db_sessi
         json.dumps({
             "action": "tool",
             "tool_calls": [{
-                "name": "prepare_leave_application",
-                "arguments": {
-                    "leave_type": "CASUAL",
-                    "start_date": "2026-10-20",
-                    "end_date": "2026-10-10",
-                },
+                "name": "resolve_dates",
+                "arguments": {"text": "from 20 October to 10 October"},
             }],
         }),
     ])
@@ -1924,3 +1814,67 @@ def test_chat_endpoint_requires_authentication(client):
 
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "authentication_failed"
+
+
+def test_tuesday_and_sunday_eligibility_then_apply_it_uses_the_same_one_day_plan(db_session):
+    """Regression: 'Tuesday and Sunday' was answered as 1 day, then applied as 4 days (Tue-Sun)."""
+    llm = FakeLLM([
+        route(intent="leave_eligibility", leave_type="CASUAL"),
+        route(domain="general", intent="general"),
+    ])
+    service = orchestrator(db_session, llm)
+
+    answer = service.chat("tue-sun", "can i take a casual leave on Tuesday and Sunday")
+    proposal = service.chat("tue-sun", "can you apply for it")
+
+    assert "1 working day(s) on 2026-10-06" in answer.message
+    assert "2026-10-11 (Sun, weekly off)" in answer.message
+    assert answer.pending_action is None
+    assert proposal.pending_action is not None
+    assert "Apply for 1 working day(s) of Casual leave from 2026-10-06 to 2026-10-06" in proposal.pending_action
+    assert [event["tool"] for event in proposal.agent_activity] == ["prepare_leave_application"]
+
+    confirmed = service.chat("tue-sun", "yes")
+    requests = db_session.scalars(select(LeaveRequest)).all()
+
+    assert "1 working day(s) was submitted successfully" in confirmed.message
+    assert [(item.start_date, item.end_date, item.working_days) for item in requests] == [
+        (date(2026, 10, 6), date(2026, 10, 6), 1)
+    ]
+
+
+def test_separate_days_plan_is_confirmed_as_separate_requests(db_session):
+    llm = FakeLLM([route(intent="apply_leave", leave_type="SICK")])
+    service = orchestrator(db_session, llm)
+
+    proposal = service.chat("separate-days", "apply sick leave on Tuesday and Friday")
+    confirmed = service.chat("separate-days", "yes")
+
+    assert "2026-10-06 (Tue); 2026-10-09 (Fri)" in proposal.message
+    assert "requests were submitted successfully" in confirmed.message
+    assert len(db_session.scalars(select(LeaveRequest)).all()) == 2
+
+
+def test_prepare_requires_the_active_plan_id(db_session):
+    service = orchestrator(db_session, FakeLLM([]))
+
+    execution = service.leave_agent.tools.execute(
+        "prepare_leave_application", {"plan_id": "lp_unknown"}, session_id="no-plan", active_plan=None
+    )
+
+    assert execution.ok is False
+    assert "No active leave plan" in execution.data["error"]
+
+
+def test_read_tools_never_change_the_active_plan(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility", leave_type="CASUAL"),
+        route(intent="calculate_leave_days"),
+    ])
+    service = orchestrator(db_session, llm)
+
+    service.chat("plan-stable", "can i take casual leave on Tuesday and Sunday")
+    service.chat("plan-stable", "calculate working days from Tuesday to Sunday")
+    stored = json.loads(db_session.get(ConversationSession, "plan-stable").state_json)
+
+    assert stored["leave_plan"]["requested_dates"] == ["2026-10-06", "2026-10-11"]

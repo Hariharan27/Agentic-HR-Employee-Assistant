@@ -1,39 +1,4 @@
-from typing import Any, Literal, TypedDict
-
-
-LeaveDraftStatus = Literal[
-    "COLLECTING_DETAILS",
-    "READY_FOR_VALIDATION",
-    "VALIDATED",
-    "AWAITING_CONFIRMATION",
-    "SUBMITTED",
-    "CANCELLED",
-    "EXPIRED",
-    "REJECTED",
-]
-
-
-LEAVE_DRAFT_STATUSES = {
-    "COLLECTING_DETAILS",
-    "READY_FOR_VALIDATION",
-    "VALIDATED",
-    "AWAITING_CONFIRMATION",
-    "SUBMITTED",
-    "CANCELLED",
-    "EXPIRED",
-    "REJECTED",
-}
-
-
-class LeaveDraft(TypedDict, total=False):
-    """Canonical, persisted state for a multi-turn leave request."""
-
-    mode: Literal["apply_leave"]
-    status: LeaveDraftStatus
-    leave_type: str
-    start_date: str
-    end_date: str
-    reason: str
+from typing import Any, TypedDict
 
 
 class AgentState(TypedDict, total=False):
@@ -51,7 +16,8 @@ class AgentState(TypedDict, total=False):
     agent_activity: list[dict[str, str]]
     pending_summary: str | None
     llm_calls: int
-    leave_context: dict[str, str]
+    # The active, validated leave plan (LeavePlan.to_dict()); replaces the old leave_context draft.
+    leave_plan: dict[str, Any] | None
     onboarding_context: dict[str, str]
     parking_context: dict[str, str]
     sensitive_response: bool

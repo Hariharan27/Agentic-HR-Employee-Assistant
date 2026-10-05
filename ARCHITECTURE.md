@@ -202,6 +202,21 @@ IDs, changing statuses, or constructing SQL.
 
 ## 8. Leave lifecycle
 
+### Leave plans (agent path)
+
+The Leave Agent never computes dates or day counts. It passes the employee's date words to
+`resolve_dates` (`app/domain/leave/dates.py`), which returns exact dates and whether they are
+separate days ("Tuesday and Sunday") or one range ("Tuesday to Sunday"). `build_leave_plan`
+(`LeaveService.build_leave_plan`) validates those dates and returns a `LeavePlan`: contiguous
+segments, weekends and holidays not counted, balance before and after, past-date rules (sick
+leave up to 7 days back, other types from today), overlaps, and a fingerprint. The newest plan is
+the conversation's active plan, persisted on the session and valid for 30 minutes.
+
+"Apply it" means `prepare_leave_application(plan_id)`: the executor rebuilds the plan, requires
+the same fingerprint, and stores an `apply_leave_plan` pending action. On confirmation the
+handler rebuilds the plan again inside the transaction and creates one request per segment, so
+the days the employee was shown are exactly the days submitted.
+
 ### Read operations
 
 - Balance responses combine total, used, and pending days.
