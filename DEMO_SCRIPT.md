@@ -2,11 +2,11 @@
 
 This script walks through **every capability** in the order a real employee journey happens:
 
-1. **Onboarding** — a manager creates a new employee, HR Admin activates the account, departments
-   update provisioning
+1. **Onboarding** — HR creates a new employee, HR Admin activates the account, IT / Finance /
+   Facilities reply by email and HR tracks the provisioning status
 2. **Employee** — policy, leave planning and applications, parking
-3. **Manager** — approvals, rejections, audit history, onboarding tracking
-4. **HR** — organisation-wide approvals and onboarding in chat
+3. **Manager** — approvals, rejections, audit history, onboarding by form
+4. **HR** — organisation-wide approvals and onboarding tracking
 5. **HR Admin** — the onboarding approval queue and rejection
 6. **Parking Admin** — the daily queue, check-in, completion, cancellation, no-show and override
 
@@ -26,18 +26,26 @@ docker compose exec -T backend python -m app.seed --reset-demo
 Open <http://localhost:5173>. Do not run the reset again until the recording is finished: it
 removes the accounts activated during the demo.
 
-Optional, for the department-reply step (1.4): add `INBOUND_EMAIL_TOKEN=demo-inbound-token` to `.env`
-before `docker compose up`.
+For the department-reply emails (1.4), add this line to `.env` **before** `docker compose up`
+(without it the endpoint answers 503):
+
+```text
+INBOUND_EMAIL_TOKEN=demo-inbound-token
+```
+
+The department sender addresses are `it@example.com`, `finance@example.com` and
+`facilities@example.com` unless you set `IT_NOTIFICATION_EMAIL`, `FINANCE_NOTIFICATION_EMAIL` or
+`FACILITIES_NOTIFICATION_EMAIL` in `.env`. If you did, use your values as the `sender` below.
 
 ### 0.2 Accounts
 
 | Act | Role | Person | Username | Password |
 |---|---|---|---|---|
-| 1, 3 | Manager | Saanvika Sree | `manager` | `manager123` |
+| 1, 4 | HR | Hariharan | `hr` | `hr12345` |
 | 1, 5 | HR Admin | Alaguselvi | `hradmin` | `hradmin123` |
+| 3 | Manager | Saanvika Sree | `manager` | `manager123` |
 | 2 | Existing employee (reports to Saanvika, has vehicle TN01AR1001) | Advik | `employee` | `employee123` |
 | 2 | New employee created in Act 1 | Nila Raman | generated | generated |
-| 4 | HR | Hariharan | `hr` | `hr12345` |
 | 6 | Parking Admin | Dhaswanth | `parkingadmin` | `parkingadmin123` |
 
 ### 0.3 Timing (parking rules are real)
@@ -75,75 +83,226 @@ recording day.
 
 ---
 
-## Act 1 — Onboarding a new employee
+## Act 1 — Onboarding a new employee (HR → HR Admin → departments → HR)
 
-### 1.1 Manager creates the request (form inside chat)
+### 1.1 HR signs in and starts onboarding
 
-1. Sign in as **Manager** (`manager` / `manager123`).
-2. Click **Start onboarding in chat**, or type `Start onboarding a new employee`.
-   - Expected: PeopleDesk asks for the missing details and shows the inline onboarding form.
-3. Fill the form:
+1. Sign in as **HR** (`hr` / `hr12345`). The profile shows Hariharan, role **HR**.
+2. Type:
 
-   | Field | Value |
-   |---|---|
-   | Name | Nila Raman |
-   | Email | `nila.demo@ideas2it.com` |
-   | Designation | Software Engineer |
-   | Department | Engineering |
-   | Reporting manager | Saanvika Sree |
-   | Joining date | 2026-10-12 |
-   | Employment type | Permanent |
-   | Location | Chennai |
+   ```text
+   Start onboarding a new employee
+   ```
 
-4. Click **Create request for confirmation**.
-   - Expected: a **New employee onboarding** summary. **Account role: Employee** is separate from
-     **Designation**, the manager is resolved from the employee directory, and five provisioning
-     tasks are listed: corporate email, laptop, permanent access card, temporary access card,
-     payroll setup.
-5. Click **Confirm** and note `<NILA_ONB_ID>`.
+   Expected: `Please provide the employee name, email, designation, …` and the inline onboarding
+   form appears under the reply.
 
-Point out: the form and chat share one draft; the location and employment-type lists are fixed;
-the joining date can't be in the past; the account role can't be changed.
-
-### 1.2 Manager cannot approve it
+### 1.2 HR gives the details in chat (one detail left out on purpose)
 
 ```text
-Approve onboarding request #<NILA_ONB_ID>
+Onboard Nila Raman. Email: nila.demo@ideas2it.com; designation: Software Engineer; department: Engineering; reporting manager: Saanvika Sree; location: Chennai; employment type: Permanent
 ```
 
-Expected: an "not authorized" error. Approval belongs to the HR Admin, so the person who creates a
-request can't also approve it (maker-checker).
+Expected: everything is captured; the reply asks only for the **joining date**. The form below is
+pre-filled with the same values.
 
-### 1.3 HR Admin approves and activates the account
+```text
+Her joining date is 2026-10-12
+```
 
-1. Sign out and sign in as **HR Admin** (`hradmin` / `hradmin123`). The **Approval queue** panel
-   shows Nila's request.
-2. Ask `Show pending onboarding approvals`.
-   - Expected: `Pending onboarding approvals:` with Nila's request.
-3. Ask `Approve onboarding request #<NILA_ONB_ID>`, then click **Confirm**.
-   - Expected: employee code, username and a **one-time temporary password**. Note
-     `<NILA_USERNAME>` and `<NILA_PASSWORD>`; the password is shown only once.
+Expected: the **New employee onboarding** summary:
 
-Point out: the employee record, login and default leave balances (6 Casual, 6 Sick, 12 Earned) are
-created in one transaction. Emails go to IT, Finance and Facilities (see the backend log:
-`docker compose logs backend | grep -A6 "EMAIL"`).
+| Field | Value |
+|---|---|
+| Name | Nila Raman |
+| Email | nila.demo@ideas2it.com |
+| Account role | Employee |
+| Designation | Software Engineer |
+| Department | Engineering |
+| Manager | Saanvika Sree |
+| Joining date | 2026-10-12 |
+| Location | Chennai |
+| Employment type | Permanent |
 
-### 1.4 Departments reply by email (optional; needs `INBOUND_EMAIL_TOKEN`)
+followed by the five provisioning requests (corporate email, laptop, permanent access card,
+temporary access card, payroll setup) and **Confirm / Cancel**.
 
-Simulate the IT team replying to the provisioning email:
+Instead of chat you can fill the same values in the inline form and click **Create request for
+confirmation**. Chat and form share one draft.
+
+Point out: a value is accepted only if you typed it. A manager name that matches nobody, a past
+joining date, or a location other than Chennai/Bengaluru is rejected with the reason.
+
+### 1.3 HR submits the request; it is waiting for HR Admin
+
+1. Click **Confirm**. Note the onboarding request ID as `<NILA_ONB_ID>`.
+2. HR can't approve its own request:
+
+   ```text
+   Approve onboarding request #<NILA_ONB_ID>
+   ```
+
+   Expected: "You are not authorized to perform this action." Approval belongs to the HR Admin
+   (maker-checker).
+
+3. Check the status:
+
+   ```text
+   What's Nila Raman's onboarding status?
+   ```
+
+   Expected: **Pending approval**, 0/5 provisioning tasks.
+
+### 1.4 HR Admin approves and activates the account
+
+1. Sign out and sign in as **HR Admin** (`hradmin` / `hradmin123`).
+2. Type:
+
+   ```text
+   Show pending onboarding approvals
+   ```
+
+   Expected: `Pending onboarding approvals:` with `#<NILA_ONB_ID>: Nila Raman — Software Engineer,
+   joining 2026-10-12`.
+
+3. Type `Approve onboarding request #<NILA_ONB_ID>` and click **Confirm**.
+   Expected: the employee code, username and a **one-time temporary password**. Note
+   `<NILA_CODE>`, `<NILA_USERNAME>` and `<NILA_PASSWORD>`; the password is shown only once.
+4. Three provisioning emails go out (to Finance, IT and Facilities). Show them in a terminal:
+
+   ```bash
+   docker compose logs backend | grep -A4 "========== EMAIL"
+   ```
+
+   The subjects look like `[Onboarding #<NILA_ONB_ID>] IT Provisioning Required - Nila Raman
+   (<NILA_CODE>) - Joining 2026-10-12`. The `[Onboarding #ID]` tag is how replies are matched
+   back to the request.
+
+### 1.5 Departments reply by email (inbound email endpoint)
+
+**URL:** `POST http://localhost:8000/api/v1/inbound/email`
+
+**Headers:** `Content-Type: application/json` and `X-Inbound-Token: demo-inbound-token`
+
+**Body fields:** `sender` (must be a known department address), `subject` (must contain
+`[Onboarding #<id>]`), `body` (the reply text in plain words).
+
+You can send these from a terminal (below), or from <http://localhost:8000/docs> → **POST
+/api/v1/inbound/email** → **Try it out**: put `demo-inbound-token` in the `x-inbound-token` field
+and paste the JSON body.
+
+Replace `<NILA_ONB_ID>` with the real ID in each command.
+
+**Reply 1 — IT completes email and laptop**
 
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/inbound/email \
-  -H "Content-Type: application/json" -H "X-Inbound-Token: demo-inbound-token" \
-  -d '{"sender":"it@example.com","subject":"Re: [Onboarding #<NILA_ONB_ID>] New joiner","body":"Corporate email is created and the laptop has been issued."}'
+  -H "Content-Type: application/json" \
+  -H "X-Inbound-Token: demo-inbound-token" \
+  -d '{
+    "sender": "it@example.com",
+    "subject": "Re: [Onboarding #<NILA_ONB_ID>] IT Provisioning Required - Nila Raman",
+    "body": "Hi HR, the corporate email account nila.demo@ideas2it.com has been created and the laptop has been issued. Regards, IT Team"
+  }'
 ```
 
-Point out:
-- The sender decides which tasks it may update (IT can only update email and laptop).
-- The model only interprets the wording of the reply.
-- Without the token the endpoint answers 401.
+Expected response:
 
-The manager will see 2 of 5 tasks completed in Act 3.
+```json
+{"request_id": <NILA_ONB_ID>, "department": "IT",
+ "interpreted_updates": [{"task_type": "CORPORATE_EMAIL", "status": "COMPLETED"},
+                         {"task_type": "LAPTOP", "status": "COMPLETED"}],
+ "onboarding_status": "ACTIVE", "completed_tasks": 2, "total_tasks": 5}
+```
+
+**Reply 2 — Facilities: one task done, one in progress**
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/inbound/email \
+  -H "Content-Type: application/json" \
+  -H "X-Inbound-Token: demo-inbound-token" \
+  -d '{
+    "sender": "facilities@example.com",
+    "subject": "Re: [Onboarding #<NILA_ONB_ID>] Access Provisioning Required - Nila Raman",
+    "body": "The temporary access card is ready for collection at the front desk. The permanent access card is being printed and will be ready next week."
+  }'
+```
+
+Expected: `TEMPORARY_ACCESS_CARD` → `COMPLETED`, `ACCESS_CARD` → `IN_PROGRESS`, completed 3 of 5.
+The model reads the wording; Python decides which tasks this sender is allowed to touch.
+
+At this point, ask HR for the status (1.6). Then send the last two replies:
+
+**Reply 3 — Finance completes payroll**
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/inbound/email \
+  -H "Content-Type: application/json" \
+  -H "X-Inbound-Token: demo-inbound-token" \
+  -d '{
+    "sender": "finance@example.com",
+    "subject": "Re: [Onboarding #<NILA_ONB_ID>] Payroll Setup Required - Nila Raman",
+    "body": "Payroll registration and the salary account setup are complete for Nila Raman."
+  }'
+```
+
+Expected: `PAYROLL_SETUP` → `COMPLETED`, 4 of 5.
+
+**Reply 4 — Facilities completes the permanent card**
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/inbound/email \
+  -H "Content-Type: application/json" \
+  -H "X-Inbound-Token: demo-inbound-token" \
+  -d '{
+    "sender": "facilities@example.com",
+    "subject": "Re: [Onboarding #<NILA_ONB_ID>] Access Provisioning Required - Nila Raman",
+    "body": "The permanent access card has been handed over to Nila."
+  }'
+```
+
+Expected: `ACCESS_CARD` → `COMPLETED`, 5 of 5, `onboarding_status` → `COMPLETED`.
+
+**Guardrails (optional, 20 seconds):**
+
+```bash
+# wrong token → 401
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/api/v1/inbound/email \
+  -H "Content-Type: application/json" -H "X-Inbound-Token: wrong" \
+  -d '{"sender":"it@example.com","subject":"[Onboarding #<NILA_ONB_ID>]","body":"done"}'
+
+# unknown sender → 400 "The email sender is not authorized for onboarding updates."
+curl -s -X POST http://localhost:8000/api/v1/inbound/email \
+  -H "Content-Type: application/json" -H "X-Inbound-Token: demo-inbound-token" \
+  -d '{"sender":"someone@gmail.com","subject":"Re: [Onboarding #<NILA_ONB_ID>]","body":"Laptop issued."}'
+```
+
+The IT address also can't mark payroll: tasks outside a department's list are refused.
+
+### 1.6 HR asks for the onboarding status
+
+Sign back in as **HR** (or keep a second browser window signed in as HR). Ask:
+
+```text
+What's Nila Raman's onboarding status?
+```
+
+Or by ID or email:
+
+```text
+Show onboarding status for request #<NILA_ONB_ID>
+What is the onboarding status of nila.demo@ideas2it.com?
+```
+
+Expected after replies 1–2: **Active**, 3/5 completed:
+- Corporate email: Completed
+- Laptop: Completed
+- Temporary access card: Completed
+- Permanent access card: In progress
+- Payroll setup: Pending
+
+After replies 3–4: **Completed**, 5/5. The **Onboarding** side panel (search by name, email or
+ID) shows the same status as a progress card.
 
 ---
 
@@ -400,12 +559,21 @@ Expected: explains what PeopleDesk currently supports; nothing is changed.
    Show history for leave request #<ADVIK_LEAVE_1>
    ```
    Expected: Pending → Rejected, by Saanvika, with the reason.
-7. Onboarding tracking:
+7. The manager tracks Nila (she reports to Saanvika):
    ```text
    What's Nila Raman's onboarding status?
    ```
-   Or use the **Track onboarding** panel. Expected: active, with the provisioning tasks; 2 of 5 are
-   done if you ran 1.4.
+8. The manager onboards someone by **form**:
+   - Click **Start onboarding in chat**.
+   - Fill in: Name `Arun Kumar`, Email `arun.demo@ideas2it.com`, Designation `QA Engineer`,
+     Department `Engineering`, Reporting manager `Saanvika Sree`, Joining date `2026-10-19`,
+     Employment type `Contract`, Location `Bengaluru`.
+   - Click **Create request for confirmation**, then **Confirm**. Note `<ARUN_ONB_ID>`.
+9. The manager can't approve onboarding:
+   ```text
+   Approve onboarding request #<ARUN_ONB_ID>
+   ```
+   Expected: "You are not authorized to perform this action."
 
 Leave `<ADVIK_LEAVE_2>` pending for HR.
 
@@ -414,37 +582,33 @@ Leave `<ADVIK_LEAVE_2>` pending for HR.
 ## Act 4 — HR side (Hariharan)
 
 1. Sign in as **HR** (`hr` / `hr12345`).
-2. Approvals across the organisation:
+2. Leave approvals across the organisation:
    ```text
    Show my approval queue
    ```
-   Expected: requests from across the company, including Advik's `<ADVIK_LEAVE_2>`.
+   Expected: pending requests from across the company, including Advik's `<ADVIK_LEAVE_2>`. HR
+   isn't limited to direct reports.
    ```text
    Approve leave request #<ADVIK_LEAVE_2>
    ```
    **Confirm**.
-3. Onboarding in chat (no form), with a missing detail:
+3. Track both onboarding requests:
    ```text
-   Onboard a new employee. Name: Arun Kumar; email: arun.demo@ideas2it.com; designation: QA Engineer; department: Engineering; reporting manager: Saanvika Sree; location: Bengaluru; employment type: Contract
-   ```
-   Expected: everything is captured except the joining date, which it asks for.
-   ```text
-   joining date is 2026-10-19
-   ```
-   Expected: the full **New employee onboarding** summary with provisioning tasks. **Confirm** →
-   `<ARUN_ONB_ID>`.
-   Point out: values are accepted only when you typed them; a name that matches no manager, a past
-   joining date or a location outside Chennai/Bengaluru is rejected with the reason.
-4. ```text
    Show onboarding status for request #<ARUN_ONB_ID>
+   What's Nila Raman's onboarding status?
    ```
-   Expected: pending HR Admin approval.
+   Expected: Arun is pending HR Admin approval; Nila is completed, 5/5.
+4. HR is still an employee for HR self-service:
+   ```text
+   What is my leave balance?
+   ```
 
 ---
 
 ## Act 5 — HR Admin side (Alaguselvi)
 
-1. Sign in as **HR Admin**. The **Approval queue** panel shows Arun's request.
+1. Sign in as **HR Admin**. The **Approval queue** panel shows Arun's request (created by the
+   manager in Act 3).
 2. ```text
    Show pending onboarding approvals
    ```
@@ -460,7 +624,7 @@ Leave `<ADVIK_LEAVE_2>` pending for HR.
 4. ```text
    What's Nila Raman's onboarding status?
    ```
-   Expected: Nila is active, and her tasks are listed.
+   Expected: Nila is completed, with all five tasks done.
 5. Policy works for every role:
    ```text
    What does the code of conduct say about conflicts of interest?
@@ -519,14 +683,15 @@ Leave `<ADVIK_LEAVE_2>` pending for HR.
 
 ## 12-minute cut
 
-1. 1.1 + 1.3: Manager creates Nila by form; HR Admin approves; one-time credentials.
-2. 2.3: one policy question with sources.
-3. 2.5 steps 1–2: Tuesday and Sunday → 1 working day → "can you apply for it" → Confirm.
-4. 2.5 step 5: split leave offer (Cancel at the end).
-5. 2.6 steps 1–2: register vehicle, slot board, choose B-22.
-6. Act 3 steps 2 and 4: the manager sees and approves Nila's leave.
-7. 2.7: another employee's balance, and the employee trying to approve.
-8. Act 6 step 1: the Parking Admin queue shows Nila's booking.
+1. 1.1–1.4: HR creates Nila in chat; HR Admin approves; one-time credentials.
+2. 1.5 replies 1–2 and 1.6: IT and Facilities reply by email; HR sees 3/5 tasks.
+3. 2.3: one policy question with sources.
+4. 2.5 steps 1–2: Tuesday and Sunday → 1 working day → "can you apply for it" → Confirm.
+5. 2.5 step 5: split leave offer (Cancel at the end).
+6. 2.6 steps 1–2: register vehicle, slot board, choose B-22.
+7. Act 3 steps 2 and 4: the manager sees and approves Nila's leave.
+8. 2.7: another employee's balance, and the employee trying to approve.
+9. Act 6 step 1: the Parking Admin queue shows Nila's booking.
 
 ## Cautions
 
