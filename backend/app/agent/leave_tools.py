@@ -266,18 +266,22 @@ class LeaveToolExecutor:
         )
 
     def _get_holidays(self, arguments: DateRangeArguments, **_: Any) -> LeaveToolExecution:
-        holidays = sorted(self.leave.get_holidays(arguments.start_date, arguments.end_date))
+        holidays = self.leave.get_holidays(arguments.start_date, arguments.end_date, self.actor)
         return LeaveToolExecution(
             "get_holidays",
             True,
-            {"holidays": [item.isoformat() for item in holidays]},
+            {
+                "holidays": [item.isoformat() for item in sorted(holidays)],
+                "names": {item.isoformat(): holidays[item] for item in sorted(holidays)},
+                "calendar": self.leave.holiday_region(self.actor),
+            },
             self._base_label("get_holidays"),
         )
 
     def _calculate_leave_days(
         self, arguments: DateRangeArguments, **_: Any
     ) -> LeaveToolExecution:
-        days = self.leave.calculate_leave_days(arguments.start_date, arguments.end_date)
+        days = self.leave.calculate_leave_days(arguments.start_date, arguments.end_date, self.actor)
         return LeaveToolExecution(
             "calculate_leave_days",
             True,
@@ -288,7 +292,7 @@ class LeaveToolExecutor:
     def _resolve_dates(self, arguments: ResolveDatesArguments, **_: Any) -> LeaveToolExecution:
         today = self.leave.today()
         window_end = date(today.year + 1, 12, 31)
-        holidays = self.leave.get_holidays(date(today.year, 1, 1), window_end)
+        holidays = self.leave.get_holidays(date(today.year, 1, 1), window_end, self.actor)
         resolution = resolve_leave_dates(arguments.text, today, holidays)
         data: dict[str, Any] = {
             "today": today.isoformat(),

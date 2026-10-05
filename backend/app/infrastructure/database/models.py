@@ -152,11 +152,16 @@ class Holiday(Base):
     __tablename__ = "holidays"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    holiday_date: Mapped[date] = mapped_column(Date, unique=True)
+    holiday_date: Mapped[date] = mapped_column(Date)
     name: Mapped[str] = mapped_column(String(160))
     category: Mapped[str] = mapped_column(String(40), default="PUBLIC")
+    # Regional calendar (TAMIL_NADU, KARNATAKA); NULL applies to every location.
+    region: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
-    __table_args__ = (Index("ix_holidays_date", "holiday_date"),)
+    __table_args__ = (
+        Index("ix_holidays_date", "holiday_date"),
+        UniqueConstraint("holiday_date", "region", name="uq_holidays_date_region"),
+    )
 
 
 class OnboardingRequest(Base):

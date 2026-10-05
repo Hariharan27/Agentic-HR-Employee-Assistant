@@ -6,6 +6,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
+from app.domain.leave.holidays import HOLIDAY_CALENDARS
 from app.infrastructure.database.models import (
     ConversationSession,
     Employee,
@@ -377,19 +378,26 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
             slot.slot_type = slot_type
             slot.active = True
 
-    year = date.today().year
-    for holiday_date, name in (
-        (date(year, 1, 26), "Republic Day"),
-        (date(year, 8, 15), "Independence Day"),
-        (date(year, 10, 2), "Gandhi Jayanti"),
-        (date(year, 12, 25), "Christmas"),
-    ):
-        holiday = db.scalar(select(Holiday).where(Holiday.holiday_date == holiday_date))
-        if holiday is None:
-            db.add(Holiday(holiday_date=holiday_date, name=name, category="PUBLIC"))
-        elif reset_demo:
-            holiday.name = name
-            holiday.category = "PUBLIC"
+    regional_dates = {
+        holiday_date for calendar in HOLIDAY_CALENDARS.values() for holiday_date, _ in calendar
+    }
+    # Earlier seeds stored a few company-wide holidays without a region; the regional calendars
+    # from the 2026 holiday list PDFs replace them.
+    for legacy in db.scalars(
+        select(Holiday).where(Holiday.region.is_(None), Holiday.holiday_date.in_(regional_dates))
+    ).all():
+        db.delete(legacy)
+    db.flush()
+    for region, calendar in HOLIDAY_CALENDARS.items():
+        for holiday_date, name in calendar:
+            holiday = db.scalar(
+                select(Holiday).where(Holiday.holiday_date == holiday_date, Holiday.region == region)
+            )
+            if holiday is None:
+                db.add(Holiday(holiday_date=holiday_date, name=name, category="PUBLIC", region=region))
+            else:
+                holiday.name = name
+                holiday.category = "PUBLIC"
 
 
 

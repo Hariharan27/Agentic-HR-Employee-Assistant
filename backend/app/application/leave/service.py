@@ -21,6 +21,7 @@ from app.domain.leave.entities import (
     LeaveStatus,
     LeaveType,
 )
+from app.domain.leave.holidays import DEFAULT_REGION, region_for_location
 from app.domain.leave.plan import ExcludedDay, LeavePlan, PlanSegment, plan_ttl
 from app.domain.leave.rules import calculate_working_days, validate_date_range
 
@@ -73,17 +74,29 @@ class LeaveService:
             for b in balances
         ]
 
-    def get_holidays(self, start_date: date, end_date: date) -> set[date]:
-        validate_date_range(start_date, end_date)
-        return self.repository.get_holidays(start_date, end_date)
+    def holiday_region(self, actor: AuthenticatedUser | None) -> str:
+        if actor is None:
+            return DEFAULT_REGION
+        return region_for_location(self.repository.get_employee_location(actor.employee_id))
 
-    def calculate_leave_days(self, start_date: date, end_date: date) -> Decimal:
-        return calculate_working_days(start_date, end_date, self.get_holidays(start_date, end_date))
+    def get_holidays(
+        self, start_date: date, end_date: date, actor: AuthenticatedUser | None = None
+    ) -> dict[date, str]:
+        """Holidays (date -> name) in the employee's regional calendar."""
+        validate_date_range(start_date, end_date)
+        return self.repository.get_holidays(start_date, end_date, self.holiday_region(actor))
+
+    def calculate_leave_days(
+        self, start_date: date, end_date: date, actor: AuthenticatedUser | None = None
+    ) -> Decimal:
+        return calculate_working_days(
+            start_date, end_date, set(self.get_holidays(start_date, end_date, actor))
+        )
 
     def check_leave_eligibility(self, actor: AuthenticatedUser, leave_type: str,
                                 start_date: date, end_date: date) -> LeaveEligibility:
         parsed = self._parse_leave_type(leave_type)
-        working_days = self.calculate_leave_days(start_date, end_date)
+        working_days = self.calculate_leave_days(start_date, end_date, actor)
         if working_days == 0:
             return LeaveEligibility(False, working_days, Decimal("0"), "The selected range has no working days")
         balances = self.get_leave_balance(actor, parsed.value)
@@ -112,13 +125,13 @@ class LeaveService:
             raise ValidationError("At least one leave date is required")
         if (requested[-1] - requested[0]).days + 1 > MAX_PLAN_DAYS:
             raise ValidationError(f"A leave plan can cover at most {MAX_PLAN_DAYS} calendar days")
-        holidays = self.repository.get_holidays(requested[0], requested[-1])
+        holidays = self.repository.get_holidays(requested[0], requested[-1], self.holiday_region(actor))
 
         def working(day: date) -> bool:
             return day.weekday() < 5 and day not in holidays
 
         excluded = tuple(
-            ExcludedDay(day, "holiday" if day in holidays else "weekly off")
+            ExcludedDay(day, "holiday", holidays[day]) if day in holidays else ExcludedDay(day, "weekly off")
             for day in requested if not working(day)
         )
         working_dates = [day for day in requested if working(day)]
@@ -225,8 +238,10 @@ class LeaveService:
         locked = self.repository.get_balances(actor.employee_id, parsed, for_update=True)
         if not locked:
             raise NotFoundError("No leave balance was found for the requested leave type")
-        working_days = calculate_working_days(start_date, end_date,
-                                              self.repository.get_holidays(start_date, end_date))
+        working_days = calculate_working_days(
+            start_date, end_date,
+            set(self.repository.get_holidays(start_date, end_date, self.holiday_region(actor))),
+        )
         if working_days == 0:
             raise ValidationError("The selected range has no working days")
         if self.repository.has_overlapping_request(actor.employee_id, start_date, end_date):

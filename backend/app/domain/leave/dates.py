@@ -55,7 +55,7 @@ class DateResolution:
 
 
 def resolve_leave_dates(
-    text: str, today: date, holidays: set[date] | frozenset[date] = frozenset()
+    text: str, today: date, holidays: dict[date, str] | set[date] | frozenset[date] = frozenset()
 ) -> DateResolution:
     """Resolve a date phrase into concrete dates.
 
@@ -206,10 +206,13 @@ def _mentions(normalized: str, today: date) -> list[_Mention]:
     return sorted(found, key=lambda item: item.start)
 
 
-def describe_day(value: date, holidays: set[date] | frozenset[date] = frozenset()) -> dict[str, object]:
-    return {
+def describe_day(value: date, holidays: dict[date, str] | set[date] | frozenset[date] = frozenset()) -> dict[str, object]:
+    described: dict[str, object] = {
         "date": value.isoformat(),
         "weekday": value.strftime("%A"),
         "is_weekend": value.weekday() >= 5,
         "is_holiday": value in holidays,
     }
+    if isinstance(holidays, dict) and value in holidays:
+        described["holiday"] = holidays[value]
+    return described

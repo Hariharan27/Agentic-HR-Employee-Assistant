@@ -121,3 +121,26 @@ def test_privilege_leave_is_not_treated_as_earned_leave(db_session, value):
 
     with pytest.raises(ValidationError, match="Privilege Leave \\(PL\\) is a separate legacy balance"):
         service(db_session).build_leave_plan(employee(db_session), value, [date(2026, 10, 6)])
+
+
+def test_holidays_follow_the_employee_location_calendar(db_session):
+    from app.infrastructure.database.models import Holiday
+
+    db_session.add_all([
+        Holiday(holiday_date=date(2026, 11, 10), name="Diwali", category="PUBLIC", region="KARNATAKA"),
+        Holiday(holiday_date=date(2026, 10, 19), name="Ayudha Poojai", category="PUBLIC", region="TAMIL_NADU"),
+    ])
+    db_session.commit()
+    hr_user = db_session.scalar(select(User).where(User.username == "hr"))  # located in Bengaluru
+    from app.infrastructure.database.models import LeaveBalance
+    db_session.add(LeaveBalance(employee_id=hr_user.employee_id, leave_type="CASUAL", total_days=6, used_days=0))
+    db_session.commit()
+    hr = AuthenticatedUser(hr_user.id, hr_user.employee_id, hr_user.role)
+    leave = service(db_session)
+
+    chennai = leave.build_leave_plan(employee(db_session), "CASUAL", [date(2026, 10, 19), date(2026, 11, 10)])
+    bengaluru = leave.build_leave_plan(hr, "CASUAL", [date(2026, 10, 19), date(2026, 11, 10)])
+
+    assert [(item.day, item.name) for item in chennai.excluded_days] == [(date(2026, 10, 19), "Ayudha Poojai")]
+    assert [(item.day, item.name) for item in bengaluru.excluded_days] == [(date(2026, 11, 10), "Diwali")]
+    assert "holiday: Ayudha Poojai" in chennai.summary()

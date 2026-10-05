@@ -120,3 +120,28 @@ def test_demo_reset_is_repeatable_and_restores_baseline():
         assert db.scalar(select(func.count()).select_from(Vehicle)) == 0
         assert casual.used_days == Decimal("2")
         assert verify_password("employee123", employee_user.password_hash)
+
+
+def test_seed_loads_both_regional_2026_holiday_calendars_idempotently():
+    from app.infrastructure.database.models import Holiday
+
+    engine = create_engine("sqlite+pysqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    TestingSession = sessionmaker(bind=engine, expire_on_commit=False)
+    with TestingSession() as db:
+        db.add(Holiday(holiday_date=date(2026, 10, 2), name="Gandhi Jayanti", category="PUBLIC"))  # legacy, no region
+        db.commit()
+        seed_database(db, reset_demo=True)
+        seed_database(db, reset_demo=True)
+        db.commit()
+
+        rows = db.scalars(select(Holiday)).all()
+        by_region = {}
+        for row in rows:
+            by_region.setdefault(row.region, {})[row.holiday_date] = row.name
+
+    assert None not in by_region
+    assert len(by_region["TAMIL_NADU"]) == 12 and len(by_region["KARNATAKA"]) == 12
+    assert by_region["TAMIL_NADU"][date(2026, 10, 19)] == "Ayudha Poojai"
+    assert by_region["TAMIL_NADU"][date(2026, 11, 8)] == "Diwali"
+    assert by_region["KARNATAKA"][date(2026, 11, 10)] == "Diwali"

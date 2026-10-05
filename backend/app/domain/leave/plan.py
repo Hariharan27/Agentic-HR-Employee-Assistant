@@ -27,6 +27,7 @@ class PlanSegment:
 class ExcludedDay:
     day: date
     reason: str  # "weekly off", "holiday"
+    name: str | None = None  # holiday name
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +79,9 @@ class LeavePlan:
 
     def excluded_text(self) -> str:
         return ", ".join(
-            f"{item.day.isoformat()} ({item.day.strftime('%a')}, {item.reason})" for item in self.excluded_days
+            f"{item.day.isoformat()} ({item.day.strftime('%a')}, "
+            f"{item.reason + ': ' + item.name if item.name else item.reason})"
+            for item in self.excluded_days
         )
 
     def summary(self) -> str:
@@ -129,7 +132,10 @@ class LeavePlan:
                 }
                 for item in self.segments
             ],
-            "excluded_days": [{"date": item.day.isoformat(), "reason": item.reason} for item in self.excluded_days],
+            "excluded_days": [
+                {"date": item.day.isoformat(), "reason": item.reason, **({"holiday": item.name} if item.name else {})}
+                for item in self.excluded_days
+            ],
             "total_working_days": _number(self.total_working_days),
             "available_before": _number(self.available_before),
             "available_after": _number(self.available_after),
