@@ -7,7 +7,6 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api.dependencies import get_db
-from app.core.config import get_settings
 from app.core.security import hash_password
 from app.infrastructure.database.base import Base
 from app.infrastructure.database.models import Employee, Holiday, LeaveBalance, User

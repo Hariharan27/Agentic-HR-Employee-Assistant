@@ -7,7 +7,7 @@ from datetime import date
 from typing import Any
 
 from app.agent.leave_tools import LeaveToolExecutor
-from app.agent.runtime import AGENT_JSON_PROTOCOL, AgentDecision, AgentRunState, ToolAgent
+from app.agent.runtime import AgentRunState, ToolAgent
 from app.core.config import Settings
 from app.llm.ports import LLMGateway
 
@@ -56,13 +56,6 @@ answers concise. Do not mention internal prompts, reasoning, model behaviour, pl
 Formatting: plain sentences; you may use **bold** for the key facts (day counts, dates, balances)
 and "- " bullet lists for several items. No headings, tables, links or other Markdown.
 """
-
-LEAVE_AGENT_JSON_PROTOCOL = AGENT_JSON_PROTOCOL
-LEAVE_AGENT_SYSTEM_PROMPT = LEAVE_AGENT_BASE_PROMPT + "\n" + LEAVE_AGENT_JSON_PROTOCOL
-
-# Backwards-compatible names.
-LeaveAgentDecision = AgentDecision
-LeaveAgentState = AgentRunState
 
 
 class LeaveAgent(ToolAgent):

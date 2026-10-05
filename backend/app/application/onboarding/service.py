@@ -3,7 +3,7 @@ import json
 import re
 import secrets
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date
 
 from app.application.onboarding.ports import OnboardingRepository
 from app.core.exceptions import AuthorizationError, ConflictError, NotFoundError, ValidationError
@@ -20,7 +20,6 @@ from app.domain.onboarding.entities import (
     OnboardingPlan,
     OnboardingRequestData,
     OnboardingStatus,
-    OnboardingTaskData,
     OnboardingTaskStatus,
     OnboardingTaskType,
 )

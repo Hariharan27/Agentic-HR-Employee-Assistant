@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError as PydanticVa
 
 from app.application.leave.service import LeaveService
 from app.application.pending.service import PendingActionCoordinator
-from app.core.exceptions import ApplicationError, ValidationError
+from app.core.exceptions import ApplicationError
 from app.core.security import AuthenticatedUser
 from app.domain.leave.dates import MAX_RESOLVED_DAYS, describe_day, resolve_leave_dates
 from app.domain.leave.entities import LeaveType

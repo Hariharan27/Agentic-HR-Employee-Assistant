@@ -42,7 +42,6 @@ from app.core.exceptions import (
     AuthorizationError,
     ConflictError,
     LLMServiceError,
-    ParkingUnavailableError,
 )
 from app.core.security import AuthenticatedUser
 from app.domain.leave.dates import resolve_leave_dates

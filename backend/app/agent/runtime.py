@@ -217,13 +217,6 @@ class ToolAgent:
         )
 
     @staticmethod
-    def last_success(state: AgentRunState) -> dict[str, Any] | None:
-        results = state.get("tool_results", [])
-        if results and results[-1].get("status") == "success":
-            return results[-1]
-        return None
-
-    @staticmethod
     def friendly_failure(tool: str, data: dict[str, Any]) -> str:
         details = data.get("reason") or data.get("error")
         return f"I could not complete that request: {details}." if details else "I could not complete that request."

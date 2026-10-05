@@ -16,3 +16,7 @@ dist/
 # Logs and editor metadata
 *.log
 .DS_Store
+
+# tsc -b output for vite.config.ts
+vite.config.js
+vite.config.d.ts
