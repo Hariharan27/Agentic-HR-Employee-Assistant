@@ -15,3 +15,6 @@ backend/evals/reports/
 
 # Files the Claude desktop app saves into this folder
 Claude outputs/
+
+# local style previews
+frontend/tmp-preview/

@@ -425,8 +425,8 @@ function App() {
     return (
       <main className="login-page">
         <section className="login-story">
-          <div className="brand-mark">I</div>
-          <p className="eyebrow">IDEATOR PEOPLEDESK</p>
+          <img className="brand-logo on-dark" src="/ideas2it-logo.svg" alt="ideas2it" />
+          <p className="eyebrow">PEOPLEDESK BY IDEAS2IT</p>
           <h1>HR help for Ideators, without the waiting.</h1>
           <p className="lead">Your secure ideas2it HR help desk, grounded in company policy and connected to real employee workflows.</p>
           <div className="trust-row"><span>Policy grounded</span><span>Authenticated</span><span>Auditable</span></div>
@@ -438,7 +438,7 @@ function App() {
           <div className="role-switcher">
             {Object.entries(demoAccounts).map(([role, account]) => (
               <button key={role} type="button" className={loginForm.username === account.username ? "active" : ""}
-                onClick={() => setLoginForm(account)}>{role === "HR_ADMIN" ? "HR Admin" : role === "PARKING_ADMIN" ? "Parking Admin" : role[0] + role.slice(1).toLowerCase()}</button>
+                onClick={() => setLoginForm(account)}>{role === "HR_ADMIN" ? "HR Admin" : role === "PARKING_ADMIN" ? "Parking" : role === "HR" ? "HR" : role[0] + role.slice(1).toLowerCase()}</button>
             ))}
           </div>
           <form onSubmit={handleLogin}>
@@ -477,8 +477,8 @@ function App() {
     return (
       <main className="login-page">
         <section className="login-story">
-          <div className="brand-mark">I</div>
-          <p className="eyebrow">IDEATOR PEOPLEDESK</p>
+          <img className="brand-logo on-dark" src="/ideas2it-logo.svg" alt="ideas2it" />
+          <p className="eyebrow">PEOPLEDESK BY IDEAS2IT</p>
           <h1>Welcome, {profile.name.split(" ")[0]}.</h1>
           <p className="lead">Your account was just activated with a one-time password. Choose your own password to continue.</p>
         </section>
@@ -503,7 +503,7 @@ function App() {
   return (
     <main className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark small">I</div><div><strong>Ideator PeopleDesk</strong><span>by ideas2it</span></div></div>
+        <div className="brand"><img className="brand-logo small on-dark" src="/ideas2it-logo.svg" alt="ideas2it" /><div><strong>PeopleDesk</strong><span>by Ideas2IT</span></div></div>
         <div className="profile-card"><div className="avatar">{profile.name.split(" ").map((part) => part[0]).slice(0, 2).join("")}</div><div><strong>{profile.name}</strong><span>{profile.employee_code} · {profile.role.replaceAll("_", " ")}</span></div></div>
         <nav><button className="nav-active"><span>✦</span> Assistant</button>{canManageOnboarding && <button onClick={() => setSidePanel("onboarding")}><span>◇</span> Onboarding</button>}{canManageParking && <button onClick={() => { setSidePanel("parking"); void refreshParkingReservations(); }}><span>▦</span> Parking</button>}</nav>
         <div className="side-note"><span className="live-dot" />Connected to HR services</div>
@@ -515,7 +515,7 @@ function App() {
         <div className={`content-grid${showSidePanel ? "" : " chat-only"}`}>
           <section className="chat-panel">
             <div className="messages">
-              {messages.length === 0 && <div className="welcome"><div className="spark">✦</div><h3>Hello, {profile.name.split(" ")[0]}</h3><p>Ask PeopleDesk about HR policies, balances, leave requests, or workplace parking.{profile.role === "HR_ADMIN" ? " You can also review onboarding requests and activate employee accounts." : canManageParking ? " You can monitor parking arrivals and confirm admin actions before anything changes." : canCreateOnboarding ? " You can also onboard and track new Ideators." : ""} I’ll show sources and confirm before changing anything.</p><div className="suggestions">{suggestions.map((prompt) => <button key={prompt} onClick={() => void submitMessage(prompt)}>{prompt}<span>→</span></button>)}</div></div>}
+              {messages.length === 0 && <div className="welcome"><img className="brand-logo welcome-logo" src="/ideas2it-logo.svg" alt="" /><h3>Hello, {profile.name.split(" ")[0]}</h3><p>Ask PeopleDesk about HR policies, balances, leave requests, or workplace parking.{profile.role === "HR_ADMIN" ? " You can also review onboarding requests and activate employee accounts." : canManageParking ? " You can monitor parking arrivals and confirm admin actions before anything changes." : canCreateOnboarding ? " You can also onboard and track new Ideators." : ""} I’ll show sources and confirm before changing anything.</p><div className="suggestions">{suggestions.map((prompt) => <button key={prompt} onClick={() => void submitMessage(prompt)}>{prompt}<span>→</span></button>)}</div></div>}
               {messages.map((message) => {
                 const renderInlineOnboardingForm = canCreateOnboarding && shouldRenderOnboardingForm(message);
                 const renderInlineVehicleForm = profile.role === "EMPLOYEE" && shouldRenderVehicleForm(message);
@@ -528,7 +528,7 @@ function App() {
             </div>
             {pendingAction && <div className="pending-banner"><div><strong>Confirmation required</strong><span>{pendingAction}</span></div><div><button onClick={() => void submitMessage("cancel")}>Cancel</button><button className="confirm" onClick={() => void submitMessage("yes")}>Confirm</button></div></div>}
             {error && <p className="error chat-error">{error}</p>}
-            <form className="composer" onSubmit={(event) => { event.preventDefault(); void submitMessage(); }}><textarea rows={1} value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask Ideator PeopleDesk…" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submitMessage(); } }} /><button disabled={!input.trim() || loading} aria-label="Send">↑</button></form>
+            <form className="composer" onSubmit={(event) => { event.preventDefault(); void submitMessage(); }}><textarea rows={1} value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask PeopleDesk…" onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submitMessage(); } }} /><button disabled={!input.trim() || loading} aria-label="Send">↑</button></form>
             <p className="disclaimer">Responses are grounded in company policy. Confirm important decisions with HR.</p>
           </section>
 
