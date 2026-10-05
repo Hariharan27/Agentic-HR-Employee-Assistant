@@ -1,5 +1,5 @@
 import argparse
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import delete, select
@@ -117,13 +117,6 @@ DEMO_BALANCES = {
     "PARKING_ADMIN": (("CASUAL", 6, 1, 0), ("SICK", 6, 0, 0), ("EARNED", 12, 2, 8)),
 }
 
-DEMO_VEHICLES = {
-    "EMPLOYEE": ("TN01AR1001", "CAR", "Hyundai i20"),
-    "MANAGER": ("TN01KI1001", "CAR", "Honda City"),
-    "HR": ("KA01MN1001", "CAR", "Tata Nexon"),
-    "HR_ADMIN": ("TN01NK1001", "MOTORCYCLE", "TVS Ntorq"),
-}
-
 DEMO_PARKING_SLOTS = (
     ("B-21", "Chennai HQ - Basement B", "REGULAR"),
     ("B-22", "Chennai HQ - Basement B", "REGULAR"),
@@ -133,13 +126,6 @@ DEMO_PARKING_SLOTS = (
 )
 
 LEGACY_DEMO_EMPLOYEE_CODES = ("E1001", "M1001", "H1001", "H1002")
-
-
-def _next_parking_workday() -> date:
-    candidate = date.today() + timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    return candidate
 
 
 def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[int]) -> None:
@@ -174,6 +160,9 @@ def _clear_demo_activity(db: Session, user_ids: list[int], employee_ids: list[in
             ParkingReservation.employee_id.in_(parking_employee_ids)
         )
     )
+    # Vehicles are created through the parking workflow. Remove only demo-owned
+    # vehicles when resetting the demo; parking slots are master data and stay.
+    db.execute(delete(Vehicle).where(Vehicle.employee_id.in_(parking_employee_ids)))
     if onboarding_ids:
         db.execute(
             delete(OnboardingTask).where(
@@ -379,44 +368,14 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
                 balance.used_days = Decimal(used)
                 balance.carry_forward_limit_days = Decimal(carry_forward_limit)
 
-    vehicles: dict[str, Vehicle] = {}
-    for role, (registration_number, vehicle_type, make_model) in DEMO_VEHICLES.items():
-        employee = employees[role]
-        vehicle = db.scalar(select(Vehicle).where(Vehicle.employee_id == employee.id))
-        if vehicle is None:
-            vehicle = Vehicle(
-                employee_id=employee.id,
-                registration_number=registration_number,
-                vehicle_type=vehicle_type,
-                make_model=make_model,
-                active=True,
-            )
-            db.add(vehicle)
-            db.flush()
-        elif reset_demo:
-            vehicle.registration_number = registration_number
-            vehicle.vehicle_type = vehicle_type
-            vehicle.make_model = make_model
-            vehicle.active = True
-        vehicles[role] = vehicle
-
-    parking_slots: dict[str, ParkingSlot] = {}
     for code, location, slot_type in DEMO_PARKING_SLOTS:
         slot = db.scalar(select(ParkingSlot).where(ParkingSlot.code == code))
         if slot is None:
-            slot = ParkingSlot(
-                code=code,
-                location=location,
-                slot_type=slot_type,
-                active=True,
-            )
-            db.add(slot)
-            db.flush()
+            db.add(ParkingSlot(code=code, location=location, slot_type=slot_type, active=True))
         elif reset_demo:
             slot.location = location
             slot.slot_type = slot_type
             slot.active = True
-        parking_slots[code] = slot
 
     year = date.today().year
     for holiday_date, name in (
@@ -432,33 +391,6 @@ def seed_database(db: Session, *, reset_demo: bool = False) -> None:
             holiday.name = name
             holiday.category = "PUBLIC"
 
-    parking_date = _next_parking_workday()
-    occupied = db.scalar(
-        select(ParkingReservation).where(
-            ParkingReservation.employee_id == employees["MANAGER"].id,
-            ParkingReservation.reservation_date == parking_date,
-            ParkingReservation.status.in_(("RESERVED", "CHECKED_IN")),
-        )
-    )
-    if occupied is None:
-        occupied = ParkingReservation(
-            employee_id=employees["MANAGER"].id,
-            vehicle_id=vehicles["MANAGER"].id,
-            slot_id=parking_slots["B-21"].id,
-            reservation_date=parking_date,
-            status="RESERVED",
-        )
-        db.add(occupied)
-        db.flush()
-        db.add(
-            ParkingReservationEvent(
-                reservation_id=occupied.id,
-                actor_user_id=users["MANAGER"].id,
-                from_status=None,
-                to_status="RESERVED",
-                reason="Seeded occupied slot for the parking demo",
-            )
-        )
 
 
 def seed(*, reset_demo: bool = False) -> None:

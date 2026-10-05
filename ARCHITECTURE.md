@@ -41,7 +41,7 @@ flowchart TB
     GRAPH --> ROUTER[Intent router\nGPT OSS 20B]
     GRAPH --> CONFIRM[Pending-action\nconfirmation]
     ROUTER --> POLICY[Policy node]
-    ROUTER --> LEAVE[Leave node]
+    ROUTER --> LEAVE[Leave Agent subgraph]
     ROUTER --> PARKING[Parking node]
     ROUTER --> GENERAL[Deterministic general response]
     ROUTER --> UNSUPPORTED[Future-domain response]
@@ -51,7 +51,9 @@ flowchart TB
     EMBED --> QDRANT[(Qdrant)]
     POLICY --> ANSWER[Grounded response\nGPT OSS 120B]
 
-    LEAVE --> SERVICE[Deterministic LeaveService]
+    LEAVE --> LEAVE_MODEL[Bounded tool-calling loop\nGPT OSS 120B]
+    LEAVE_MODEL --> LEAVE_TOOLS[Typed Leave tools]
+    LEAVE_TOOLS --> SERVICE[Deterministic LeaveService]
     PARKING --> PARKING_SERVICE[Deterministic ParkingService]
     CONFIRM --> PENDING[PendingActionCoordinator]
     PENDING --> SERVICE
@@ -63,8 +65,10 @@ flowchart TB
     CONVERSATION --> POSTGRES
 ```
 
-The model proposes routing and structured fields. It does not receive authority to identify a
-different employee, bypass role checks, calculate final business values, or commit a transaction.
+The low-cost model proposes the top-level domain. Leave then runs a bounded tool-calling subgraph
+where the model selects typed operations and consumes structured results. It does not receive
+authority to identify a different employee, bypass role checks, calculate final business values, or
+commit a transaction.
 
 ## 4. Repository layers
 
@@ -103,11 +107,12 @@ sequenceDiagram
         S->>D: Atomic transaction
     else Normal request
         G->>G: Route and apply deterministic guards
-        G->>S: Invoke leave service or policy retrieval
+        G->>G: Leave Agent selects typed tools and consumes results
+        G->>S: Invoke LeaveService or policy retrieval
         S->>D: Read operational data or policy chunks
     end
     G->>D: Persist conversation state
-    G-->>A: Message, intent, sources, pending summary
+    G-->>A: Message, intent, sources, activity, pending summary
     A-->>W: Typed JSON response
     W-->>U: Answer and confirmation controls
 ```
@@ -131,7 +136,10 @@ flowchart LR
     ROUTER --> UNSUPPORTED[unsupported]
     CONFIRM --> END
     POLICY --> END
-    LEAVE --> END
+    LEAVE --> LEAVE_AGENT[Leave Agent]
+    LEAVE_AGENT -->|tool calls| LEAVE_TOOLS[Leave tool executor]
+    LEAVE_TOOLS -->|results| LEAVE_AGENT
+    LEAVE_AGENT --> END
     PARKING --> END
     GENERAL --> END
     UNSUPPORTED --> END
@@ -147,6 +155,7 @@ The graph carries:
 - Validated `RouteDecision`
 - Pending action and user-facing summary
 - Response and policy sources
+- Safe factual Leave agent activity events
 - Per-request LLM call count
 - Validated parking date context for safe follow-up turns
 
@@ -164,9 +173,9 @@ dates, reason, and request ID. Post-model guards enforce important invariants:
 
 ## 7. Application tools and deterministic boundaries
 
-The implementation uses tool-like application-service invocations from LangGraph. They are not
-model-native function calls: the orchestrator selects a validated operation and invokes trusted
-Python code directly.
+The Leave Agent uses a structured tool-call protocol inside the LangGraph subgraph. Its typed tool
+executor validates each call and invokes trusted Python code directly; the model never receives a
+repository or employee identity argument.
 
 | Capability | Implementation | Source of truth |
 |---|---|---|
@@ -180,6 +189,7 @@ Python code directly.
 | Approve/reject | Pending handler + `LeaveService` | Authorized transaction |
 | Cancel request | Pending handler + `LeaveService` | Request ownership |
 | Audit history | `LeaveService.get_leave_request_history` | Request events |
+| Policy search from Leave | `PolicyKnowledgeService.search` | Qdrant policy chunks and source metadata |
 | Parking vehicle | `ParkingService.get_vehicle` | Authenticated employee vehicle |
 | Parking availability | `ParkingService.check_availability` | PostgreSQL slots/reservations |
 | Reserve/cancel | Pending handlers + `ParkingService` | Confirmed atomic transaction |
@@ -204,7 +214,7 @@ IDs, changing statuses, or constructing SQL.
 
 ```text
 User request
-  → structured route
+  → domain route → Leave Agent tool selection
   → validate fields and authorization
   → calculate/revalidate business rules
   → store expiring PendingAction

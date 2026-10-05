@@ -23,3 +23,4 @@ class ChatResponse(BaseModel):
     intent: str | None = None
     sources: list[dict[str, Any]] = Field(default_factory=list)
     pending_action: str | None = None
+    agent_activity: list[dict[str, str]] = Field(default_factory=list)

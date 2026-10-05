@@ -75,6 +75,7 @@ def test_manager_can_preview_plan_without_creating_data(client, db_session):
         "LAPTOP",
         "ACCESS_CARD",
         "TEMPORARY_ACCESS_CARD",
+        "PAYROLL_SETUP",
     ]
     assert db_session.scalar(select(func.count()).select_from(OnboardingRequest)) == 0
 
@@ -142,7 +143,7 @@ def test_manager_can_read_status_by_id_or_employee_name(client, db_session):
     assert by_id.status_code == 200
     assert by_name.status_code == 200
     assert by_id.json()["id"] == by_name.json()["id"] == created.id
-    assert by_name.json()["total_tasks"] == 4
+    assert by_name.json()["total_tasks"] == 5
 
 
 def test_create_handler_produces_json_safe_arguments_and_rejects_missing_fields(db_session):

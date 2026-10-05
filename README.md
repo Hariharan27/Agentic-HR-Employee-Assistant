@@ -10,7 +10,7 @@ and Parking Administrator attendance workflows end to end.
 ## What it demonstrates
 
 - Authenticated employee, manager, HR, HR administrator, and Parking Administrator experiences
-- LangGraph intent routing and multi-turn conversation state
+- LangGraph domain routing, a bounded Leave tool-calling subgraph, and multi-turn conversation state
 - Grounded policy RAG over 32 PDFs with document/page attribution
 - Dynamic leave balances, eligibility, working-day calculation, and request history
 - Leave application, cancellation, manager approval, and rejection workflows
@@ -33,17 +33,19 @@ flowchart LR
     GRAPH --> ROUTER[GPT OSS 20B\nRouter]
     GRAPH --> CONFIRM[Confirmation\nLifecycle]
     ROUTER --> POLICY[Policy RAG]
-    ROUTER --> LEAVE[Deterministic\nLeave Services]
+    ROUTER --> LEAVE_AGENT[Leave Agent\nGPT OSS 120B]
+    LEAVE_AGENT --> LEAVE_TOOLS[Typed Leave Tools]
     ROUTER --> PARKING[Deterministic\nParking Services]
     POLICY --> QDRANT[(Qdrant)]
     POLICY --> MODEL[GPT OSS 120B\nGrounded Answer]
-    LEAVE --> POSTGRES[(PostgreSQL)]
+    LEAVE_TOOLS --> POSTGRES[(PostgreSQL)]
     PARKING --> POSTGRES
     CONFIRM --> POSTGRES
     GRAPH --> POSTGRES
 ```
 
-The LLM proposes an intent and structured fields. Authenticated identity, authorization,
+The low-cost router selects the top-level domain. Inside Leave, the agent selects typed tools and
+can consume intermediate results across bounded rounds. Authenticated identity, authorization,
 calculations, confirmation, transactions, and audit events remain controlled by application code.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
@@ -57,13 +59,13 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
 | Policy questions | Qdrant retrieval and grounded GPT OSS 120B response with sources |
 | Dynamic employee information | PostgreSQL-backed balances and request lifecycle |
 | Calculations | Python working-day, holiday, overlap, and balance rules |
-| Tool usage | LangGraph invokes validated policy, leave, onboarding, and parking services |
+| Tool usage | Leave Agent dynamically invokes validated typed tools over LeaveService and Policy RAG |
 | Agent workflow | Structured routing, conditional graph nodes, context, and escalation |
 | Safe actions | Expiring pending actions and explicit Confirm/Cancel step |
 | Manager workflow | Direct-report queue, approve/reject, balance update, audit history |
-| Onboarding workflow | Four provisioning tasks, HR Admin approval, account activation, employee login |
+| Onboarding workflow | Five provisioning tasks, HR Admin approval, account activation, employee login |
 | Parking workflow | Availability, reservation/cancellation, waitlist, admin attendance, and three-strike suspension |
-| Quality evidence | 141 automated tests and 99 live golden scenarios |
+| Quality evidence | 167 automated tests and 99 live golden scenarios |
 
 ## Quick start with Docker
 
@@ -131,12 +133,12 @@ POST /api/v1/chat
   → resolve confirmation first, when present
   → otherwise route the request
        ├─ policy  → retrieve Qdrant evidence → grounded response + sources
-       ├─ leave   → deterministic application service
+       ├─ leave   → bounded Leave Agent → typed Leave tools → grounded response/activity
        ├─ onboarding → deterministic request, review, and account activation services
        ├─ parking → deterministic availability and employee parking service
        └─ general → deterministic capability response
   → persist conversation state
-  → return message, intent, sources, and pending-action summary
+  → return message, intent, sources, safe Leave agent activity, and pending-action summary
 ```
 
 Application and manager decisions follow a two-turn lifecycle:
@@ -149,8 +151,9 @@ No leave, onboarding, or parking mutation is executed directly from model output
 
 ## Application tools
 
-LangGraph invokes tool-like application services directly rather than allowing the model to run SQL
-or native provider function calls.
+The Leave Agent selects from typed tool adapters over application services rather than allowing the
+model to run SQL or access repositories directly. Read tools execute immediately; mutation tools only
+create a PendingAction for the existing explicit-confirmation lifecycle.
 
 | Area | Operations |
 |---|---|

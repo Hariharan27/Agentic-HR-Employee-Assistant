@@ -133,4 +133,5 @@ def chat(
         intent=result.intent,
         sources=result.sources,
         pending_action=result.pending_action,
+        agent_activity=result.agent_activity or [],
     )

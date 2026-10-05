@@ -35,7 +35,9 @@ class Settings(BaseSettings):
     complex_max_output_tokens: int = 1200
     complex_escalation_threshold: float = 0.70
     llm_max_retries: int = 1
-    llm_max_calls_per_request: int = 3
+    llm_max_calls_per_request: int = Field(default=8, ge=1, le=20)
+    leave_agent_max_iterations: int = Field(default=6, ge=1, le=12)
+    leave_agent_max_tool_calls: int = Field(default=8, ge=1, le=20)
     parking_booking_horizon_days: int = Field(default=30, ge=1, le=365)
     parking_cancellation_cutoff_hour: int = Field(default=20, ge=0, le=23)
     parking_check_in_open_hour: int = Field(default=7, ge=0, le=23)

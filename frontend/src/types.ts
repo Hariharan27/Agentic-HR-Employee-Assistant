@@ -20,6 +20,13 @@ export type ChatResponse = {
   intent?: string | null;
   sources: Source[];
   pending_action?: string | null;
+  agent_activity: AgentActivity[];
+};
+
+export type AgentActivity = {
+  tool: string;
+  label: string;
+  status: "success" | "error";
 };
 
 export type ChatMessage = {
@@ -28,6 +35,7 @@ export type ChatMessage = {
   text: string;
   sources?: Source[];
   intent?: string | null;
+  agentActivity?: AgentActivity[];
   showOnboardingForm?: boolean;
   showVehicleForm?: boolean;
 };
