@@ -9,6 +9,8 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError as PydanticValidationError
 
 from app.agent.leave_agent import LeaveAgent
+from app.agent.onboarding_agent import OnboardingAgent
+from app.agent.onboarding_tools import OnboardingToolExecutor
 from app.agent.leave_tools import LeaveToolExecutor
 from app.agent.state import AgentState
 from app.application.leave.service import LeaveService
@@ -24,7 +26,7 @@ from app.core.exceptions import (
 )
 from app.core.security import AuthenticatedUser, require_role
 from app.domain.leave.plan import stored_plan_inputs
-from app.domain.onboarding.entities import TASK_TITLES, OnboardingCandidate
+from app.domain.onboarding.draft import FIELDS as ONBOARDING_FIELDS, missing_fields
 from app.domain.pending.entities import ConfirmationDecision
 from app.infrastructure.repositories.conversation import SQLAlchemyConversationRepository
 from app.llm.models import ModelTier, RouteDecision
@@ -106,6 +108,7 @@ class ChatResult:
     sources: list[dict[str, object]]
     pending_action: str | None = None
     agent_activity: list[dict[str, str]] | None = None
+    onboarding_draft: dict[str, str] | None = None
 
 
 class HRAssistantOrchestrator:
@@ -141,9 +144,16 @@ class HRAssistantOrchestrator:
                 policies=policies,
             ),
         )
+        self.onboarding_agent = OnboardingAgent(
+            settings=settings,
+            llm=llm,
+            tools=OnboardingToolExecutor(actor=actor, onboarding=onboarding, pending=pending),
+        )
         self.graph = self._build_graph()
 
-    def chat(self, session_id: str, message: str) -> ChatResult:
+    def chat(
+        self, session_id: str, message: str, *, onboarding_form: dict[str, str] | None = None
+    ) -> ChatResult:
         stored = self.conversations.load_or_create(session_id, self.actor.user_id)
         history = self._safe_history(stored.get("messages"))
         state: AgentState = {
@@ -159,6 +169,7 @@ class HRAssistantOrchestrator:
                 stored.get("onboarding_context")
             ),
             "parking_context": self._safe_parking_context(stored.get("parking_context")),
+            "onboarding_form": self._safe_onboarding_form(onboarding_form),
             "sources": [],
             "agent_activity": [],
             "llm_calls": 0,
@@ -196,6 +207,11 @@ class HRAssistantOrchestrator:
             sources=result.get("sources", []),
             pending_action=result.get("pending_summary"),
             agent_activity=result.get("agent_activity", []),
+            onboarding_draft={
+                name: value
+                for name, value in (result.get("onboarding_context") or {}).items()
+                if name in ONBOARDING_FIELDS
+            } or None,
         )
 
     def _build_graph(self):
@@ -388,6 +404,9 @@ class HRAssistantOrchestrator:
         } else "leave"
 
     def _route(self, state: AgentState) -> AgentState:
+        if state.get("onboarding_form"):
+            form_route = RouteDecision(domain="onboarding", intent="start_onboarding", confidence=1.0)
+            return {"route": form_route, "active_domain": "onboarding", "llm_calls": 0}
         security_route = self._security_route(state["user_message"])
         if security_route is not None:
             return {"route": security_route, "active_domain": security_route.domain, "llm_calls": 0}
@@ -546,203 +565,69 @@ class HRAssistantOrchestrator:
 
     def _handle_onboarding(self, state: AgentState) -> AgentState:
         route: RouteDecision = state["route"]
-        if route.intent == "onboarding_approvals":
-            requests = self.onboarding.get_pending_approvals(self.actor)
-            if not requests:
-                return {
-                    "response": "There are no onboarding requests pending approval.",
-                    "active_domain": "onboarding",
-                }
-            lines = [
-                f"#{item.id}: {item.candidate.name} — {item.candidate.designation}, "
-                f"joining {item.candidate.joining_date}"
-                for item in requests[:20]
-            ]
-            return {
-                "response": "Pending onboarding approvals:\n" + "\n".join(lines),
-                "active_domain": "onboarding",
-            }
-        if route.intent in {"approve_onboarding", "reject_onboarding"}:
-            if route.request_id is None:
-                return {
-                    "response": "Please provide the onboarding request ID.",
-                    "active_domain": "onboarding",
-                }
-            if route.intent == "reject_onboarding" and not route.reason:
-                return {
-                    "response": "Please provide a reason for rejecting the onboarding request.",
-                    "active_domain": "onboarding",
-                }
-            request = self.onboarding.prepare_review(self.actor, route.request_id)
-            if route.intent == "approve_onboarding":
-                action_type = "approve_onboarding"
-                arguments = {"request_id": request.id, "comment": route.reason}
-                summary = f"Approve onboarding request #{request.id} for {request.candidate.name}"
-            else:
-                action_type = "reject_onboarding"
-                arguments = {"request_id": request.id, "reason": route.reason}
-                summary = f"Reject onboarding request #{request.id} for {request.candidate.name}: {route.reason}"
-            action = self.pending.propose(
-                self.actor, state["session_id"], action_type, arguments, summary
-            )
-            return {
-                "response": f"{action.summary}. Reply yes to confirm or cancel.",
-                "active_domain": "onboarding",
-                "pending_summary": action.summary,
-            }
-        if route.intent == "onboarding_status":
-            if route.request_id is not None:
-                request = self.onboarding.get_onboarding_status(self.actor, route.request_id)
-            else:
-                query = self._trusted_onboarding_lookup(route, state["user_message"])
-                if query is None:
-                    return {
-                        "response": "Please provide the employee name, email, or onboarding request ID.",
-                        "active_domain": "onboarding",
-                    }
-                request = self.onboarding.find_onboarding_status(self.actor, query)
-            task_lines = [
-                f"{task.title}: {task.status.value.replace('_', ' ').title()}"
-                for task in request.tasks
-            ]
-            return {
-                "response": (
-                    f"{request.candidate.name} — {request.candidate.designation}\n"
-                    f"Joining: {request.candidate.joining_date}\n"
-                    f"Status: {request.status.value.replace('_', ' ').title()} "
-                    f"({request.completed_tasks}/{request.total_tasks} completed)\n"
-                    + "\n".join(task_lines)
-                ),
-                "active_domain": "onboarding",
-            }
-
-        require_role(self.actor, "MANAGER", "HR")
-
-        context = self._merge_onboarding_context(
-            state.get("onboarding_context", {}), route, state["user_message"]
+        # Role gates stay deterministic so unauthorized requests fail with 403 before any model call.
+        if route.intent in {"onboarding_approvals", "approve_onboarding", "reject_onboarding"}:
+            require_role(self.actor, "HR_ADMIN")
+        elif route.intent == "onboarding_status":
+            require_role(self.actor, "MANAGER", "HR", "HR_ADMIN")
+        else:
+            require_role(self.actor, "MANAGER", "HR")
+        draft = dict(state.get("onboarding_context", {}))
+        form = state.get("onboarding_form")
+        if form:
+            return self._handle_onboarding_form(state, draft, form)
+        tools: OnboardingToolExecutor = self.onboarding_agent.tools  # type: ignore[assignment]
+        tools.turn_text = state["user_message"]
+        result = self.onboarding_agent.invoke(
+            session_id=state["session_id"],
+            user_message=state["user_message"],
+            conversation=state.get("messages", []),
+            active_plan=draft,
+            llm_calls=state.get("llm_calls", 0),
         )
-        required = (
-            ("name", "employee name"),
-            ("email", "email"),
-            ("designation", "designation"),
-            ("department", "department"),
-            ("reporting_manager", "reporting manager"),
-            ("joining_date", "joining date"),
-            ("location", "location"),
-            ("employment_type", "employment type"),
-        )
-        missing = [label for field, label in required if not context.get(field)]
-        if missing:
-            return {
-                "response": (
-                    "Use the onboarding form below so I can collect the required employee details "
-                    f"({', '.join(missing)}) and ask for confirmation before creating the request."
-                ),
-                "active_domain": "onboarding",
-                "onboarding_context": context,
-            }
-
-        candidate = OnboardingCandidate(
-            name=context["name"],
-            email=context["email"],
-            designation=context["designation"],
-            department=context["department"],
-            reporting_manager=context["reporting_manager"],
-            joining_date=date.fromisoformat(context["joining_date"]),
-            location=context["location"],
-            employment_type=context["employment_type"],
-        )
-        plan = self.onboarding.prepare_plan(self.actor, candidate)
-        arguments = {
-            "name": plan.candidate.name,
-            "email": plan.candidate.email,
-            "designation": plan.candidate.designation,
-            "department": plan.candidate.department,
-            "reporting_manager": plan.candidate.reporting_manager,
-            "joining_date": plan.candidate.joining_date.isoformat(),
-            "location": plan.candidate.location,
-            "employment_type": plan.candidate.employment_type,
-        }
-        summary = (
-            f"Create onboarding for {plan.candidate.name} ({plan.candidate.designation}), "
-            f"joining {plan.candidate.joining_date}, with {len(plan.task_types)} provisioning requests"
-        )
-        action = self.pending.propose(
-            self.actor, state["session_id"], "create_onboarding", arguments, summary
-        )
-        task_lines = "\n".join(f"- {TASK_TITLES[item]}" for item in plan.task_types)
         return {
-            "response": (
-                "New employee onboarding\n"
-                f"Name: {plan.candidate.name}\n"
-                f"Email: {plan.candidate.email}\n"
-                "Account role: Employee\n"
-                f"Designation: {plan.candidate.designation}\n"
-                f"Department: {plan.candidate.department}\n"
-                f"Manager: {plan.candidate.reporting_manager}\n"
-                f"Joining date: {plan.candidate.joining_date}\n"
-                f"Location: {plan.candidate.location}\n"
-                f"Employment type: {plan.candidate.employment_type}\n\n"
-                f"Provisioning requests:\n{task_lines}\n\n"
-                "Reply yes to confirm or cancel."
-            ),
+            "response": result["response"],
             "active_domain": "onboarding",
-            "onboarding_context": context,
-            "pending_summary": action.summary,
+            "onboarding_context": result.get("active_plan") or {},
+            "pending_summary": result.get("pending_summary"),
+            "agent_activity": result.get("agent_activity", []),
+            "llm_calls": result.get("llm_calls", state.get("llm_calls", 0)),
+        }
+
+    def _handle_onboarding_form(
+        self, state: AgentState, draft: dict[str, str], form: dict[str, str]
+    ) -> AgentState:
+        """Structured form values go straight into the draft: no text parsing, no model call."""
+        tools: OnboardingToolExecutor = self.onboarding_agent.tools  # type: ignore[assignment]
+        updated, invalid, _ = tools.apply_fields(draft, form, require_stated=False)
+        missing = missing_fields(updated)
+        if invalid or missing:
+            problems = [f"{label}: {reason}" for label, reason in invalid.items()]
+            if missing:
+                problems.append("missing " + ", ".join(missing))
+            return {
+                "response": "Please check the onboarding form: " + "; ".join(problems) + ".",
+                "active_domain": "onboarding",
+                "onboarding_context": updated,
+            }
+        summary, reply = tools.propose(updated, state["session_id"])
+        return {
+            "response": reply,
+            "active_domain": "onboarding",
+            "onboarding_context": updated,
+            "pending_summary": summary,
         }
 
     @staticmethod
-    def _merge_onboarding_context(
-        existing: dict[str, str], route: RouteDecision, message: str
-    ) -> dict[str, str]:
-        context = dict(existing)
-        fields = {
-            "name": route.employee_name,
-            "designation": route.designation,
-            "department": route.department,
-            "reporting_manager": route.reporting_manager,
-            "location": route.location,
-            "employment_type": route.employment_type,
+    def _safe_onboarding_form(value: object) -> dict[str, str] | None:
+        if not isinstance(value, dict):
+            return None
+        form = {
+            key: str(item).strip()
+            for key, item in value.items()
+            if key in ONBOARDING_FIELDS and isinstance(item, (str, int)) and str(item).strip()
         }
-        for field, value in fields.items():
-            if value and HRAssistantOrchestrator._value_is_explicit(value, message):
-                context[field] = value.strip()
-        labelled_patterns = {
-            "name": r"(?:employee\s+)?name\s*:\s*([^,;\n]+)",
-            "designation": r"(?:designation|role)\s*:\s*([^,;\n]+)",
-            "department": r"department\s*:\s*([^,;\n]+)",
-            "reporting_manager": r"(?:reporting\s+manager|manager)\s*:\s*([^,;\n]+)",
-            "location": r"location\s*:\s*([^,;\n]+)",
-            "employment_type": r"employment\s+type\s*:\s*([^,;\n]+)",
-        }
-        for field, pattern in labelled_patterns.items():
-            match = re.search(pattern, message, re.I)
-            if match:
-                context[field] = match.group(1).strip()
-        email_match = re.search(
-            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", message, re.I
-        )
-        if email_match:
-            context["email"] = email_match.group(0).casefold()
-        iso_date_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", message)
-        if iso_date_match:
-            context["joining_date"] = iso_date_match.group(0)
-        elif route.joining_date is not None and HRAssistantOrchestrator._contains_date_reference(message):
-            context["joining_date"] = route.joining_date.isoformat()
-        return context
-
-    @staticmethod
-    def _trusted_onboarding_lookup(route: RouteDecision, message: str) -> str | None:
-        email_match = re.search(
-            r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", message, re.I
-        )
-        if email_match:
-            return email_match.group(0)
-        if route.employee_name and HRAssistantOrchestrator._value_is_explicit(
-            route.employee_name, message
-        ):
-            return route.employee_name.strip()
-        return None
+        return form or None
 
     @staticmethod
     def _value_is_explicit(value: str, message: str) -> bool:
@@ -1560,10 +1445,7 @@ class HRAssistantOrchestrator:
 
     @staticmethod
     def _safe_onboarding_context(value: object) -> dict[str, str]:
-        allowed = {
-            "name", "email", "designation", "department", "reporting_manager",
-            "joining_date", "location", "employment_type",
-        }
+        allowed = {*ONBOARDING_FIELDS, "plan_id", "fingerprint"}
         if not isinstance(value, dict):
             return {}
         return {

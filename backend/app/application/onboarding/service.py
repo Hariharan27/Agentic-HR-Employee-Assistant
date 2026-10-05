@@ -1,11 +1,19 @@
+import hashlib
+import json
 import re
 import secrets
-
-from datetime import datetime
+from collections.abc import Callable
+from datetime import date, datetime
 
 from app.application.onboarding.ports import OnboardingRepository
 from app.core.exceptions import AuthorizationError, ConflictError, NotFoundError, ValidationError
 from app.core.security import AuthenticatedUser, hash_password, require_role
+from app.domain.onboarding.draft import (
+    EMPLOYMENT_TYPES,
+    LOCATIONS,
+    normalize_employment_type,
+    normalize_location,
+)
 from app.domain.onboarding.entities import (
     OnboardingActivationResult,
     OnboardingCandidate,
@@ -31,14 +39,43 @@ _ONBOARDING_TASKS = (
 class OnboardingService:
     """Deterministic onboarding planning and lifecycle foundation."""
 
-    def __init__(self, repository: OnboardingRepository):
+    def __init__(self, repository: OnboardingRepository, *, today: Callable[[], date] | None = None):
         self.repository = repository
+        self.today = today or date.today
+
+    @staticmethod
+    def plan_fingerprint(plan: OnboardingPlan) -> str:
+        candidate = plan.candidate
+        payload = [
+            candidate.name, candidate.email, candidate.designation, candidate.department,
+            candidate.reporting_manager, candidate.joining_date.isoformat(), candidate.location,
+            candidate.employment_type, plan.reporting_manager.id, [item.value for item in plan.task_types],
+        ]
+        return hashlib.sha256(json.dumps(payload).encode()).hexdigest()[:16]
+
+    def resolve_reporting_manager(self, actor: AuthenticatedUser, name: str) -> str | None:
+        """Match a manager name as typed ("Karthik") to one eligible reporting manager."""
+        require_role(actor, "MANAGER", "HR", "HR_ADMIN")
+        wanted = " ".join(name.casefold().split())
+        managers = self.repository.list_reporting_managers()
+        exact = [item for item in managers if item.name.casefold() == wanted]
+        if exact:
+            return exact[0].name
+        partial = [
+            item for item in managers
+            if all(token in item.name.casefold().split() for token in wanted.split())
+        ]
+        return partial[0].name if len(partial) == 1 else None
 
     def prepare_plan(
         self, actor: AuthenticatedUser, candidate: OnboardingCandidate
     ) -> OnboardingPlan:
         require_role(actor, "MANAGER", "HR")
         normalized = self._normalize_candidate(candidate)
+        if normalized.joining_date < self.today():
+            raise ValidationError(
+                f"The joining date must be today ({self.today().isoformat()}) or later"
+            )
         if self.repository.employee_email_exists(normalized.email):
             raise ConflictError("An employee with this email already exists")
         if self.repository.active_onboarding_email_exists(normalized.email):
@@ -353,4 +390,11 @@ class OnboardingService:
             raise ValidationError("A valid employee email is required")
         if candidate.joining_date is None:
             raise ValidationError("Missing required onboarding fields: joining date")
+        employment_type = normalize_employment_type(values["employment_type"])
+        if employment_type is None:
+            raise ValidationError("Employment type must be " + ", ".join(EMPLOYMENT_TYPES))
+        location = normalize_location(values["location"])
+        if location is None:
+            raise ValidationError("Location must be " + " or ".join(LOCATIONS))
+        values.update(employment_type=employment_type, location=location)
         return OnboardingCandidate(joining_date=candidate.joining_date, **values)

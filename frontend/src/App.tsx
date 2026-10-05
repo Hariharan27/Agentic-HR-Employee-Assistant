@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { getOnboardingStatus, getParkingAdminReservations, getPendingOnboardingApprovals, getProfile, getReportingManagers, login, sendChat } from "./api";
 import { RichText } from "./RichText";
-import type { ChatMessage, OnboardingStatus, ParkingReservation, Profile, ReportingManager, Source } from "./types";
+import type { ChatMessage, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager, Source } from "./types";
 
 const demoAccounts = {
   EMPLOYEE: { username: "employee", password: "employee123" },
@@ -257,19 +257,16 @@ function App() {
       return;
     }
     setOnboardingFormError("");
-    await submitMessage(
-      [
-        "Create onboarding request with these details:",
-        `name: ${values.name}`,
-        `email: ${values.email}`,
-        `designation: ${values.designation}`,
-        `department: ${values.department}`,
-        `reporting manager: ${values.reportingManager}`,
-        `joining date: ${values.joiningDate}`,
-        `location: ${values.location}`,
-        `employment type: ${values.employmentType}`,
-      ].join("; ")
-    );
+    await submitMessage(`Submitted the onboarding form for ${values.name}`, {
+      name: values.name,
+      email: values.email,
+      designation: values.designation,
+      department: values.department,
+      reporting_manager: values.reportingManager,
+      joining_date: values.joiningDate,
+      location: values.location,
+      employment_type: values.employmentType,
+    });
   }
 
   function renderOnboardingForm() {
@@ -281,8 +278,8 @@ function App() {
         <label>Designation<input value={onboardingForm.designation} onChange={(event) => updateOnboardingForm("designation", event.target.value)} placeholder="Software Engineer" /></label>
         <label>Department<input value={onboardingForm.department} onChange={(event) => updateOnboardingForm("department", event.target.value)} placeholder="Engineering" /></label>
         <label>Reporting manager<select value={onboardingForm.reportingManager} onChange={(event) => updateOnboardingForm("reportingManager", event.target.value)}>{reportingManagers.length === 0 ? <option value="">No managers available</option> : reportingManagers.map((manager) => <option key={manager.id} value={manager.name}>{manager.name}{manager.employee_code ? ` · ${manager.employee_code}` : ""}</option>)}</select></label>
-        <div className="onboarding-form-grid"><label>Joining date<input type="date" value={onboardingForm.joiningDate} onChange={(event) => updateOnboardingForm("joiningDate", event.target.value)} /></label><label>Employment type<select value={onboardingForm.employmentType} onChange={(event) => updateOnboardingForm("employmentType", event.target.value)}><option>Permanent</option><option>Contract</option><option>Intern</option></select></label></div>
-        <label>Location<input value={onboardingForm.location} onChange={(event) => updateOnboardingForm("location", event.target.value)} placeholder="Chennai" /></label>
+        <div className="onboarding-form-grid"><label>Joining date<input type="date" min={localDateInputValue()} value={onboardingForm.joiningDate} onChange={(event) => updateOnboardingForm("joiningDate", event.target.value)} /></label><label>Employment type<select value={onboardingForm.employmentType} onChange={(event) => updateOnboardingForm("employmentType", event.target.value)}><option>Permanent</option><option>Contract</option><option>Intern</option></select></label></div>
+        <label>Location<select value={onboardingForm.location} onChange={(event) => updateOnboardingForm("location", event.target.value)}><option>Chennai</option><option>Bengaluru</option></select></label>
         {onboardingFormError && <p className="panel-error">{onboardingFormError}</p>}
         <button className="submit-onboarding" disabled={loading || reportingManagers.length === 0}>Create request for confirmation</button>
       </form>
@@ -342,7 +339,7 @@ function App() {
     );
   }
 
-  async function submitMessage(text = input) {
+  async function submitMessage(text = input, onboardingPayload?: OnboardingFormPayload) {
     const normalized = text.trim();
     if (!normalized || !token || loading) return;
     setInput("");
@@ -353,8 +350,23 @@ function App() {
     ]);
     setLoading(true);
     try {
-      const response = await sendChat(token, normalized, sessionId);
+      const response = await sendChat(token, normalized, sessionId, onboardingPayload);
       setSessionId(response.session_id);
+      const draft = response.onboarding_draft;
+      if (draft) {
+        // Details given in chat pre-fill the form; anything the user already typed in the form wins.
+        setOnboardingForm((current) => ({
+          ...current,
+          name: current.name || draft.name || "",
+          email: current.email || draft.email || "",
+          designation: current.designation || draft.designation || "",
+          department: current.department || draft.department || "",
+          reportingManager: draft.reporting_manager || current.reportingManager,
+          joiningDate: current.joiningDate || draft.joining_date || "",
+          location: draft.location || current.location,
+          employmentType: draft.employment_type || current.employmentType,
+        }));
+      }
       setPendingAction(response.pending_action || null);
       const showOnboardingForm = response.domain === "onboarding" && response.intent === "start_onboarding" && !response.pending_action;
       const showVehicleForm = response.domain === "parking" && response.intent === "register_vehicle" && !response.pending_action;

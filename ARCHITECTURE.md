@@ -258,6 +258,25 @@ execute the same action twice.
 - Native provider tool calling is used when `LEAVE_AGENT_NATIVE_TOOLS=true`; check support first
   with `python -m app.llm.probe`. Otherwise the JSON decision protocol is used.
 
+### Onboarding Agent
+
+Onboarding runs on the same shared loop (`app/agent/runtime.py`) as the Leave Agent, with its own
+typed tools (`app/agent/onboarding_tools.py`):
+
+- Manager/HR: `update_onboarding_draft` (every value must be stated in the user's message;
+  employment type Permanent/Contract/Intern, location Chennai/Bengaluru, joining date today or
+  later, manager matched to one eligible employee), `build_onboarding_plan`, `prepare_onboarding`,
+  `list_reporting_managers`, `check_employee_exists`, `get_onboarding_status`.
+- HR Admin: `list_onboarding_approvals`, `get_onboarding_request`, `prepare_onboarding_approval`,
+  `prepare_onboarding_rejection`.
+- Role gates run before the agent and tool authorization failures are raised, so unauthorized
+  requests return HTTP 403. Credentials are generated only at confirmation and never reach a model.
+- The inline form posts structured `onboarding_form` values that are written straight into the same
+  draft (no text parsing, no model call); details given in chat are returned as `onboarding_draft`
+  and pre-fill the form.
+- Department reply emails (`POST /api/v1/inbound/email`) require the `X-Inbound-Token` shared
+  secret (`INBOUND_EMAIL_TOKEN`).
+
 ## 9. Policy RAG
 
 ### Ingestion

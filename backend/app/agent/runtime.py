@@ -498,7 +498,8 @@ class ToolAgent:
             )
             if execution.pending_summary:
                 return snapshot(
-                    response=f"{execution.pending_summary}. Reply yes to confirm or cancel.",
+                    response=getattr(execution, "pending_response", None)
+                    or f"{execution.pending_summary}. Reply yes to confirm or cancel.",
                     pending_summary=execution.pending_summary,
                     final_status="awaiting_confirmation",
                 )

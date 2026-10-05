@@ -1,4 +1,4 @@
-import type { ChatResponse, LeaveRequest, OnboardingStatus, ParkingReservation, Profile, ReportingManager } from "./types";
+import type { ChatResponse, LeaveRequest, OnboardingFormPayload, OnboardingStatus, ParkingReservation, Profile, ReportingManager } from "./types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
@@ -29,10 +29,13 @@ export async function login(username: string, password: string) {
 
 export const getProfile = (token: string) => request<Profile>("/api/v1/auth/me", {}, token);
 
-export const sendChat = (token: string, message: string, sessionId?: string) =>
+export const sendChat = (token: string, message: string, sessionId?: string, onboardingForm?: OnboardingFormPayload) =>
   request<ChatResponse>(
     "/api/v1/chat",
-    { method: "POST", body: JSON.stringify({ message, session_id: sessionId || null }) },
+    {
+      method: "POST",
+      body: JSON.stringify({ message, session_id: sessionId || null, onboarding_form: onboardingForm || null }),
+    },
     token,
   );
 

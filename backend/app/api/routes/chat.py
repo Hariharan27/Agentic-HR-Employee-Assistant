@@ -90,7 +90,9 @@ def chat(
     leave = LeaveService(
         SQLAlchemyLeaveRepository(db), today=lambda: datetime.now(timezone).date()
     )
-    onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db))
+    onboarding = OnboardingService(
+        SQLAlchemyOnboardingRepository(db), today=lambda: datetime.now(timezone).date()
+    )
     parking = ParkingService(SQLAlchemyParkingRepository(db), settings)
     email_service = EmailService(ConsoleEmailGateway())
     pending = PendingActionCoordinator(
@@ -132,7 +134,7 @@ def chat(
         policies=policies,
         llm=llm,
     )
-    result = service.chat(body.session_id or str(uuid4()), body.message)
+    result = service.chat(body.session_id or str(uuid4()), body.message, onboarding_form=body.onboarding_form)
     return ChatResponse(
         session_id=result.session_id,
         message=result.message,
@@ -141,4 +143,5 @@ def chat(
         sources=result.sources,
         pending_action=result.pending_action,
         agent_activity=result.agent_activity or [],
+        onboarding_draft=result.onboarding_draft,
     )

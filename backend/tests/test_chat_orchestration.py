@@ -78,9 +78,19 @@ class FakeLLM:
         self.responses = responses
         self.calls: list[tuple[ModelTier, bool]] = []
         self.last_route: dict[str, object] = {}
+        self.last_any_route: dict[str, object] = {}
 
     def complete(self, tier, *, system, user, json_mode=False):
         self.calls.append((tier, json_mode))
+        if "tool-calling Onboarding Agent" in system:
+            if self.responses:
+                try:
+                    candidate = json.loads(self.responses[0])
+                except (TypeError, ValueError):
+                    candidate = {}
+                if candidate.get("action") in {"tool", "final"}:
+                    return self.responses.pop(0)
+            return self._simulated_onboarding_response(user)
         if "tool-calling Leave Agent" in system:
             if self.responses:
                 try:
@@ -97,6 +107,8 @@ class FakeLLM:
             candidate = {}
         if candidate.get("domain") == "leave":
             self.last_route = candidate
+        if candidate.get("domain"):
+            self.last_any_route = candidate
         return response
 
     def _legacy_leave_agent_response(self, prompt: str) -> str:
@@ -240,6 +252,108 @@ class FakeLLM:
             return self._tool("prepare_leave_rejection", request_id=arguments["request_id"], reason=reason)
         return json.dumps({"action": "final", "message": "Please clarify the Leave request."})
 
+    def _simulated_onboarding_response(self, prompt: str) -> str:
+        """Simulate a well-behaved Onboarding Agent model over the onboarding tools."""
+        results = []
+        marker = "Tool results so far:\n"
+        if marker in prompt:
+            try:
+                results = json.loads(prompt.split(marker, 1)[1])
+            except ValueError:
+                results = []
+        message_match = re.search(r"Current user message: (.*)\n\nAvailable tools:", prompt, re.S)
+        message = message_match.group(1).strip() if message_match else ""
+        draft_match = re.search(r"Current onboarding draft: (.*)\n", prompt)
+        try:
+            draft = json.loads(draft_match.group(1)) if draft_match else None
+        except ValueError:
+            draft = None
+        final = lambda text: json.dumps({"action": "final", "message": text})  # noqa: E731
+        if results:
+            latest = results[-1]
+            data = latest.get("result", {})
+            if latest.get("status") == "error":
+                return final(data.get("error", "The onboarding step failed."))
+            tool = latest.get("tool")
+            if tool == "update_onboarding_draft":
+                if data.get("invalid"):
+                    return final("Please check: " + "; ".join(f"{k}: {v}" for k, v in data["invalid"].items()) + ".")
+                if data.get("missing"):
+                    return final("Please provide the " + ", ".join(data["missing"]) + ".")
+                return self._tool("build_onboarding_plan")
+            if tool == "build_onboarding_plan":
+                return self._tool("prepare_onboarding", plan_id=data["plan_id"])
+            if tool == "get_onboarding_status":
+                lines = [f"{task['title']}: {task['status'].replace('_', ' ').title()}" for task in data["tasks"]]
+                return final(
+                    f"{data['name']} — {data['designation']}\nJoining: {data['joining_date']}\n"
+                    f"Status: {data['status'].replace('_', ' ').title()} ({data['completed_tasks']}/{data['total_tasks']} completed)\n"
+                    + "\n".join(lines)
+                )
+            if tool == "list_onboarding_approvals":
+                requests = data.get("requests", [])
+                return final("Pending onboarding approvals:\n" + "\n".join(
+                    f"#{item['request_id']}: {item['name']} — {item['designation']}" for item in requests
+                ) if requests else "There are no onboarding requests pending approval.")
+            return final("Done.")
+
+        normalized = message.casefold()
+        request_match = re.search(r"#\s*(\d+)", message)
+        request_id = int(request_match.group(1)) if request_match else None
+        reason_match = re.search(r"\bbecause\s+(.+)$", message, re.I)
+        if re.search(r"\b(reject|decline)\b", normalized):
+            if request_id is None:
+                return final("Please provide the onboarding request ID.")
+            if not reason_match:
+                return final("Please provide a reason for rejecting the onboarding request.")
+            return self._tool("prepare_onboarding_rejection", request_id=request_id, reason=reason_match.group(1).strip())
+        if re.search(r"\bapprove\b", normalized):
+            if request_id is None:
+                return final("Please provide the onboarding request ID.")
+            return self._tool("prepare_onboarding_approval", request_id=request_id)
+        if "pending" in normalized and "approval" in normalized:
+            return self._tool("list_onboarding_approvals")
+        if re.search(r"\b(status|progress)\b", normalized):
+            name = self.last_any_route.get("employee_name")
+            if request_id is not None:
+                return self._tool("get_onboarding_status", request_id=request_id)
+            if name:
+                return self._tool("get_onboarding_status", employee=name)
+            return final("Please provide the employee name, email, or onboarding request ID.")
+
+        route_fields = {
+            "name": self.last_any_route.get("employee_name"),
+            "email": self.last_any_route.get("employee_email"),
+            "designation": self.last_any_route.get("designation"),
+            "department": self.last_any_route.get("department"),
+            "reporting_manager": self.last_any_route.get("reporting_manager"),
+            "joining_date": self.last_any_route.get("joining_date"),
+            "location": self.last_any_route.get("location"),
+            "employment_type": self.last_any_route.get("employment_type"),
+        }
+        labelled = {
+            "name": r"(?:employee\s+)?name\s*:\s*([^,;\n]+)",
+            "email": r"email\s*:\s*([^,;\n]+)",
+            "designation": r"(?:designation|role)\s*:\s*([^,;\n]+)",
+            "department": r"department\s*:\s*([^,;\n]+)",
+            "reporting_manager": r"(?:reporting\s+manager|manager)\s*:\s*([^,;\n]+)",
+            "joining_date": r"joining\s+date\s*:\s*([^,;\n]+)",
+            "location": r"location\s*:\s*([^,;\n]+)",
+            "employment_type": r"employment\s+type\s*:\s*([^,;\n]+)",
+        }
+        fields = {key: value for key, value in route_fields.items() if value}
+        for key, pattern in labelled.items():
+            match = re.search(pattern, message, re.I)
+            if match:
+                fields[key] = match.group(1).strip()
+        if fields:
+            return self._tool("update_onboarding_draft", **fields)
+        missing = (draft or {}).get("missing") or [
+            "employee name", "email", "designation", "department", "reporting manager",
+            "joining date", "location", "employment type",
+        ]
+        return final("Please provide the " + ", ".join(missing) + ". You can also use the onboarding form below.")
+
     def _simulated_intent(self, message, active_plan, earlier_user):
         normalized = message.casefold()
         if re.search(r"\bapprove\b.*\b(?:leave\s+)?request\b", normalized):
@@ -294,8 +408,8 @@ class FakeLLM:
         return match.group(1).strip() if match else None
 
     @staticmethod
-    def _tool(name, **arguments):
-        return json.dumps({"action": "tool", "tool_calls": [{"name": name, "arguments": arguments}]})
+    def _tool(tool_name, /, **arguments):
+        return json.dumps({"action": "tool", "tool_calls": [{"name": tool_name, "arguments": arguments}]})
 
 class FakePolicies:
     def search(self, question: str) -> PolicyContext:
@@ -396,7 +510,7 @@ def orchestrator(db_session, fake_llm, *, settings=None, current_actor=None, par
     current_actor = current_actor or actor(db_session)
     settings = settings or Settings()
     leave = LeaveService(SQLAlchemyLeaveRepository(db_session), today=lambda: TEST_TODAY)
-    onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db_session))
+    onboarding = OnboardingService(SQLAlchemyOnboardingRepository(db_session), today=lambda: TEST_TODAY)
     parking = ParkingService(
         SQLAlchemyParkingRepository(db_session),
         settings,
@@ -819,7 +933,7 @@ def test_manager_onboarding_collects_fields_then_confirms_atomically(db_session)
     assert db_session.scalar(
         select(PendingAction).where(PendingAction.session_id == "onboarding-session")
     ) is None
-    assert len(llm.calls) == 2
+    assert [tier for tier, _ in llm.calls].count("router") == 2  # one routing call per user turn
 
 
 def test_hr_admin_approves_onboarding_with_confirmation_and_credentials_are_redacted(db_session):
@@ -2089,3 +2203,136 @@ def test_same_leave_next_week_moves_the_active_plan_by_seven_days(db_session):
     assert stored["requested_dates"] == ["2026-10-13", "2026-10-18"]
     assert stored["leave_type"] == "CASUAL" and stored["eligible"] is True
     assert [event["tool"] for event in moved.agent_activity] == ["shift_leave_plan"]
+
+
+ONBOARDING_FORM = {
+    "name": "Nila Raman",
+    "email": "nila.raman@example.com",
+    "designation": "Software Engineer",
+    "department": "Engineering",
+    "reporting_manager": "Test Manager",
+    "joining_date": "2026-10-12",
+    "location": "Chennai",
+    "employment_type": "Permanent",
+}
+
+
+def test_onboarding_form_goes_straight_to_a_plan_without_any_model_call(db_session):
+    llm = FakeLLM([])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "manager"))
+
+    proposal = service.chat("onboarding-form", "Submitted the onboarding form", onboarding_form=ONBOARDING_FORM)
+
+    assert llm.calls == []
+    assert "New employee onboarding" in proposal.message
+    assert "Set up payroll and salary account" in proposal.message
+    assert "with 5 provisioning requests" in proposal.pending_action
+    assert proposal.onboarding_draft["email"] == "nila.raman@example.com"
+
+
+def test_onboarding_form_reports_invalid_fields(db_session):
+    service = orchestrator(db_session, FakeLLM([]), current_actor=actor(db_session, "manager"))
+    form = {**ONBOARDING_FORM, "joining_date": "2026-10-01", "location": "Mumbai", "employment_type": "freelance"}
+
+    result = service.chat("onboarding-form-invalid", "Submitted the onboarding form", onboarding_form=form)
+
+    assert "Please check the onboarding form" in result.message
+    assert "joining date must be today (2026-10-05) or later" in result.message
+    assert "location must be Chennai or Bengaluru" in result.message
+    assert "employment type must be Permanent, Contract, Intern" in result.message
+    assert result.pending_action is None
+
+
+def test_chat_details_and_the_form_fill_one_shared_draft(db_session):
+    llm = FakeLLM([route(domain="onboarding", intent="start_onboarding", employee_name="Nila Raman",
+                         designation="Software Engineer")])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "manager"))
+
+    first = service.chat("onboarding-mixed", "Onboard Nila Raman as a Software Engineer")
+    rest = {key: value for key, value in ONBOARDING_FORM.items() if key not in {"name", "designation"}}
+    proposal = service.chat("onboarding-mixed", "Submitted the onboarding form", onboarding_form=rest)
+
+    assert first.onboarding_draft == {"name": "Nila Raman", "designation": "Software Engineer"}
+    assert "Please provide the email" in first.message
+    assert "Name: Nila Raman" in proposal.message and proposal.pending_action is not None
+
+
+def test_onboarding_tool_rejects_values_the_user_did_not_state(db_session):
+    service = orchestrator(db_session, FakeLLM([]), current_actor=actor(db_session, "manager"))
+    tools = service.onboarding_agent.tools
+    tools.turn_text = "Onboard Nila Raman as a Software Engineer"
+
+    execution = tools.execute(
+        "update_onboarding_draft",
+        {"name": "Nila Raman", "email": "invented@example.com", "location": "Blr"},
+        session_id="s",
+    )
+
+    assert execution.data["draft"] == {"employee name": "Nila Raman"}
+    assert set(execution.data["not_stated_by_user"]) == {"email", "location"}
+
+
+def test_onboarding_field_aliases_normalise(db_session):
+    service = orchestrator(db_session, FakeLLM([]), current_actor=actor(db_session, "manager"))
+    tools = service.onboarding_agent.tools
+    tools.turn_text = "she is perm, based in Blr, reports to manager, joins next Monday"
+
+    execution = tools.execute(
+        "update_onboarding_draft",
+        {"employment_type": "perm", "location": "Blr", "reporting_manager": "manager", "joining_date": "next Monday"},
+        session_id="s",
+    )
+
+    assert execution.data["draft"] == {
+        "employment type": "Permanent", "location": "Bengaluru",
+        "reporting manager": "Test Manager", "joining date": "2026-10-12",
+    }
+
+
+def test_manager_cannot_approve_onboarding_and_gets_403(db_session):
+    llm = FakeLLM([route(domain="onboarding", intent="approve_onboarding", request_id=999)])
+
+    with pytest.raises(AuthorizationError):
+        orchestrator(db_session, llm, current_actor=actor(db_session, "manager")).chat(
+            "manager-approve-onboarding", "Approve onboarding request #999"
+        )
+
+
+def test_hr_admin_rejection_asks_for_a_reason_then_prepares_it(db_session):
+    created = OnboardingService(SQLAlchemyOnboardingRepository(db_session), today=lambda: TEST_TODAY).create_onboarding(
+        actor(db_session, "manager"),
+        OnboardingCandidate(name="Nila Raman", email="nila.raman@example.com", designation="Software Engineer",
+                            department="Engineering", reporting_manager="Test Manager",
+                            joining_date=date(2026, 10, 12), location="Chennai", employment_type="Permanent"),
+    )
+    llm = FakeLLM([route(domain="general", intent="general"), route(domain="general", intent="general")])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "hradmin"))
+
+    missing = service.chat("reject-onboarding", f"Reject onboarding request #{created.id}")
+    proposal = service.chat("reject-onboarding", f"Reject onboarding request #{created.id} because duplicate hire")
+
+    assert "Please provide a reason" in missing.message and missing.pending_action is None
+    assert proposal.pending_action == f"Reject onboarding request #{created.id} for Nila Raman: duplicate hire"
+
+
+def test_chat_endpoint_accepts_a_structured_onboarding_form(client, db_session):
+    app.dependency_overrides[get_llm_gateway] = lambda: FakeLLM([])
+    app.dependency_overrides[get_policy_service] = lambda: FakePolicies()
+    try:
+        token = client.post(
+            "/api/v1/auth/login", json={"username": "manager", "password": "manager-password"}
+        ).json()["access_token"]
+        form = {**ONBOARDING_FORM, "joining_date": "2099-01-15"}
+        response = client.post(
+            "/api/v1/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"message": "Submitted the onboarding form", "onboarding_form": form},
+        )
+    finally:
+        app.dependency_overrides.pop(get_llm_gateway, None)
+        app.dependency_overrides.pop(get_policy_service, None)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["domain"] == "onboarding" and body["pending_action"]
+    assert body["onboarding_draft"]["joining_date"] == "2099-01-15"

@@ -21,6 +21,18 @@ export type ChatResponse = {
   sources: Source[];
   pending_action?: string | null;
   agent_activity: AgentActivity[];
+  onboarding_draft?: Record<string, string> | null;
+};
+
+export type OnboardingFormPayload = {
+  name: string;
+  email: string;
+  designation: string;
+  department: string;
+  reporting_manager: string;
+  joining_date: string;
+  location: string;
+  employment_type: string;
 };
 
 export type AgentActivity = {
