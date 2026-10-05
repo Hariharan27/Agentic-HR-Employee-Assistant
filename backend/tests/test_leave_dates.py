@@ -92,3 +92,18 @@ def test_no_dates_is_ambiguous_with_a_question():
 def test_reversed_range_is_rejected():
     with pytest.raises(ValidationError, match="End date must be on or after start date"):
         resolve_leave_dates("from 20 October to 10 October", MONDAY)
+
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("apply leave next week wednesday", ["2026-10-14"]),
+        ("wednesday next week", ["2026-10-14"]),
+        ("next week Monday and Tuesday", ["2026-10-12", "2026-10-13"]),
+        ("this week friday", ["2026-10-09"]),
+        ("next wednesday", ["2026-10-07"]),  # bare "next <day>" = the upcoming one
+    ],
+)
+def test_weekdays_with_an_explicit_week(text, expected):
+    assert iso(resolve_leave_dates(text, MONDAY)) == expected

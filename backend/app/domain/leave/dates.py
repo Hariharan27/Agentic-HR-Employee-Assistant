@@ -188,11 +188,20 @@ def _mentions(normalized: str, today: date) -> list[_Mention]:
         r"\b(next\s+|this\s+|coming\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
         normalized,
     ))
+    # "next week Wednesday" / "Wednesday next week" name a day in the next calendar week (Mon-Sun);
+    # "this week Friday" one in the current week. A bare "Wednesday" is the upcoming one.
+    week_start: date | None = None
+    if re.search(r"\bnext week\b", normalized):
+        week_start = today - timedelta(days=today.weekday()) + timedelta(days=7)
+    elif re.search(r"\bthis week\b", normalized):
+        week_start = today - timedelta(days=today.weekday())
     previous: date | None = None
     for match in weekday_matches:
         target = _WEEKDAYS[match.group(2)]
         modifier = (match.group(1) or "").strip()
-        if previous is None:
+        if previous is None and week_start is not None:
+            candidate = week_start + timedelta(days=target)
+        elif previous is None:
             delta = (target - today.weekday()) % 7
             if delta == 0 and modifier in {"next", "coming"}:
                 delta = 7
