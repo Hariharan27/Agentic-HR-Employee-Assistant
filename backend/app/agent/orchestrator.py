@@ -589,6 +589,7 @@ class HRAssistantOrchestrator:
             "asks for steps or a detailed explanation. Use plain text only: no Markdown, headings, "
             "bullets, quotations, document names, page numbers, or inline citations. The interface "
             "shows source documents separately. Use natural grammar and spacing, such as '12 days'. "
+            "Write every number as digits (6, not six). "
             "Write leave types in full the first time (Earned Leave (EL), Privilege Leave (PL), "
             "Casual Leave (CL), Sick Leave (SL))."
         )

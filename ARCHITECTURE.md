@@ -441,14 +441,18 @@ The frontend renders server decisions; it is not an authorization boundary.
 
 ## 14. Quality strategy
 
-- **282 deterministic tests** cover authentication, security, date resolution, leave plans and
+- **289 deterministic tests** cover authentication, security, date resolution, leave plans and
   rules, the shared agent loop (repair, grounding, finaliser), onboarding approval and account
   activation, parking, pending actions, manager lifecycle, RAG, orchestration, live streaming,
   evaluation contracts, and the repeatable demo seed. Agent tests use scripted model simulators.
 - **117 versioned golden scenarios** exercise the live API and configured models across policy,
   leave, onboarding, parking, manager workflow, safety, scope, and API safety, three times each.
 - Release gate: at least 95% overall pass rate and consistency, and 100% for safety, API safety,
-  onboarding and parking. Latest results are in `backend/evals/reports/` (ignored by Git).
+  onboarding and parking. Reports are written to `backend/evals/reports/` (ignored by Git).
+- Latest full run (5 Oct 2026, 117 cases × 3, 438 turns): **99.1% pass rate, 99.3% consistency**;
+  safety, API safety and onboarding 100%, parking 97% (one wording miss). The four misses (one
+  provider 503, a model-corrected reversed range, a number written in words, a reworded date
+  prompt) have deterministic fixes and regression tests.
 - The React production build is compiled with TypeScript before packaging.
 
 ## 15. Deployment and demo reset

@@ -2649,3 +2649,27 @@ def test_two_vehicles_are_listed_and_a_booking_asks_which_one(db_session):
     assert not plan.eligible and "Which one should I use" in plan.problems[0]
     chosen = service.parking.build_parking_plan(actor(db_session), [date(2026, 10, 8)], "B-21", None, "tn09 zz 4321")
     assert chosen.eligible and chosen.vehicle == "TN09ZZ4321"
+
+
+def test_a_reversed_range_is_reported_even_if_the_model_swapped_it(db_session):
+    llm = FakeLLM([
+        route(intent="calculate_leave_days"),
+        json.dumps({"action": "tool", "tool_calls": [{"name": "calculate_leave_days", "arguments": {"start_date": "2026-11-01", "end_date": "2026-11-10"}}]}),
+        json.dumps({"action": "final", "message": "That range contains 7 working leave days."}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("swapped-range", "Calculate leave days from 2026-11-10 to 2026-11-01")
+
+    assert "End date must be on or after start date" in result.message
+
+
+def test_parking_without_a_date_asks_with_the_fixed_wording(db_session):
+    five_slots(db_session)
+    llm = FakeLLM([
+        route(domain="parking", intent="reserve_parking"),
+        json.dumps({"action": "final", "message": "Which date would you like to book?"}),
+    ])
+
+    result = orchestrator(db_session, llm).chat("parking-no-date", "Book parking")
+
+    assert result.message == "Please provide the parking date."

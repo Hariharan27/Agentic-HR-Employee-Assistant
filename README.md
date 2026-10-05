@@ -91,7 +91,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete as-built design and
 | Manager workflow | Direct-report queue, approve/reject, balance update, audit history |
 | Onboarding workflow | Provisioning tasks, HR Admin approval, account activation, employee login |
 | Parking workflow | Slot board and choice, reservation/cancellation, waitlist, admin attendance, three-strike suspension |
-| Quality evidence | 282 automated tests and a 117-case live golden set run three times per release |
+| Quality evidence | 289 automated tests; 117-case live golden set × 3: 99.1% pass, 99.3% consistency |
 
 ## Quick start with Docker
 
@@ -272,7 +272,7 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Current deterministic result: **282 passed**.
+Current deterministic result: **289 passed**. Latest live golden run: **99.1%** pass rate, **99.3%** consistency.
 
 Validate or run the live golden dataset:
 

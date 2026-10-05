@@ -261,6 +261,11 @@ class LeaveAgent(ToolAgent):
         if intent in self.PLAN_INTENTS and not self._OTHER_TYPES.search(text):
             return self._finalize_plan(state, str(intent), message)
 
+        if intent == "calculate_leave_days" and self._latest(results, "calculate_leave_days"):
+            # The model may have "fixed" a reversed range on its own; the employee's own words win.
+            check = self.tools.execute("resolve_dates", {"text": text[:300]}, session_id=state["session_id"])
+            if not check.ok:
+                return {**state, "response": self.friendly_failure("resolve_dates", check.data)}
         if intent == "calculate_leave_days" and not self._latest(results, "calculate_leave_days"):
             # The model asked back instead of counting: resolve the stated range and count it.
             state = self.execute_inline(state, "resolve_dates", {"text": text[:300]})

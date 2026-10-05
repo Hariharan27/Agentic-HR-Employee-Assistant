@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Any
 
@@ -77,6 +78,12 @@ class ParkingAgent(ToolAgent):
 
     def finalize(self, state: AgentRunState, message: str) -> AgentRunState | None:
         results = state.get("tool_results", [])
+        dated = any(
+            item.get("status") == "success" and item.get("tool") in {"resolve_dates", "list_parking_slots", "build_parking_plan"}
+            for item in results
+        )
+        if not dated and not (state.get("active_plan") or {}).get("dates") and re.search(r"\bdates?\b", message, re.I):
+            return {"response": "Please provide the parking date."}
         if not results or any(item.get("tool") == "prepare_parking" for item in results):
             return None
         last = results[-1]
