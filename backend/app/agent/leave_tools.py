@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, ClassVar
 
@@ -75,6 +75,14 @@ class ManagedRequestsArguments(ToolArguments):
     status: str | None = Field(default="PENDING", max_length=24)
 
 
+class ShiftPlanArguments(ToolArguments):
+    plan_id: str = Field(min_length=1, max_length=40)
+    shift_days: int = Field(
+        ge=-62, le=62,
+        description="Calendar days to move every date of the active plan: 7 = same days next week, -7 = previous week.",
+    )
+
+
 class PrepareApplicationArguments(ToolArguments):
     plan_id: str = Field(min_length=1, max_length=40)
 
@@ -112,6 +120,7 @@ class LeaveToolExecutor:
         "get_leave_balance": LeaveBalanceArguments,
         "resolve_dates": ResolveDatesArguments,
         "build_leave_plan": BuildPlanArguments,
+        "shift_leave_plan": ShiftPlanArguments,
         "get_holidays": DateRangeArguments,
         "calculate_leave_days": DateRangeArguments,
         "get_my_leave_requests": RequestListArguments,
@@ -151,6 +160,10 @@ class LeaveToolExecutor:
                 "Validate a leave request for explicit dates (from resolve_dates) and one leave type. "
                 "Returns the plan: working days per segment, weekends/holidays not counted, balance "
                 "before/after, eligibility and problems. The newest plan becomes the active plan."
+            ),
+            "shift_leave_plan": (
+                "Move every date of the active plan by a number of calendar days (e.g. 'same leave "
+                "next week' = 7) keeping its leave type, split and reason, and re-check it. Returns the new plan."
             ),
             "get_holidays": "Get configured holidays in a date range.",
             "calculate_leave_days": "Calculate deterministic working leave days in a date range.",
@@ -233,6 +246,7 @@ class LeaveToolExecutor:
             "get_leave_balance": "Checked leave balance",
             "resolve_dates": "Resolved leave dates",
             "build_leave_plan": "Checked leave eligibility",
+            "shift_leave_plan": "Moved leave plan dates",
             "get_holidays": "Checked holiday calendar",
             "calculate_leave_days": "Calculated working leave days",
             "get_my_leave_requests": "Retrieved leave requests",
@@ -396,6 +410,21 @@ class LeaveToolExecutor:
             self._base_label("search_leave_policy"),
             sources=context.sources,
         )
+
+    def _shift_leave_plan(
+        self, arguments: ShiftPlanArguments, *, active_plan: dict[str, Any] | None = None, **_: Any
+    ) -> LeaveToolExecution:
+        inputs = stored_plan_inputs(active_plan)
+        if inputs is None or inputs.plan_id != arguments.plan_id:
+            return self._error("shift_leave_plan", "No active leave plan has that plan_id; build a leave plan first")
+        if arguments.shift_days == 0:
+            return self._error("shift_leave_plan", "shift_days must not be 0")
+        shifted = [day + timedelta(days=arguments.shift_days) for day in inputs.dates]
+        plan = self.leave.build_leave_plan(
+            self.actor, inputs.leave_type, shifted, inputs.reason, inputs.split_with
+        )
+        data = plan.to_dict()
+        return LeaveToolExecution("shift_leave_plan", True, data, self._base_label("shift_leave_plan"), plan=data)
 
     def _prepare_leave_application(
         self,

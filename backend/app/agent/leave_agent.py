@@ -30,6 +30,8 @@ Leave dates and applications:
   (CASUAL, SICK or EARNED). If the type was never named in this conversation, ask for it; never
   guess it. Explain the plan from its summary: working days, any weekend or holiday not counted,
   balance after, or the exact problems if it is not eligible.
+- To move the active plan ("same leave next week", "push it a week later"), call
+  shift_leave_plan with the number of calendar days (7 per week); never recompute dates yourself.
 - "Apply it", "go ahead", "submit it" with an eligible active plan means call
   prepare_leave_application with that plan_id. If the latest message changes dates or type, build
   a new plan first. Never prepare an application the employee has not seen as a plan.
@@ -400,7 +402,7 @@ class LeaveAgent:
         results = state.get("tool_results", [])
         for item in reversed(results):
             tool, data, ok = item.get("tool"), item.get("result", {}), item.get("status") == "success"
-            if tool == "build_leave_plan" and ok and data.get("summary"):
+            if tool in {"build_leave_plan", "shift_leave_plan"} and ok and data.get("summary"):
                 text = str(data["summary"])
                 return text + (" Would you like me to apply it?" if data.get("eligible") else "")
             if not ok:

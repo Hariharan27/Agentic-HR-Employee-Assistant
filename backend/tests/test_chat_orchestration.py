@@ -2068,3 +2068,24 @@ def test_onboarding_confirmation_counts_the_planned_provisioning_tasks(db_sessio
     proposal = service.chat("onboarding-task-count", complete_onboarding_message())
 
     assert "with 5 provisioning requests" in proposal.pending_action
+
+
+def test_same_leave_next_week_moves_the_active_plan_by_seven_days(db_session):
+    llm = FakeLLM([
+        route(intent="leave_eligibility", leave_type="CASUAL"),
+        route(domain="general", intent="general"),
+    ])
+    service = orchestrator(db_session, llm)
+    service.chat("shift", "can i take casual leave on Tuesday and Sunday")
+    plan_id = json.loads(db_session.get(ConversationSession, "shift").state_json)["leave_plan"]["plan_id"]
+    llm.responses.extend([
+        json.dumps({"action": "tool", "tool_calls": [{"name": "shift_leave_plan", "arguments": {"plan_id": plan_id, "shift_days": 7}}]}),
+        json.dumps({"action": "final", "message": "Moved: 1 working day on 2026-10-13; Sunday 2026-10-18 is a weekly off."}),
+    ])
+
+    moved = service.chat("shift", "same leave next week")
+    stored = json.loads(db_session.get(ConversationSession, "shift").state_json)["leave_plan"]
+
+    assert stored["requested_dates"] == ["2026-10-13", "2026-10-18"]
+    assert stored["leave_type"] == "CASUAL" and stored["eligible"] is True
+    assert [event["tool"] for event in moved.agent_activity] == ["shift_leave_plan"]
