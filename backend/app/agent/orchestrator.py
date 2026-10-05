@@ -530,6 +530,7 @@ class HRAssistantOrchestrator:
         decision = self._apply_routing_guards(
             decision, state["user_message"], date.fromisoformat(today)
         )
+        decision = self._contextual_review_target(decision, state)
         if state.get("active_domain") == "parking" and self._is_vehicle_registration_follow_up(
             state["user_message"], state.get("parking_context") or {}, decision
         ):
@@ -1254,6 +1255,28 @@ class HRAssistantOrchestrator:
             return True  # still collecting registration details ("it is a car")
         # A bare registration number (e.g. "TN84P2145, Zeta") with no booking words is a registration.
         return bool(cls.PLATE_PATTERN.search(message)) and not cls._BOOKING_WORDS.search(message)
+
+    _REVIEW_SWAP = {
+        "approve_leave_request": "approve_onboarding",
+        "reject_leave_request": "reject_onboarding",
+    }
+
+    def _contextual_review_target(self, decision: RouteDecision, state: AgentState) -> RouteDecision:
+        """"Approve request 16" names no workflow. An HR administrator (who reviews onboarding, not
+        leave) or a conversation that was just about onboarding means the onboarding request; a
+        manager who was just looking at leave means the leave request. Explicit words always win."""
+        message = state["user_message"].casefold()
+        says_leave = bool(re.search(r"\bleaves?\b", message))
+        says_onboarding = bool(re.search(r"\bonboard", message))
+        previous = state.get("previous_domain")
+        if decision.intent in self._REVIEW_SWAP and not says_leave:
+            if self.actor.role == "HR_ADMIN" or previous == "onboarding":
+                return decision.model_copy(update={"domain": "onboarding", "intent": self._REVIEW_SWAP[decision.intent]})
+        reverse = {value: key for key, value in self._REVIEW_SWAP.items()}
+        if decision.intent in reverse and not says_onboarding:
+            if self.actor.role in {"MANAGER", "HR"} and previous == "leave":
+                return decision.model_copy(update={"domain": "leave", "intent": reverse[decision.intent]})
+        return decision
 
     @staticmethod
     def _claims_vehicle_registered(reply: str) -> bool:

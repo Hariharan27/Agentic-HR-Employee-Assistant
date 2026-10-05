@@ -373,7 +373,7 @@ class FakeLLM:
             return final("Done.")
 
         normalized = message.casefold()
-        request_match = re.search(r"#\s*(\d+)", message)
+        request_match = re.search(r"(?:#|\brequest\s+)\s*(\d+)", message)
         request_id = int(request_match.group(1)) if request_match else None
         reason_match = re.search(r"\bbecause\s+(.+)$", message, re.I)
         if re.search(r"\b(reject|decline)\b", normalized):
@@ -2901,3 +2901,41 @@ def test_a_bike_only_employee_cannot_ask_for_a_car_slot(db_session):
     plan = parking.build_parking_plan(me, [date(2026, 10, 7)], "B-21")
     assert not plan.eligible and "is a car slot" in plan.problems[0]
     assert parking.build_parking_plan(me, [date(2026, 10, 7)], "M-01").eligible
+
+
+def _pending_onboarding(db_session):
+    return OnboardingService(SQLAlchemyOnboardingRepository(db_session)).create_onboarding(
+        actor(db_session, "manager"),
+        OnboardingCandidate(
+            name="Nila Raman", email="nila.raman@example.com", designation="Software Engineer",
+            department="Engineering", reporting_manager="Test Manager", joining_date=date(2026, 10, 12),
+            location="Chennai", employment_type="Permanent",
+        ),
+    )
+
+
+def test_hr_admin_approving_a_bare_request_number_means_the_onboarding_request(db_session):
+    created = _pending_onboarding(db_session)
+    llm = FakeLLM([
+        route(domain="onboarding", intent="onboarding_approvals"),
+        route(domain="leave", intent="approve_leave_request", request_id=created.id),
+    ])
+    service = orchestrator(db_session, llm, current_actor=actor(db_session, "hradmin"))
+
+    queue = service.chat("hr-admin-bare-id", "Which onboarding requests are waiting for my approval?")
+    assert f"#{created.id}: Nila Raman" in queue.message
+
+    proposal = service.chat("hr-admin-bare-id", f"can you approve request {created.id}")
+
+    assert proposal.intent == "approve_onboarding"
+    assert proposal.pending_action and "Nila Raman" in proposal.pending_action
+
+
+def test_manager_approving_a_bare_request_number_after_leave_means_the_leave_request():
+    decision = RouteDecision(domain="onboarding", intent="approve_onboarding", confidence=0.9, request_id=7)
+    stub = HRAssistantOrchestrator.__new__(HRAssistantOrchestrator)
+    stub.actor = type("A", (), {"role": "MANAGER"})()
+    swapped = stub._contextual_review_target(decision, {"user_message": "approve request 7", "previous_domain": "leave"})
+    assert swapped.intent == "approve_leave_request"
+    kept = stub._contextual_review_target(decision, {"user_message": "approve onboarding 7", "previous_domain": "leave"})
+    assert kept.intent == "approve_onboarding"
